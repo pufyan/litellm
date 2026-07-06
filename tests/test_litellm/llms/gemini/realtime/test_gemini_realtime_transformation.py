@@ -539,6 +539,50 @@ def test_gemini_setup_requests_both_transcriptions():
     assert deferred_setup["outputAudioTranscription"] == {}
 
 
+def test_gemini_session_resumption_hooks():
+    from litellm.types.realtime import RealtimeResumptionState
+
+    config = GeminiRealtimeConfig()
+
+    assert config.supports_session_resumption() is True
+
+    state = config.extract_resumption_state({"sessionResumptionUpdate": {"newHandle": "h-123", "resumable": True}})
+    assert state is not None
+    assert state.handle == "h-123"
+    assert state.resumable is True
+    assert config.extract_resumption_state({"serverContent": {"turnComplete": True}}) is None
+    assert config.extract_resumption_state({"sessionResumptionUpdate": {"resumable": True}}) is None
+
+    notice = config.extract_go_away({"goAway": {"timeLeft": "9.5s"}})
+    assert notice is not None
+    assert notice.time_left_ms == 9500
+    assert config.extract_go_away({"serverContent": {}}) is None
+
+    original = json.dumps({"setup": {"model": "models/gemini-2.5-flash", "sessionResumption": {}}})
+    resumed = config.build_resume_session_request(RealtimeResumptionState(handle="h-123", resumable=True), original)
+    assert json.loads(resumed)["setup"]["sessionResumption"] == {"handle": "h-123"}
+
+    not_resumable = config.build_resume_session_request(
+        RealtimeResumptionState(handle="h-123", resumable=False), original
+    )
+    assert not_resumable == original
+
+
+def test_gemini_setup_enables_session_resumption():
+    config = GeminiRealtimeConfig()
+
+    eager_setup = json.loads(config.session_configuration_request("gemini-2.5-flash"))["setup"]
+    assert eager_setup["sessionResumption"] == {}
+
+    messages = config.transform_realtime_request(
+        json.dumps({"type": "session.update", "session": {}}),
+        "gemini-2.5-flash",
+        session_configuration_request=None,
+    )
+    deferred_setup = json.loads(messages[0])["setup"]
+    assert deferred_setup["sessionResumption"] == {}
+
+
 def test_gemini_turn_detection_maps_vad_sensitivity():
     config = GeminiRealtimeConfig()
 

@@ -53,6 +53,8 @@ from litellm.types.llms.vertex_ai import (
     HttpxContentType,
 )
 from litellm.types.realtime import (
+    RealtimeGoAwayNotice,
+    RealtimeResumptionState,
     ALL_DELTA_TYPES,
     RealtimeModalityResponseTransformOutput,
     RealtimeResponseTransformInput,
@@ -81,6 +83,15 @@ _SPEECH_END_SENSITIVITY_MAP: dict[str, EndOfSpeechSensitivityEnum] = {
     "high": "END_SENSITIVITY_HIGH",
     "low": "END_SENSITIVITY_LOW",
 }
+
+
+def _parse_duration_ms(value: object) -> Optional[int]:
+    if not isinstance(value, str) or not value.endswith("s"):
+        return None
+    try:
+        return int(float(value[:-1]) * 1000)
+    except ValueError:
+        return None
 
 
 def _voice_to_audio_params(value: object) -> dict[str, str]:
@@ -461,6 +472,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             generation_config.setdefault("responseModalities", ["AUDIO"])
             new_overrides.setdefault("inputAudioTranscription", {})
             new_overrides.setdefault("outputAudioTranscription", {})
+            new_overrides.setdefault("sessionResumption", {})
             new_overrides["model"] = f"models/{model}"
             verbose_logger.debug("Gemini Realtime: Sending initial setup with tools to backend")
             return [json.dumps({"setup": self._finalize_gemini_live_setup(model, new_overrides)})]
@@ -1595,6 +1607,39 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "session_configuration_request": session_configuration_request,
         }
 
+    def supports_session_resumption(self) -> bool:
+        return True
+
+    def extract_resumption_state(self, event: dict) -> Optional[RealtimeResumptionState]:
+        update = event.get("sessionResumptionUpdate")
+        if not isinstance(update, dict):
+            return None
+        handle = update.get("newHandle")
+        if not isinstance(handle, str) or not handle:
+            return None
+        return RealtimeResumptionState(handle=handle, resumable=bool(update.get("resumable")))
+
+    def extract_go_away(self, event: dict) -> Optional[RealtimeGoAwayNotice]:
+        go_away = event.get("goAway")
+        if not isinstance(go_away, dict):
+            return None
+        return RealtimeGoAwayNotice(time_left_ms=_parse_duration_ms(go_away.get("timeLeft")))
+
+    def build_resume_session_request(
+        self, state: RealtimeResumptionState, original_session_request: Optional[str]
+    ) -> Optional[str]:
+        if not state.resumable or original_session_request is None:
+            return original_session_request
+        try:
+            request = json.loads(original_session_request)
+        except json.JSONDecodeError:
+            return original_session_request
+        setup = request.get("setup")
+        if not isinstance(setup, dict):
+            return original_session_request
+        setup["sessionResumption"] = {"handle": state.handle}
+        return json.dumps(request)
+
     def requires_session_configuration(self) -> bool:
         # Deferred setup opt-in: litellm.gemini_live_defer_setup = True
         return not litellm.gemini_live_defer_setup
@@ -1631,6 +1676,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             # Return input transcript so guardrails can inspect user speech.
             "inputAudioTranscription": {},
             "outputAudioTranscription": {},
+            "sessionResumption": {},
         }
         return json.dumps(
             {

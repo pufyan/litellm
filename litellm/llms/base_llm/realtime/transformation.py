@@ -5,8 +5,10 @@ import httpx
 
 from litellm.types.llms.openai import OpenAIRealtimeStreamSessionEvents
 from litellm.types.realtime import (
+    RealtimeGoAwayNotice,
     RealtimeResponseTransformInput,
     RealtimeResponseTypedDict,
+    RealtimeResumptionState,
 )
 
 from ..chat.transformation import BaseLLMException
@@ -85,6 +87,29 @@ class BaseRealtimeConfig(ABC):
         emit a synthetic event immediately after backend websocket connection.
         """
         return None
+
+    def supports_session_resumption(self) -> bool:
+        """Whether the provider backend can resume a live session on a fresh
+        websocket (e.g. Gemini Live's sessionResumption handle)."""
+        return False
+
+    def extract_resumption_state(self, event: dict) -> Optional[RealtimeResumptionState]:
+        """Return updated resumption state when ``event`` carries a new resumption
+        token/handle from the backend; None otherwise."""
+        return None
+
+    def extract_go_away(self, event: dict) -> Optional[RealtimeGoAwayNotice]:
+        """Return a notice when ``event`` announces the backend will close the
+        connection soon (e.g. Gemini Live ``goAway``); None otherwise."""
+        return None
+
+    def build_resume_session_request(
+        self, state: RealtimeResumptionState, original_session_request: Optional[str]
+    ) -> Optional[str]:
+        """Build the first message for a re-opened backend socket that resumes the
+        prior session from ``state``. Default: re-send the original setup (fresh
+        session, prior server-side context is lost)."""
+        return original_session_request
 
     @abstractmethod
     def transform_realtime_response(

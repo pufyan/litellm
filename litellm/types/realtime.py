@@ -1,7 +1,8 @@
+from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel
-from typing_extensions import TypedDict  # noqa: F401 – re-exported
+from typing_extensions import TypedDict
 
 from .llms.openai import (
     OpenAIRealtimeEvents,
@@ -10,6 +11,17 @@ from .llms.openai import (
 )
 
 ALL_DELTA_TYPES = Literal["text", "audio"]
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeResumptionState:
+    handle: str
+    resumable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeGoAwayNotice:
+    time_left_ms: Optional[int]
 
 
 class RealtimeResponseTransformInput(TypedDict):
