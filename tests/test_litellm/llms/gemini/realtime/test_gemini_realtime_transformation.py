@@ -539,6 +539,55 @@ def test_gemini_setup_requests_both_transcriptions():
     assert deferred_setup["outputAudioTranscription"] == {}
 
 
+def test_gemini_turn_detection_maps_vad_sensitivity():
+    config = GeminiRealtimeConfig()
+
+    mapped = config.map_automatic_turn_detection(
+        {
+            "type": "server_vad",
+            "prefix_padding_ms": 100,
+            "silence_duration_ms": 300,
+            "start_sensitivity": "high",
+            "end_sensitivity": "low",
+        }
+    )
+
+    assert mapped["startOfSpeechSensitivity"] == "START_SENSITIVITY_HIGH"
+    assert mapped["endOfSpeechSensitivity"] == "END_SENSITIVITY_LOW"
+    assert mapped["prefixPaddingMs"] == 100
+    assert mapped["silenceDurationMs"] == 300
+
+    mapped_invalid = config.map_automatic_turn_detection({"type": "server_vad", "start_sensitivity": "3"})
+    assert "startOfSpeechSensitivity" not in mapped_invalid
+
+
+def test_gemini_voice_dict_maps_language_code():
+    config = GeminiRealtimeConfig()
+
+    params = config.map_openai_params(
+        optional_params={},
+        non_default_params={"voice": {"name": "Leda", "language_code": "ru-RU"}},
+    )
+
+    speech_config = params["generationConfig"]["speechConfig"]
+    assert speech_config["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"] == "Leda"
+    assert speech_config["languageCode"] == "ru-RU"
+
+
+def test_gemini_context_window_compression_passthrough():
+    config = GeminiRealtimeConfig()
+
+    compression = {"triggerTokens": 102400, "slidingWindow": {"targetTokens": 65536}}
+    messages = config.transform_realtime_request(
+        json.dumps({"type": "session.update", "session": {"context_window_compression": compression}}),
+        "gemini-2.5-flash",
+        session_configuration_request=None,
+    )
+
+    setup_payload = json.loads(messages[0])["setup"]
+    assert setup_payload["contextWindowCompression"] == compression
+
+
 def test_gemini_subsequent_session_update_is_dropped_not_resent_as_setup():
     """Regression: Gemini Live accepts exactly one ``setup`` message; a second
     one closes the socket with ``1007 Request contains an invalid argument``.

@@ -24,6 +24,8 @@ from litellm.types.llms.gemini import (
     BidiGenerateContentServerContent,
     BidiGenerateContentServerMessage,
     BidiGenerateContentSetup,
+    EndOfSpeechSensitivityEnum,
+    StartOfSpeechSensitivityEnum,
 )
 from litellm.types.llms.openai import (
     OpenAIRealtimeContentPartDone,
@@ -70,6 +72,30 @@ MAP_GEMINI_FIELD_TO_OPENAI_EVENT: Dict[str, Union[OpenAIRealtimeEventTypes, Resp
 
 # Keys the main transform loop handles; siblings like ``usageMetadata`` are skipped.
 _KNOWN_GEMINI_TOP_LEVEL_KEYS: set = {map_key.split(".", 1)[0] for map_key in MAP_GEMINI_FIELD_TO_OPENAI_EVENT}
+
+_SPEECH_START_SENSITIVITY_MAP: dict[str, StartOfSpeechSensitivityEnum] = {
+    "high": "START_SENSITIVITY_HIGH",
+    "low": "START_SENSITIVITY_LOW",
+}
+_SPEECH_END_SENSITIVITY_MAP: dict[str, EndOfSpeechSensitivityEnum] = {
+    "high": "END_SENSITIVITY_HIGH",
+    "low": "END_SENSITIVITY_LOW",
+}
+
+
+def _voice_to_audio_params(value: object) -> dict[str, str]:
+    if isinstance(value, str):
+        return {"voice": value}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        param_key: param_value
+        for param_key, param_value in (
+            ("voice", value.get("name")),
+            ("language_code", value.get("language_code")),
+        )
+        if isinstance(param_value, str)
+    }
 
 
 class GeminiRealtimeConfig(BaseRealtimeConfig):
@@ -225,6 +251,12 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             automatic_activity_dection["prefixPaddingMs"] = value["prefix_padding_ms"]
         if "silence_duration_ms" in value and isinstance(value["silence_duration_ms"], int):
             automatic_activity_dection["silenceDurationMs"] = value["silence_duration_ms"]
+        start_sensitivity = _SPEECH_START_SENSITIVITY_MAP.get(str(value.get("start_sensitivity", "")).lower())
+        if start_sensitivity is not None:
+            automatic_activity_dection["startOfSpeechSensitivity"] = start_sensitivity
+        end_sensitivity = _SPEECH_END_SENSITIVITY_MAP.get(str(value.get("end_sensitivity", "")).lower())
+        if end_sensitivity is not None:
+            automatic_activity_dection["endOfSpeechSensitivity"] = end_sensitivity
         return automatic_activity_dection
 
     def get_supported_openai_params(self, model: str) -> List[str]:
@@ -237,7 +269,20 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "input_audio_transcription",
             "turn_detection",
             "voice",
+            "context_window_compression",
         ]
+
+    def _apply_turn_detection(self, optional_params: dict, value: OpenAIRealtimeTurnDetection) -> None:
+        if isinstance(value, dict) and value.get("type") == "semantic_vad" and "create_response" not in value:
+            # Pipecat/OpenAI GA semantic VAD — skip; Gemini uses its own VAD.
+            # Only skip when there is no create_response override so that
+            # a guardrail-injected create_response:false is not dropped.
+            return
+        transformed_audio_activity_config = self.map_automatic_turn_detection(value)
+        if transformed_audio_activity_config:
+            optional_params["realtimeInputConfig"] = BidiGenerateContentRealtimeInputConfig(
+                automaticActivityDetection=transformed_audio_activity_config
+            )
 
     def map_openai_params(self, optional_params: dict, non_default_params: dict) -> dict:
         if "generationConfig" not in optional_params:
@@ -266,30 +311,18 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             elif key == "input_audio_transcription" and value is not None:
                 optional_params["inputAudioTranscription"] = {}
             elif key == "turn_detection":
-                value_typed = cast(OpenAIRealtimeTurnDetection, value)
-                if (
-                    isinstance(value_typed, dict)
-                    and value_typed.get("type") == "semantic_vad"
-                    and "create_response" not in value_typed
-                ):
-                    # Pipecat/OpenAI GA semantic VAD — skip; Gemini uses its own VAD.
-                    # Only skip when there is no create_response override so that
-                    # a guardrail-injected create_response:false is not dropped.
-                    continue
-                transformed_audio_activity_config = self.map_automatic_turn_detection(value_typed)
-                if transformed_audio_activity_config:
-                    optional_params["realtimeInputConfig"] = BidiGenerateContentRealtimeInputConfig(
-                        automaticActivityDetection=transformed_audio_activity_config
-                    )
+                self._apply_turn_detection(optional_params, cast(OpenAIRealtimeTurnDetection, value))
             elif key == "voice":
                 from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
                     VertexGeminiConfig,
                 )
 
                 vertex_gemini_config = VertexGeminiConfig()
-                speech_config = vertex_gemini_config._map_audio_params({"voice": value})
+                speech_config = vertex_gemini_config._map_audio_params(_voice_to_audio_params(value))
                 if speech_config:
                     optional_params["generationConfig"]["speechConfig"] = speech_config
+            elif key == "context_window_compression" and isinstance(value, dict):
+                optional_params["contextWindowCompression"] = value
         if len(optional_params["generationConfig"]) == 0:
             optional_params.pop("generationConfig")
         return optional_params
