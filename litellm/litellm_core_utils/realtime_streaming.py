@@ -707,6 +707,11 @@ class RealTimeStreaming:
         state = self.provider_config.extract_resumption_state(event_obj)
         if isinstance(state, RealtimeResumptionState):
             self._resumption_state = state
+            verbose_logger.debug(
+                "Realtime session resumption state updated (resumable=%s, handle_len=%d)",
+                state.resumable,
+                len(state.handle),
+            )
             return "state"
         if isinstance(self.provider_config.extract_go_away(event_obj), RealtimeGoAwayNotice):
             return "go_away"
