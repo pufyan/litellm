@@ -477,6 +477,27 @@ def test_gemini_session_update_defaults_to_audio_modality():
     assert setup_payload["generationConfig"]["responseModalities"] == ["AUDIO"]
 
 
+def test_gemini_setup_requests_both_transcriptions():
+    """Regression: outputAudioTranscription was hardcoded off, so OpenAI-Realtime
+    clients never received ``response.output_audio_transcript.delta``. Both the
+    eager setup and the deferred (session.update-built) setup must request input
+    and output transcription from Gemini."""
+    config = GeminiRealtimeConfig()
+
+    eager_setup = json.loads(config.session_configuration_request("gemini-2.5-flash"))["setup"]
+    assert eager_setup["inputAudioTranscription"] == {}
+    assert eager_setup["outputAudioTranscription"] == {}
+
+    messages = config.transform_realtime_request(
+        json.dumps({"type": "session.update", "session": {}}),
+        "gemini-2.5-flash",
+        session_configuration_request=None,
+    )
+    deferred_setup = json.loads(messages[0])["setup"]
+    assert deferred_setup["inputAudioTranscription"] == {}
+    assert deferred_setup["outputAudioTranscription"] == {}
+
+
 def test_gemini_subsequent_session_update_is_dropped_not_resent_as_setup():
     """Regression: Gemini Live accepts exactly one ``setup`` message; a second
     one closes the socket with ``1007 Request contains an invalid argument``.

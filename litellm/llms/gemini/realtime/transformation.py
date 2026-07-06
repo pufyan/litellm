@@ -427,6 +427,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             generation_config = new_overrides.setdefault("generationConfig", {})
             generation_config.setdefault("responseModalities", ["AUDIO"])
             new_overrides.setdefault("inputAudioTranscription", {})
+            new_overrides.setdefault("outputAudioTranscription", {})
             new_overrides["model"] = f"models/{model}"
             verbose_logger.debug("Gemini Realtime: Sending initial setup with tools to backend")
             return [json.dumps({"setup": self._finalize_gemini_live_setup(model, new_overrides)})]
@@ -1573,18 +1574,14 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         """
 
         response_modalities: List[GeminiResponseModalities] = ["AUDIO"]
-        output_audio_transcription = False
-        # if "audio" in model: ## UNCOMMENT THIS WHEN AUDIO IS SUPPORTED
-        #     output_audio_transcription = True
 
         setup_config: BidiGenerateContentSetup = {
             "model": f"models/{model}",
             "generationConfig": {"responseModalities": response_modalities},
             # Return input transcript so guardrails can inspect user speech.
             "inputAudioTranscription": {},
+            "outputAudioTranscription": {},
         }
-        if output_audio_transcription:
-            setup_config["outputAudioTranscription"] = {}
         return json.dumps(
             {
                 "setup": setup_config,
