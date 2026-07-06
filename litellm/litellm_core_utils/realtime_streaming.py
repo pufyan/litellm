@@ -15,7 +15,7 @@ from litellm.types.llms.openai import (
     OpenAIRealtimeStreamResponseBaseObject,
     OpenAIRealtimeStreamSessionEvents,
 )
-from litellm.types.realtime import ALL_DELTA_TYPES
+from litellm.types.realtime import ALL_DELTA_TYPES, RealtimeGoAwayNotice, RealtimeResumptionState
 
 from .litellm_logging import Logging as LiteLLMLogging
 
@@ -119,10 +119,18 @@ class RealTimeStreaming:
         self._is_transcription_session: bool = force_transcription_model is not None
         # Optional per-provider GA event normalizer (e.g. XAIRealtimeNormalizer).
         self._event_normalizer = event_normalizer
+        # Backend session resumption: latest provider resumption token and
+        # whether a backend reconnect is currently in flight (client messages
+        # are buffered while True).
+        self._resumption_state: Optional[RealtimeResumptionState] = None
+        self._reconnecting_backend: bool = False
+        self._reconnect_resumed_mode: str = "fresh"
 
     # Per-connection caps for pre-setup audio frames (message count + total bytes).
     _MAX_BUFFERED_MESSAGES: int = 200
     _MAX_BUFFERED_BYTES: int = 10 * 1024 * 1024  # 10 MB
+
+    _RECONNECT_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
 
     _SESSION_EVENT_TYPES = frozenset(["session.created", "session.updated"])
     _CLIENT_AUDIO_BUFFER_TYPES = frozenset(
@@ -490,6 +498,8 @@ class RealTimeStreaming:
         )
 
     def _should_buffer_client_message_until_setup(self, message: str) -> bool:
+        if self._reconnecting_backend:
+            return True
         if not self._uses_deferred_backend_setup():
             return False
         if self._backend_setup_complete and not self._flushing_pending_messages_until_setup:
@@ -547,6 +557,99 @@ class RealTimeStreaming:
                 )
                 return False
         return True
+
+    def _supports_backend_reconnect(self) -> bool:
+        return (
+            self.backend_connector is not None
+            and self.provider_config is not None
+            and self.provider_config.supports_session_resumption() is True
+            and self.session_configuration_request is not None
+        )
+
+    async def _send_litellm_session_event(self, event: dict[str, str]) -> None:
+        try:
+            await self.websocket.send_text(json.dumps(event))
+        except (RuntimeError, OSError) as e:
+            verbose_logger.debug(f"Failed to send litellm session event to client: {e}")
+
+    async def _reconnect_backend(self, reason: str) -> bool:
+        """Re-open the backend websocket and resume (or restart) the session.
+
+        Keeps the client socket alive; client messages arriving meanwhile are
+        buffered and flushed once the new backend acknowledges setup. Returns
+        False when every attempt failed (caller should tear the session down).
+        """
+        import websockets.exceptions
+
+        if self.backend_connector is None or self.provider_config is None:
+            return False
+        self._reconnecting_backend = True
+        await self._send_litellm_session_event({"type": "litellm.session.reconnecting", "reason": reason})
+        state = self._resumption_state
+        resume_request = (
+            self.provider_config.build_resume_session_request(state, self.session_configuration_request)
+            if state is not None
+            else self.session_configuration_request
+        )
+        old_ws = self.backend_ws
+        for attempt, delay in enumerate(self._RECONNECT_BACKOFF_SECONDS, start=1):
+            try:
+                new_ws = await self.backend_connector.connect()
+                if resume_request is not None:
+                    await new_ws.send(resume_request)
+                self.backend_ws = new_ws
+                self._reconnect_resumed_mode = "native" if (state is not None and state.resumable) else "fresh"
+                try:
+                    await old_ws.close()
+                except (OSError, RuntimeError, websockets.exceptions.WebSocketException):
+                    pass
+                verbose_logger.info(
+                    "Realtime backend reconnected (attempt %d, reason=%s, resumed=%s)",
+                    attempt,
+                    reason,
+                    self._reconnect_resumed_mode,
+                )
+                return True
+            except (TimeoutError, OSError, RuntimeError, websockets.exceptions.WebSocketException) as e:
+                verbose_logger.warning(
+                    "Realtime backend reconnect attempt %d failed (%s); retrying in %.1fs", attempt, e, delay
+                )
+                await asyncio.sleep(delay)
+        self._reconnecting_backend = False
+        return False
+
+    async def _on_backend_setup_acknowledged_after_reconnect(self) -> None:
+        self._reconnecting_backend = False
+        while self._pending_messages_until_setup:
+            flushed = await self._flush_pending_messages_until_setup()
+            if not flushed:
+                break
+        await self._send_litellm_session_event(
+            {"type": "litellm.session.reconnected", "resumed": self._reconnect_resumed_mode}
+        )
+
+    def _handle_resumption_service_event(self, raw_response: str) -> Optional[str]:
+        """Intercept provider resumption/goAway service events.
+
+        Returns "state" when the event updated the resumption token, "go_away"
+        when the backend announced imminent shutdown, None for regular events
+        that must continue through the normal transform path.
+        """
+        if self.provider_config is None or self.provider_config.supports_session_resumption() is not True:
+            return None
+        try:
+            event_obj = json.loads(raw_response)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(event_obj, dict):
+            return None
+        state = self.provider_config.extract_resumption_state(event_obj)
+        if isinstance(state, RealtimeResumptionState):
+            self._resumption_state = state
+            return "state"
+        if isinstance(self.provider_config.extract_go_away(event_obj), RealtimeGoAwayNotice):
+            return "go_away"
+        return None
 
     def _should_drop_event_from_client(self, event: object) -> bool:
         """Return True for provider-specific events that must not reach GA clients."""
@@ -865,6 +968,12 @@ class RealTimeStreaming:
                 continue
             is_session_created_event = isinstance(event, dict) and event.get("type") == "session.created"
             if is_session_created_event:
+                if self._reconnecting_backend:
+                    await self._on_backend_setup_acknowledged_after_reconnect()
+                    # The client already saw session.created; a post-reconnect
+                    # duplicate is swallowed (litellm.session.reconnected is the
+                    # client-facing signal for this transition).
+                    continue
                 if self._uses_deferred_backend_setup() and not self._backend_setup_complete:
                     self._backend_setup_complete = True
                     self._flushing_pending_messages_until_setup = True
@@ -966,17 +1075,46 @@ class RealTimeStreaming:
             return True
         return False
 
+    async def _recv_from_backend_reconnecting_on_drop(self) -> "str | bytes | None":
+        """Receive one backend frame; on connection drop try to resume the
+        session on a fresh socket. None means "retry the loop" after a
+        successful reconnect."""
+        import websockets.exceptions
+
+        try:
+            try:
+                return await self.backend_ws.recv(decode=False)  # type: ignore[union-attr]
+            except TypeError:
+                return await self.backend_ws.recv()  # type: ignore[union-attr]
+        except websockets.exceptions.ConnectionClosed:
+            if not self._supports_backend_reconnect():
+                raise
+            if await self._reconnect_backend(reason="connection_closed"):
+                return None
+            raise
+
+    async def _maybe_handle_resumption_service_event(self, raw_response: str) -> bool:
+        """True when ``raw_response`` was a resumption/goAway service event that
+        must not continue through the normal transform path."""
+        import websockets.exceptions
+
+        service_event = self._handle_resumption_service_event(raw_response)
+        if service_event == "state":
+            return True
+        if service_event == "go_away" and self._supports_backend_reconnect():
+            if await self._reconnect_backend(reason="go_away"):
+                return True
+            raise websockets.exceptions.ConnectionClosedError(None, None)
+        return False
+
     async def backend_to_client_send_messages(self):
         import websockets
 
         try:
             while True:
-                try:
-                    raw_response = await self.backend_ws.recv(  # type: ignore[union-attr]
-                        decode=False
-                    )
-                except TypeError:
-                    raw_response = await self.backend_ws.recv()  # type: ignore[union-attr, assignment]
+                raw_response = await self._recv_from_backend_reconnecting_on_drop()
+                if raw_response is None:
+                    continue
 
                 if isinstance(raw_response, bytes):
                     try:
@@ -986,6 +1124,8 @@ class RealTimeStreaming:
                         continue
 
                 if self.provider_config:
+                    if await self._maybe_handle_resumption_service_event(raw_response):
+                        continue
                     try:
                         await self._handle_provider_config_message(raw_response)
                     except Exception as e:
@@ -1407,7 +1547,16 @@ class RealTimeStreaming:
                 # would permanently disable the injection if ``_send_to_backend``
                 # raised — neither this loop nor
                 # ``_maybe_send_guardrail_turn_detection_update`` would retry.
-                sent = await self._send_to_backend(message)
+                try:
+                    sent = await self._send_to_backend(message)
+                except Exception:
+                    if not self._supports_backend_reconnect():
+                        raise
+                    # Backend socket dropped mid-send while resumption is
+                    # available: keep the client session alive and let the
+                    # backend loop reconnect; replay this message after setup.
+                    self._buffer_pending_message_until_setup(message)
+                    continue
                 if guardrail_turn_detection_injected and sent:
                     self._guardrail_turn_detection_update_sent = True
 

@@ -2968,3 +2968,138 @@ async def test_log_messages_routes_async_logging_through_bounded_worker():
         mock_worker.ensure_initialized_and_enqueue.assert_called_once()
         # the bare create_task path must no longer be used for success logging
         mock_create_task.assert_not_called()
+
+
+def _make_gemini_reconnect_streaming(recv_sequences, connector_outcomes):
+    """Streaming wired to real GeminiRealtimeConfig with scripted backend sockets.
+
+    ``recv_sequences`` is a list of per-socket recv scripts (bytes to yield or an
+    exception instance to raise). ``connector_outcomes`` scripts
+    backend_connector.connect(): a socket index (int) or an exception to raise.
+    """
+    from litellm.llms.gemini.realtime.transformation import GeminiRealtimeConfig
+
+    sockets = []
+    for script in recv_sequences:
+        ws = MagicMock()
+        ws.recv = AsyncMock(side_effect=list(script))
+        ws.send = AsyncMock()
+        ws.close = AsyncMock()
+        sockets.append(ws)
+
+    async def _connect():
+        outcome = connector_outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return sockets[outcome]
+
+    connector = MagicMock()
+    connector.connect = AsyncMock(side_effect=_connect)
+
+    client_ws = MagicMock()
+    client_ws.send_text = AsyncMock()
+
+    logging_obj = MagicMock()
+    logging_obj.litellm_trace_id = "trace_1"
+    logging_obj.async_success_handler = AsyncMock()
+    logging_obj.success_handler = MagicMock()
+
+    streaming = RealTimeStreaming(
+        client_ws,
+        sockets[0],
+        logging_obj,
+        provider_config=GeminiRealtimeConfig(),
+        model="gemini-2.5-flash",
+        backend_connector=connector,
+    )
+    streaming.session_configuration_request = GeminiRealtimeConfig().session_configuration_request(
+        "gemini-2.5-flash"
+    )
+    streaming._session_created_sent_to_client = True
+    return streaming, sockets, connector, client_ws
+
+
+def _client_events(client_ws):
+    return [json.loads(c.args[0]) for c in client_ws.send_text.call_args_list]
+
+
+@pytest.mark.asyncio
+async def test_go_away_triggers_native_resumption_reconnect():
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[
+            [
+                b'{"sessionResumptionUpdate": {"newHandle": "h-42", "resumable": true}}',
+                b'{"goAway": {"timeLeft": "5s"}}',
+            ],
+            [b'{"setupComplete": {}}', ConnectionClosed(None, None)],
+        ],
+        connector_outcomes=[1, ConnectionClosed(None, None), ConnectionClosed(None, None), ConnectionClosed(None, None)],
+    )
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        await streaming.backend_to_client_send_messages()
+
+    resume_setup = json.loads(sockets[1].send.call_args_list[0].args[0])
+    assert resume_setup["setup"]["sessionResumption"] == {"handle": "h-42"}
+
+    event_types = [e["type"] for e in _client_events(client_ws)]
+    assert "litellm.session.reconnecting" in event_types
+    reconnected = [e for e in _client_events(client_ws) if e["type"] == "litellm.session.reconnected"]
+    assert reconnected and reconnected[0]["resumed"] == "native"
+    sockets[0].close.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_backend_drop_reconnects_and_flushes_buffered_audio():
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[
+            [ConnectionClosed(None, None)],
+            [b'{"setupComplete": {}}', ConnectionClosed(None, None)],
+        ],
+        connector_outcomes=[1, ConnectionClosed(None, None), ConnectionClosed(None, None), ConnectionClosed(None, None)],
+    )
+    streaming._reconnecting_backend = False
+    audio_msg = json.dumps({"type": "input_audio_buffer.append", "audio": "QUJD"})
+
+    async def _run():
+        await streaming.backend_to_client_send_messages()
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        streaming._buffer_pending_message_until_setup(audio_msg)
+        await _run()
+
+    sent_to_new_backend = [c.args[0] for c in sockets[1].send.call_args_list]
+    assert any("realtimeInput" in msg for msg in sent_to_new_backend)
+    reconnected = [e for e in _client_events(client_ws) if e["type"] == "litellm.session.reconnected"]
+    assert reconnected and reconnected[0]["resumed"] == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_reconnect_gives_up_after_exhausted_attempts():
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[[ConnectionClosed(None, None)]],
+        connector_outcomes=[OSError("down"), OSError("down"), OSError("down")],
+    )
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        await streaming.backend_to_client_send_messages()
+
+    assert connector.connect.await_count == 3
+    event_types = [e["type"] for e in _client_events(client_ws)]
+    assert "litellm.session.reconnecting" in event_types
+    assert "litellm.session.reconnected" not in event_types
+
+
+@pytest.mark.asyncio
+async def test_client_messages_buffer_while_reconnecting():
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[[]],
+        connector_outcomes=[],
+    )
+    streaming._reconnecting_backend = True
+
+    audio_msg = json.dumps({"type": "input_audio_buffer.append", "audio": "QUJD"})
+    assert streaming._should_buffer_client_message_until_setup(audio_msg) is True
+    streaming._buffer_pending_message_until_setup(audio_msg)
+    assert streaming._pending_messages_until_setup == [audio_msg]
+    sockets[0].send.assert_not_awaited()
