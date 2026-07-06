@@ -59,6 +59,7 @@ from litellm.types.realtime import (
     RealtimeResponseTransformInput,
     RealtimeResponseTypedDict,
     RealtimeResumptionState,
+    RealtimeTranscriptEntry,
 )
 from litellm.utils import get_empty_usage
 
@@ -1639,6 +1640,24 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             return original_session_request
         setup["sessionResumption"] = {"handle": state.handle}
         return json.dumps(request)
+
+    def build_history_replay_messages(self, entries: "tuple[RealtimeTranscriptEntry, ...]") -> "Optional[list[str]]":
+        if not entries:
+            return None
+        turns = tuple(
+            {"role": "model" if entry.role == "assistant" else "user", "parts": [{"text": entry.text}]}
+            for entry in entries
+        )
+        return [
+            json.dumps(
+                {
+                    "clientContent": {
+                        "turns": list(turns),
+                        "turnComplete": False,
+                    }
+                }
+            )
+        ]
 
     def requires_session_configuration(self) -> bool:
         # Deferred setup opt-in: litellm.gemini_live_defer_setup = True

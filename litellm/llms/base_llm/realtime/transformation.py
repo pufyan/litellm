@@ -9,6 +9,7 @@ from litellm.types.realtime import (
     RealtimeResponseTransformInput,
     RealtimeResponseTypedDict,
     RealtimeResumptionState,
+    RealtimeTranscriptEntry,
 )
 
 from ..chat.transformation import BaseLLMException
@@ -110,6 +111,13 @@ class BaseRealtimeConfig(ABC):
         prior session from ``state``. Default: re-send the original setup (fresh
         session, prior server-side context is lost)."""
         return original_session_request
+
+    def build_history_replay_messages(self, entries: "tuple[RealtimeTranscriptEntry, ...]") -> "Optional[list[str]]":
+        """Build provider-native messages that inject the accumulated conversation
+        transcript into a freshly restarted session (used when no native
+        resumption token is available). Return None when the provider cannot
+        replay history; the reconnect then proceeds with an empty context."""
+        return None
 
     @abstractmethod
     def transform_realtime_response(

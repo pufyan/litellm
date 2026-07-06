@@ -15,7 +15,12 @@ from litellm.types.llms.openai import (
     OpenAIRealtimeStreamResponseBaseObject,
     OpenAIRealtimeStreamSessionEvents,
 )
-from litellm.types.realtime import ALL_DELTA_TYPES, RealtimeGoAwayNotice, RealtimeResumptionState
+from litellm.types.realtime import (
+    ALL_DELTA_TYPES,
+    RealtimeGoAwayNotice,
+    RealtimeResumptionState,
+    RealtimeTranscriptEntry,
+)
 
 from .litellm_logging import Logging as LiteLLMLogging
 
@@ -125,12 +130,21 @@ class RealTimeStreaming:
         self._resumption_state: Optional[RealtimeResumptionState] = None
         self._reconnecting_backend: bool = False
         self._reconnect_resumed_mode: str = "fresh"
+        # Conversation transcript for history replay on a fresh (non-native)
+        # reconnect: user/assistant turns plus service notes such as barge-ins.
+        self._transcript_entries: list[RealtimeTranscriptEntry] = []
+        self._assistant_transcript_chunks: list[str] = []
 
     # Per-connection caps for pre-setup audio frames (message count + total bytes).
     _MAX_BUFFERED_MESSAGES: int = 200
     _MAX_BUFFERED_BYTES: int = 10 * 1024 * 1024  # 10 MB
 
     _RECONNECT_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+    _MAX_TRANSCRIPT_ENTRIES: int = 200
+    _REPLAY_RESTORED_NOTE = (
+        "[note: the connection dropped mid-call; the voice-call transcript so far is restored below]"
+    )
+    _REPLAY_INTERRUPTED_NOTE = "[note: the user interrupted the assistant's previous answer]"
 
     _SESSION_EVENT_TYPES = frozenset(["session.created", "session.updated"])
     _CLIENT_AUDIO_BUFFER_TYPES = frozenset(
@@ -618,8 +632,55 @@ class RealTimeStreaming:
         self._reconnecting_backend = False
         return False
 
+    def _append_transcript_entry(self, role: str, text: str) -> None:
+        if not text or len(self._transcript_entries) >= self._MAX_TRANSCRIPT_ENTRIES:
+            return
+        self._transcript_entries.append(RealtimeTranscriptEntry(role=cast(Any, role), text=text))
+
+    def _flush_assistant_transcript(self, interrupted: bool = False) -> None:
+        if self._assistant_transcript_chunks:
+            self._append_transcript_entry("assistant", "".join(self._assistant_transcript_chunks))
+            self._assistant_transcript_chunks = []
+        if interrupted:
+            self._append_transcript_entry("note", self._REPLAY_INTERRUPTED_NOTE)
+
+    def _record_transcript_event(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
+        event_type = event.get("type")
+        if event_type == "conversation.item.input_audio_transcription.completed":
+            self._append_transcript_entry("user", cast(str, event.get("transcript") or ""))
+        elif event_type in ("response.output_audio_transcript.delta", "response.audio_transcript.delta"):
+            delta = event.get("delta")
+            if isinstance(delta, str) and delta:
+                self._assistant_transcript_chunks.append(delta)
+        elif event_type == "input_audio_buffer.speech_started":
+            self._flush_assistant_transcript(interrupted=bool(self._assistant_transcript_chunks))
+        elif event_type == "response.done":
+            self._flush_assistant_transcript()
+
+    async def _replay_transcript_after_fresh_reconnect(self) -> None:
+        if self.provider_config is None or not self._transcript_entries:
+            return
+        self._flush_assistant_transcript()
+        entries = (
+            RealtimeTranscriptEntry(role="note", text=self._REPLAY_RESTORED_NOTE),
+            *self._transcript_entries,
+        )
+        replay_messages = self.provider_config.build_history_replay_messages(entries)
+        if not replay_messages:
+            return
+        for message in replay_messages:
+            await self.backend_ws.send(message)  # type: ignore[union-attr, attr-defined]
+        self._reconnect_resumed_mode = "replayed"
+
     async def _on_backend_setup_acknowledged_after_reconnect(self) -> None:
         self._reconnecting_backend = False
+        if self._reconnect_resumed_mode == "fresh":
+            try:
+                await self._replay_transcript_after_fresh_reconnect()
+            except (OSError, RuntimeError) as e:
+                verbose_logger.warning("Failed to replay transcript after reconnect: %s", e)
         while self._pending_messages_until_setup:
             flushed = await self._flush_pending_messages_until_setup()
             if not flushed:
@@ -966,6 +1027,8 @@ class RealTimeStreaming:
         for event in events:
             if self._should_drop_event_from_client(event):
                 continue
+            if self.provider_config is not None and self.provider_config.supports_session_resumption() is True:
+                self._record_transcript_event(event)
             is_session_created_event = isinstance(event, dict) and event.get("type") == "session.created"
             if is_session_created_event:
                 if self._reconnecting_backend:

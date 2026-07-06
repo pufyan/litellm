@@ -3012,9 +3012,7 @@ def _make_gemini_reconnect_streaming(recv_sequences, connector_outcomes):
         model="gemini-2.5-flash",
         backend_connector=connector,
     )
-    streaming.session_configuration_request = GeminiRealtimeConfig().session_configuration_request(
-        "gemini-2.5-flash"
-    )
+    streaming.session_configuration_request = GeminiRealtimeConfig().session_configuration_request("gemini-2.5-flash")
     streaming._session_created_sent_to_client = True
     return streaming, sockets, connector, client_ws
 
@@ -3033,7 +3031,12 @@ async def test_go_away_triggers_native_resumption_reconnect():
             ],
             [b'{"setupComplete": {}}', ConnectionClosed(None, None)],
         ],
-        connector_outcomes=[1, ConnectionClosed(None, None), ConnectionClosed(None, None), ConnectionClosed(None, None)],
+        connector_outcomes=[
+            1,
+            ConnectionClosed(None, None),
+            ConnectionClosed(None, None),
+            ConnectionClosed(None, None),
+        ],
     )
 
     with patch("asyncio.sleep", new=AsyncMock()):
@@ -3056,7 +3059,12 @@ async def test_unexpected_backend_drop_reconnects_and_flushes_buffered_audio():
             [ConnectionClosed(None, None)],
             [b'{"setupComplete": {}}', ConnectionClosed(None, None)],
         ],
-        connector_outcomes=[1, ConnectionClosed(None, None), ConnectionClosed(None, None), ConnectionClosed(None, None)],
+        connector_outcomes=[
+            1,
+            ConnectionClosed(None, None),
+            ConnectionClosed(None, None),
+            ConnectionClosed(None, None),
+        ],
     )
     streaming._reconnecting_backend = False
     audio_msg = json.dumps({"type": "input_audio_buffer.append", "audio": "QUJD"})
@@ -3103,3 +3111,90 @@ async def test_client_messages_buffer_while_reconnecting():
     streaming._buffer_pending_message_until_setup(audio_msg)
     assert streaming._pending_messages_until_setup == [audio_msg]
     sockets[0].send.assert_not_awaited()
+
+
+def test_transcript_accumulates_turns_and_interruptions():
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[[]],
+        connector_outcomes=[],
+    )
+
+    streaming._record_transcript_event(
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "Алло, добрый день"}
+    )
+    streaming._record_transcript_event({"type": "response.output_audio_transcript.delta", "delta": "Здравствуйте, "})
+    streaming._record_transcript_event({"type": "response.output_audio_transcript.delta", "delta": "чем помочь?"})
+    streaming._record_transcript_event({"type": "response.done"})
+    streaming._record_transcript_event({"type": "response.output_audio_transcript.delta", "delta": "Сейчас рас"})
+    streaming._record_transcript_event({"type": "input_audio_buffer.speech_started"})
+
+    roles_texts = [(e.role, e.text) for e in streaming._transcript_entries]
+    assert roles_texts == [
+        ("user", "Алло, добрый день"),
+        ("assistant", "Здравствуйте, чем помочь?"),
+        ("assistant", "Сейчас рас"),
+        ("note", RealTimeStreaming._REPLAY_INTERRUPTED_NOTE),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fresh_reconnect_replays_transcript_and_reports_replayed():
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[
+            [ConnectionClosed(None, None)],
+            [b'{"setupComplete": {}}', ConnectionClosed(None, None)],
+        ],
+        connector_outcomes=[
+            1,
+            ConnectionClosed(None, None),
+            ConnectionClosed(None, None),
+            ConnectionClosed(None, None),
+        ],
+    )
+    streaming._record_transcript_event(
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "Проверка"}
+    )
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        await streaming.backend_to_client_send_messages()
+
+    sent_to_new_backend = [c.args[0] for c in sockets[1].send.call_args_list]
+    replay = [json.loads(m) for m in sent_to_new_backend if "clientContent" in m]
+    assert len(replay) == 1
+    turns = replay[0]["clientContent"]["turns"]
+    assert replay[0]["clientContent"]["turnComplete"] is False
+    assert turns[0]["role"] == "user" and "restored below" in turns[0]["parts"][0]["text"]
+    assert turns[-1]["parts"][0]["text"] == "Проверка"
+
+    reconnected = [e for e in _client_events(client_ws) if e["type"] == "litellm.session.reconnected"]
+    assert reconnected and reconnected[0]["resumed"] == "replayed"
+
+
+@pytest.mark.asyncio
+async def test_native_reconnect_does_not_replay_transcript():
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[
+            [
+                b'{"sessionResumptionUpdate": {"newHandle": "h-1", "resumable": true}}',
+                ConnectionClosed(None, None),
+            ],
+            [b'{"setupComplete": {}}', ConnectionClosed(None, None)],
+        ],
+        connector_outcomes=[
+            1,
+            ConnectionClosed(None, None),
+            ConnectionClosed(None, None),
+            ConnectionClosed(None, None),
+        ],
+    )
+    streaming._record_transcript_event(
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "Проверка"}
+    )
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        await streaming.backend_to_client_send_messages()
+
+    sent_to_new_backend = [c.args[0] for c in sockets[1].send.call_args_list]
+    assert not any("clientContent" in m for m in sent_to_new_backend)
+    reconnected = [e for e in _client_events(client_ws) if e["type"] == "litellm.session.reconnected"]
+    assert reconnected and reconnected[0]["resumed"] == "native"

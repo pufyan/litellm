@@ -24,6 +24,12 @@ class RealtimeGoAwayNotice:
     time_left_ms: Optional[int]
 
 
+@dataclass(frozen=True, slots=True)
+class RealtimeTranscriptEntry:
+    role: Literal["user", "assistant", "note"]
+    text: str
+
+
 class RealtimeResponseTransformInput(TypedDict):
     session_configuration_request: Optional[str]
     current_output_item_id: Optional[
