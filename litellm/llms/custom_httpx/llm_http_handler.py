@@ -30,6 +30,7 @@ from litellm._logging import _redact_string, verbose_logger
 from litellm.anthropic_beta_headers_manager import update_headers_with_filtered_beta
 from litellm.constants import REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
 from litellm.litellm_core_utils.asyncify import run_async_function
+from litellm.litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
 from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
 from litellm.litellm_core_utils.url_utils import encode_url_path_segment
 from litellm.llms.base_llm.anthropic_messages.transformation import (
@@ -5564,58 +5565,6 @@ class BaseLLMHTTPHandler:
         new_query = parsed.query + ("&" if parsed.query else "") + urlencode(extras)
         return urlunparse(parsed._replace(query=new_query))
 
-    @staticmethod
-    async def _open_realtime_backend_ws(
-        websockets_module: Any,
-        url: str,
-        headers: dict,
-        ssl_context: Any,
-        *,
-        open_timeout: float = 8.0,
-        max_attempts: int = 3,
-    ) -> Any:
-        """Open the backend realtime websocket, retrying a hung open handshake.
-
-        The upstream Live handshake (e.g. Gemini Live) intermittently hangs on
-        open; waiting longer never recovers a hung attempt, but a fresh attempt
-        almost always connects in ~1s. So bound each attempt with ``open_timeout``
-        and retry, instead of surfacing one slow handshake to the caller as a
-        fatal 1011. A bounded attempt that timed out already spaced out the
-        retry, so no extra backoff is needed. Deterministic rejections (auth /
-        handshake status) are not retried.
-        """
-        # Handshake-status rejections are deterministic (auth / 4xx): retrying
-        # cannot help and the caller must see the upstream status, not a generic
-        # 1011. websockets <15 raises InvalidStatusCode, >=15 raises InvalidStatus.
-        deterministic_errors = tuple(
-            exc
-            for exc in (
-                getattr(websockets_module.exceptions, "InvalidStatus", None),
-                getattr(websockets_module.exceptions, "InvalidStatusCode", None),
-            )
-            if exc is not None
-        )
-        last_exc: Optional[BaseException] = None
-        for _ in range(max_attempts):
-            try:
-                return await websockets_module.connect(
-                    url,
-                    additional_headers=headers,
-                    max_size=REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES,
-                    ssl=ssl_context,
-                    open_timeout=open_timeout,
-                )
-            except deterministic_errors:
-                raise
-            except (
-                TimeoutError,
-                OSError,
-                websockets_module.exceptions.WebSocketException,
-            ) as e:
-                last_exc = e
-        assert last_exc is not None  # loop only exits via return or a captured exc
-        raise last_exc
-
     async def async_realtime(
         self,
         model: str,
@@ -5648,7 +5597,14 @@ class BaseLLMHTTPHandler:
                 ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 ssl_context.check_hostname = False
                 ssl_context.verify_mode = ssl.CERT_NONE
-            backend_ws = await self._open_realtime_backend_ws(websockets, url, headers, ssl_context)
+            backend_connector = RealtimeBackendConnector(
+                url=url,
+                headers=headers,
+                ssl_context=ssl_context,
+                open_timeout=8.0,
+                max_attempts=3,
+            )
+            backend_ws = await backend_connector.connect()
             async with backend_ws:
                 _request_data: Dict[str, Any] = {}
                 if litellm_metadata:
@@ -5664,6 +5620,7 @@ class BaseLLMHTTPHandler:
                     force_transcription_model=(
                         model if (query_params or {}).get("intent") == "transcription" else None
                     ),
+                    backend_connector=backend_connector,
                 )
 
                 # Auto-send session setup if the provider requires it (e.g.

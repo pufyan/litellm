@@ -127,6 +127,12 @@ async def test_async_realtime_success():
         async def __aexit__(self, exc_type, exc, tb):
             return None
 
+        def __await__(self):
+            async def _open():
+                return self.value
+
+            return _open().__await__()
+
     shared_context = get_shared_realtime_ssl_context()
     with (
         patch(
@@ -181,6 +187,12 @@ async def test_async_realtime_url_contains_model():
 
         async def __aexit__(self, exc_type, exc, tb):
             return None
+
+        def __await__(self):
+            async def _open():
+                return self.value
+
+            return _open().__await__()
 
     shared_context = get_shared_realtime_ssl_context()
     with (
@@ -258,6 +270,12 @@ async def test_async_realtime_forwards_openai_beta_header_when_client_sends_it()
         async def __aexit__(self, exc_type, exc, tb):
             return None
 
+        def __await__(self):
+            async def _open():
+                return self.value
+
+            return _open().__await__()
+
     with (
         patch(
             "websockets.connect", return_value=DummyAsyncContextManager(mock_backend_ws)
@@ -317,6 +335,12 @@ async def test_async_realtime_uses_max_size_parameter():
 
         async def __aexit__(self, exc_type, exc, tb):
             return None
+
+        def __await__(self):
+            async def _open():
+                return self.value
+
+            return _open().__await__()
 
     shared_context = get_shared_realtime_ssl_context()
     with (
@@ -388,6 +412,12 @@ async def test_async_realtime_ws_url_has_no_ssl():
 
         async def __aexit__(self, exc_type, exc, tb):
             return None
+
+        def __await__(self):
+            async def _open():
+                return self.value
+
+            return _open().__await__()
 
     with (
         patch(

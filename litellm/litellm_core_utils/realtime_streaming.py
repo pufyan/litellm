@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Union, ca
 import litellm
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from litellm.litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
 from litellm.llms.base_llm.realtime.transformation import BaseRealtimeConfig
 from litellm.types.llms.openai import (
     OpenAIRealtimeEvents,
@@ -57,9 +58,11 @@ class RealTimeStreaming:
         backend_uses_beta_protocol: Optional[bool] = None,
         force_transcription_model: Optional[str] = None,
         event_normalizer: Optional[RealtimeEventNormalizer] = None,
+        backend_connector: Optional[RealtimeBackendConnector] = None,
     ):
         self.websocket = websocket
         self.backend_ws = backend_ws
+        self.backend_connector = backend_connector
         self.logging_obj = logging_obj
         self.messages: List[OpenAIRealtimeEvents] = []
         self.input_message: Dict = {}

@@ -7,10 +7,10 @@ This requires websockets, and is currently only supported on LiteLLM Proxy.
 from typing import Any, Optional, cast
 
 from litellm._logging import _redact_string, verbose_proxy_logger
-from litellm.constants import REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
 from litellm.types.realtime import RealtimeQueryParams
 
 from ....litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
+from ....litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
 from ....litellm_core_utils.realtime_streaming import RealTimeStreaming
 from ....llms.custom_httpx.http_handler import get_shared_realtime_ssl_context
 from ..azure import AzureChatCompletion
@@ -119,14 +119,13 @@ class AzureOpenAIRealtime(AzureChatCompletion):
 
         try:
             ssl_context = get_shared_realtime_ssl_context()
-            async with websockets.connect(  # type: ignore
-                url,
-                additional_headers={
-                    "api-key": api_key,  # type: ignore
-                },
-                max_size=REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES,
-                ssl=ssl_context,
-            ) as backend_ws:
+            backend_connector = RealtimeBackendConnector(
+                url=url,
+                headers={"api-key": api_key or ""},
+                ssl_context=ssl_context,
+            )
+            backend_ws = await backend_connector.connect()
+            async with backend_ws:
                 realtime_streaming = RealTimeStreaming(
                     websocket,
                     cast(ClientConnection, backend_ws),
@@ -138,6 +137,7 @@ class AzureOpenAIRealtime(AzureChatCompletion):
                     force_transcription_model=(
                         model if (query_params or {}).get("intent") == "transcription" else None
                     ),
+                    backend_connector=backend_connector,
                 )
                 await realtime_streaming.bidirectional_forward()
 

@@ -1233,7 +1233,13 @@ async def test_async_anthropic_messages_handler_passes_api_key_to_agentic_hooks(
     )
     mock_config.sign_request = Mock(return_value=({}, None))
 
-    fake_raw_response = {"id": "msg_1", "type": "message", "role": "assistant", "content": [], "stop_reason": "end_turn"}
+    fake_raw_response = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "stop_reason": "end_turn",
+    }
     mock_config.transform_anthropic_messages_response = Mock(return_value=fake_raw_response)
 
     mock_logging_obj = Mock()
@@ -1253,10 +1259,17 @@ async def test_async_anthropic_messages_handler_passes_api_key_to_agentic_hooks(
     mock_httpx_response.status_code = 200
 
     with (
-        patch.object(handler, "_async_post_anthropic_messages_with_http_error_retry", new=AsyncMock(return_value=mock_httpx_response)),
+        patch.object(
+            handler,
+            "_async_post_anthropic_messages_with_http_error_retry",
+            new=AsyncMock(return_value=mock_httpx_response),
+        ),
         patch.object(handler, "_call_agentic_completion_hooks", side_effect=fake_agentic_hooks),
         patch("litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client"),
-        patch("litellm.litellm_core_utils.get_provider_specific_headers.ProviderSpecificHeaderUtils.get_provider_specific_headers", return_value=None),
+        patch(
+            "litellm.litellm_core_utils.get_provider_specific_headers.ProviderSpecificHeaderUtils.get_provider_specific_headers",
+            return_value=None,
+        ),
     ):
         result = await handler.async_anthropic_messages_handler(
             model="claude-haiku",
@@ -1277,90 +1290,3 @@ async def test_async_anthropic_messages_handler_passes_api_key_to_agentic_hooks(
         "api_key must be injected into kwargs passed to _call_agentic_completion_hooks "
         "so follow-up calls in agentic hooks (e.g. websearch) can authenticate"
     )
-
-
-class _FakeWSExceptions:
-    class WebSocketException(Exception):
-        pass
-
-    class InvalidStatusCode(WebSocketException):
-        def __init__(self) -> None:
-            super().__init__("HTTP 403")
-
-    # websockets>=15 raises InvalidStatus (not InvalidStatusCode) for a rejected
-    # client handshake; both must be treated as deterministic.
-    class InvalidStatus(WebSocketException):
-        def __init__(self) -> None:
-            super().__init__("HTTP 401")
-
-
-class _FakeWebsocketsModule:
-    """Stand-in for the ``websockets`` module so the realtime backend-open retry
-    can be exercised without a real network handshake (dependency injection,
-    no monkeypatching)."""
-
-    def __init__(self, outcomes):
-        # outcomes: list where each item is either an Exception to raise or a
-        # sentinel object to return as the "connected" websocket.
-        self._outcomes = list(outcomes)
-        self.exceptions = _FakeWSExceptions
-        self.attempts = 0
-        self.open_timeouts: list = []
-
-    async def connect(self, *args, **kwargs):
-        self.attempts += 1
-        self.open_timeouts.append(kwargs.get("open_timeout"))
-        outcome = self._outcomes.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
-
-
-@pytest.mark.asyncio
-async def test_realtime_backend_open_retries_then_succeeds():
-    """A hung/slow open handshake is retried; a later fresh attempt connects.
-
-    Regression for intermittent ``1011 timed out during opening handshake``:
-    the proxy used to surface a single slow upstream handshake to the caller as
-    a fatal 1011 with no retry.
-    """
-    sentinel = object()
-    fake = _FakeWebsocketsModule([TimeoutError("timed out during opening handshake"), sentinel])
-
-    result = await BaseLLMHTTPHandler._open_realtime_backend_ws(
-        fake, "wss://backend.example/live", {"Authorization": "Bearer x"}, None
-    )
-
-    assert result is sentinel
-    assert fake.attempts == 2
-    # Each attempt must be bounded by a finite open_timeout (not the default/None).
-    assert all(t is not None and t > 0 for t in fake.open_timeouts)
-
-
-@pytest.mark.asyncio
-async def test_realtime_backend_open_raises_after_max_attempts():
-    """When every attempt times out, the final error propagates (so the caller
-    still closes the client socket) rather than looping forever."""
-    fake = _FakeWebsocketsModule([TimeoutError("hang")] * 2)
-
-    with pytest.raises(TimeoutError):
-        await BaseLLMHTTPHandler._open_realtime_backend_ws(fake, "wss://backend.example/live", {}, None, max_attempts=2)
-
-    assert fake.attempts == 2
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "rejection",
-    [_FakeWSExceptions.InvalidStatusCode, _FakeWSExceptions.InvalidStatus],
-)
-async def test_realtime_backend_open_does_not_retry_auth_failure(rejection):
-    """A deterministic handshake-status rejection (auth/4xx) must not be retried;
-    retrying cannot help and the upstream status must surface, not a 1011. Both
-    the websockets<15 (InvalidStatusCode) and >=15 (InvalidStatus) shapes apply."""
-    fake = _FakeWebsocketsModule([rejection()])
-
-    with pytest.raises(_FakeWSExceptions.WebSocketException):
-        await BaseLLMHTTPHandler._open_realtime_backend_ws(fake, "wss://backend.example/live", {}, None)
-
-    assert fake.attempts == 1

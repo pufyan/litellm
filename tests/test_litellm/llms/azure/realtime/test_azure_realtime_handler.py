@@ -42,6 +42,12 @@ async def test_async_realtime_uses_max_size_parameter():
         async def __aexit__(self, exc_type, exc, tb):
             return None
 
+        def __await__(self):
+            async def _open():
+                return self.value
+
+            return _open().__await__()
+
     shared_context = get_shared_realtime_ssl_context()
     with (
         patch(
@@ -312,6 +318,12 @@ async def test_async_realtime_uses_ga_protocol_end_to_end():
         async def __aexit__(self, exc_type, exc, tb):
             return None
 
+        def __await__(self):
+            async def _open():
+                return self.value
+
+            return _open().__await__()
+
     with (
         patch(
             "websockets.connect", return_value=DummyAsyncContextManager(mock_backend_ws)
@@ -376,6 +388,12 @@ async def test_async_realtime_ga_without_api_version():
 
         async def __aexit__(self, exc_type, exc, tb):
             return None
+
+        def __await__(self):
+            async def _open():
+                return self.value
+
+            return _open().__await__()
 
     with (
         patch(
@@ -531,6 +549,12 @@ async def test_async_realtime_default_maintains_backwards_compatibility():
 
         async def __aexit__(self, exc_type, exc, tb):
             return None
+
+        def __await__(self):
+            async def _open():
+                return self.value
+
+            return _open().__await__()
 
     with (
         patch(
