@@ -568,6 +568,26 @@ def test_gemini_session_resumption_hooks():
     assert not_resumable == original
 
 
+def test_gemini_session_created_reports_audio_sample_rates():
+    """The proxy must tell the client the actual sample rates the backend
+    expects/produces (GA ``audio.*.format.rate``) so clients configure their
+    resampler from the API instead of hardcoding protocol defaults."""
+    config = GeminiRealtimeConfig()
+
+    event = config.transform_session_created_event(
+        model="gemini-2.5-flash",
+        logging_session_id="sess-1",
+        session_configuration_request=None,
+    )
+
+    session = event["session"]
+    assert session["input_audio_format"] == "pcm16"
+    assert session["output_audio_format"] == "pcm16"
+    assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    assert session["audio"]["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    assert config.get_audio_mime_type("pcm16") == "audio/pcm;rate=24000"
+
+
 def test_gemini_setup_enables_session_resumption():
     config = GeminiRealtimeConfig()
 

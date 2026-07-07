@@ -1781,6 +1781,20 @@ ResponsesAPIStreamingResponse = Annotated[
 REASONING_EFFORT = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
 
+class OpenAIRealtimeAudioFormat(TypedDict):
+    type: str
+    rate: int
+
+
+class OpenAIRealtimeAudioDirectionConfig(TypedDict, total=False):
+    format: OpenAIRealtimeAudioFormat
+
+
+class OpenAIRealtimeAudioConfig(TypedDict, total=False):
+    input: OpenAIRealtimeAudioDirectionConfig
+    output: OpenAIRealtimeAudioDirectionConfig
+
+
 class OpenAIRealtimeStreamSession(TypedDict, total=False):
     id: Required[str]
     """
@@ -1790,6 +1804,13 @@ class OpenAIRealtimeStreamSession(TypedDict, total=False):
     input_audio_format: str
     """
     The format of input audio. Options are pcm16, g711_ulaw, or g711_alaw. For pcm16, input audio must be 16-bit PCM at a 24kHz sample rate, single channel (mono), and little-endian byte order.
+    """
+
+    audio: OpenAIRealtimeAudioConfig
+    """
+    GA-shape audio configuration. Carries the actual sample rates the backend
+    expects (input) and produces (output) so clients can configure resampling
+    from the API instead of hardcoding protocol defaults.
     """
 
     input_audio_noise_reduction: object

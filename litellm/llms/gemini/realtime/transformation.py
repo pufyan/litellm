@@ -28,6 +28,9 @@ from litellm.types.llms.gemini import (
     StartOfSpeechSensitivityEnum,
 )
 from litellm.types.llms.openai import (
+    OpenAIRealtimeAudioConfig,
+    OpenAIRealtimeAudioDirectionConfig,
+    OpenAIRealtimeAudioFormat,
     OpenAIRealtimeContentPartDone,
     OpenAIRealtimeDoneEvent,
     OpenAIRealtimeEvents,
@@ -210,14 +213,27 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         else:
             raise ValueError(f"Unexpected delta type: {delta_type}")
 
+    INPUT_AUDIO_SAMPLE_RATE_HZ: int = 24000
+    OUTPUT_AUDIO_SAMPLE_RATE_HZ: int = 24000
+
     def get_audio_mime_type(self, input_audio_format: str = "pcm16"):
         mime_types = {
-            "pcm16": "audio/pcm;rate=24000",
+            "pcm16": f"audio/pcm;rate={self.INPUT_AUDIO_SAMPLE_RATE_HZ}",
             "g711_ulaw": "audio/pcmu",
             "g711_alaw": "audio/pcma",
         }
 
         return mime_types.get(input_audio_format, "application/octet-stream")
+
+    def get_session_audio_config(self) -> OpenAIRealtimeAudioConfig:
+        return OpenAIRealtimeAudioConfig(
+            input=OpenAIRealtimeAudioDirectionConfig(
+                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self.INPUT_AUDIO_SAMPLE_RATE_HZ)
+            ),
+            output=OpenAIRealtimeAudioDirectionConfig(
+                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self.OUTPUT_AUDIO_SAMPLE_RATE_HZ)
+            ),
+        )
 
     def _manual_turn_detection_enabled(self, session_configuration_request: Optional[str]) -> bool:
         if not session_configuration_request:
@@ -637,6 +653,9 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         session = OpenAIRealtimeStreamSession(
             id=logging_session_id,
             modalities=_modalities,
+            input_audio_format="pcm16",
+            output_audio_format="pcm16",
+            audio=self.get_session_audio_config(),
         )
         if _system_instruction is not None and isinstance(_system_instruction, str):
             session["instructions"] = _system_instruction
