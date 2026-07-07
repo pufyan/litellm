@@ -213,25 +213,44 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         else:
             raise ValueError(f"Unexpected delta type: {delta_type}")
 
-    INPUT_AUDIO_SAMPLE_RATE_HZ: int = 24000
-    OUTPUT_AUDIO_SAMPLE_RATE_HZ: int = 24000
+    # Gemini Live defaults: input is natively 16kHz (the API resamples other
+    # rates), output is always 24kHz. Per-model overrides live in model_cost
+    # (input_audio_sample_rate / output_audio_sample_rate) so a future model with
+    # different rates needs a cost-map entry, not a code change.
+    DEFAULT_INPUT_AUDIO_SAMPLE_RATE_HZ: int = 16000
+    DEFAULT_OUTPUT_AUDIO_SAMPLE_RATE_HZ: int = 24000
 
-    def get_audio_mime_type(self, input_audio_format: str = "pcm16"):
+    @staticmethod
+    def _audio_sample_rate(model: str, *, is_output: bool) -> int:
+        entry = GeminiRealtimeConfig._model_cost_entry(model)
+        key = "output_audio_sample_rate" if is_output else "input_audio_sample_rate"
+        rate = entry.get(key)
+        if isinstance(rate, int) and rate > 0:
+            return rate
+        return (
+            GeminiRealtimeConfig.DEFAULT_OUTPUT_AUDIO_SAMPLE_RATE_HZ
+            if is_output
+            else GeminiRealtimeConfig.DEFAULT_INPUT_AUDIO_SAMPLE_RATE_HZ
+        )
+
+    def get_audio_mime_type(self, input_audio_format: str = "pcm16") -> str:
+        # Gemini Live resamples any input rate, so ``rate`` only needs to match
+        # what the client sends; the proxy advertises the native rate (16kHz)
+        # via session.audio and expects the client to send that.
         mime_types = {
-            "pcm16": f"audio/pcm;rate={self.INPUT_AUDIO_SAMPLE_RATE_HZ}",
+            "pcm16": f"audio/pcm;rate={self.DEFAULT_INPUT_AUDIO_SAMPLE_RATE_HZ}",
             "g711_ulaw": "audio/pcmu",
             "g711_alaw": "audio/pcma",
         }
-
         return mime_types.get(input_audio_format, "application/octet-stream")
 
-    def get_session_audio_config(self) -> OpenAIRealtimeAudioConfig:
+    def get_session_audio_config(self, model: str) -> OpenAIRealtimeAudioConfig:
         return OpenAIRealtimeAudioConfig(
             input=OpenAIRealtimeAudioDirectionConfig(
-                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self.INPUT_AUDIO_SAMPLE_RATE_HZ)
+                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self._audio_sample_rate(model, is_output=False))
             ),
             output=OpenAIRealtimeAudioDirectionConfig(
-                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self.OUTPUT_AUDIO_SAMPLE_RATE_HZ)
+                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self._audio_sample_rate(model, is_output=True))
             ),
         )
 
@@ -655,7 +674,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             modalities=_modalities,
             input_audio_format="pcm16",
             output_audio_format="pcm16",
-            audio=self.get_session_audio_config(),
+            audio=self.get_session_audio_config(model),
         )
         if _system_instruction is not None and isinstance(_system_instruction, str):
             session["instructions"] = _system_instruction

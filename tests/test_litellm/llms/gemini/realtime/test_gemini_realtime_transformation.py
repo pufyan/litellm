@@ -571,7 +571,8 @@ def test_gemini_session_resumption_hooks():
 def test_gemini_session_created_reports_audio_sample_rates():
     """The proxy must tell the client the actual sample rates the backend
     expects/produces (GA ``audio.*.format.rate``) so clients configure their
-    resampler from the API instead of hardcoding protocol defaults."""
+    resampler from the API instead of hardcoding protocol defaults. Gemini input
+    is natively 16kHz, output 24kHz."""
     config = GeminiRealtimeConfig()
 
     event = config.transform_session_created_event(
@@ -583,9 +584,26 @@ def test_gemini_session_created_reports_audio_sample_rates():
     session = event["session"]
     assert session["input_audio_format"] == "pcm16"
     assert session["output_audio_format"] == "pcm16"
-    assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 16000}
     assert session["audio"]["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
-    assert config.get_audio_mime_type("pcm16") == "audio/pcm;rate=24000"
+    assert config.get_audio_mime_type("pcm16") == "audio/pcm;rate=16000"
+
+
+def test_gemini_audio_sample_rate_honors_model_cost_override(monkeypatch):
+    """A model with per-model sample rates in the cost map must override the
+    defaults, so a future model with different rates needs only a cost-map entry."""
+    import litellm
+
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "gemini-future-audio",
+        {"input_audio_sample_rate": 48000, "output_audio_sample_rate": 48000},
+    )
+    config = GeminiRealtimeConfig()
+
+    audio = config.get_session_audio_config("gemini-future-audio")
+    assert audio["input"]["format"]["rate"] == 48000
+    assert audio["output"]["format"]["rate"] == 48000
 
 
 def test_gemini_setup_enables_session_resumption():
