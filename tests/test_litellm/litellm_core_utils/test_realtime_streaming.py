@@ -3198,3 +3198,24 @@ async def test_native_reconnect_does_not_replay_transcript():
     assert not any("clientContent" in m for m in sent_to_new_backend)
     reconnected = [e for e in _client_events(client_ws) if e["type"] == "litellm.session.reconnected"]
     assert reconnected and reconnected[0]["resumed"] == "native"
+
+
+def test_resumption_marker_fastpath_skips_audio_frames():
+    """Audio delta frames dominate backend traffic; frames without resumption
+    markers must be skipped without a JSON parse, while marker-bearing frames
+    are still intercepted."""
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[[]],
+        connector_outcomes=[],
+    )
+
+    audio_frame = json.dumps(
+        {"serverContent": {"modelTurn": {"parts": [{"inlineData": {"mimeType": "audio/pcm", "data": "QUJD"}}]}}}
+    )
+    with patch("json.loads") as mock_loads:
+        assert streaming._handle_resumption_service_event(audio_frame) is None
+        mock_loads.assert_not_called()
+
+    update_frame = json.dumps({"sessionResumptionUpdate": {"newHandle": "h-9", "resumable": True}})
+    assert streaming._handle_resumption_service_event(update_frame) == "state"
+    assert streaming._resumption_state.handle == "h-9"

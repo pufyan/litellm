@@ -698,6 +698,11 @@ class RealTimeStreaming:
         """
         if self.provider_config is None or self.provider_config.supports_session_resumption() is not True:
             return None
+        markers = self.provider_config.resumption_event_markers()
+        if markers and not any(marker in raw_response for marker in markers):
+            # Hot path: audio delta frames are the bulk of backend traffic; a
+            # substring miss skips the full JSON parse for them.
+            return None
         try:
             event_obj = json.loads(raw_response)
         except (json.JSONDecodeError, TypeError):

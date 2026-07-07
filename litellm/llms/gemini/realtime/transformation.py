@@ -1649,6 +1649,9 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
     def supports_session_resumption(self) -> bool:
         return True
 
+    def resumption_event_markers(self) -> "tuple[str, ...]":
+        return ('"sessionResumptionUpdate"', '"goAway"')
+
     def extract_resumption_state(self, event: dict) -> Optional[RealtimeResumptionState]:
         update = event.get("sessionResumptionUpdate")
         if not isinstance(update, dict):

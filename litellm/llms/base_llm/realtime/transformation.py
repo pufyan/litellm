@@ -94,6 +94,13 @@ class BaseRealtimeConfig(ABC):
         websocket (e.g. Gemini Live's sessionResumption handle)."""
         return False
 
+    def resumption_event_markers(self) -> "tuple[str, ...]":
+        """Cheap substring markers for resumption/goAway service frames. A raw
+        backend frame containing none of them is skipped without JSON parsing
+        (audio deltas dominate backend traffic). Empty tuple disables the
+        fast-path and every frame is parsed."""
+        return ()
+
     def extract_resumption_state(self, event: dict) -> Optional[RealtimeResumptionState]:
         """Return updated resumption state when ``event`` carries a new resumption
         token/handle from the backend; None otherwise."""
