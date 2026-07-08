@@ -131,3 +131,6 @@ crash.*.log
 .coverage
 
 ui/litellm-dashboard/out/
+.mcp.json
+*.log
+litellm_migration_analysis.md
