@@ -670,6 +670,32 @@ def test_gemini_context_window_compression_passthrough():
     assert setup_payload["contextWindowCompression"] == compression
 
 
+def test_gemini_top_p_top_k_mapped_to_generation_config():
+    """top_p/top_k must reach Gemini Live as camelCase generationConfig fields.
+    Sampling params are silently dropped before this mapping existed."""
+    config = GeminiRealtimeConfig()
+
+    mapped = config.map_openai_params(optional_params={}, non_default_params={"top_p": 0.9, "top_k": 40})
+    assert mapped["generationConfig"]["topP"] == 0.9
+    assert mapped["generationConfig"]["topK"] == 40
+
+    assert "top_p" in config.get_supported_openai_params("gemini-2.5-flash")
+    assert "top_k" in config.get_supported_openai_params("gemini-2.5-flash")
+
+    messages = config.transform_realtime_request(
+        json.dumps({"type": "session.update", "session": {"top_p": 0.8, "top_k": 20}}),
+        "gemini-2.5-flash",
+        session_configuration_request=None,
+    )
+    gen = json.loads(messages[0])["setup"]["generationConfig"]
+    assert gen["topP"] == 0.8
+    assert gen["topK"] == 20
+
+    # bool must not slip through (bool is a subclass of int)
+    bool_mapped = config.map_openai_params(optional_params={}, non_default_params={"top_p": True})
+    assert "topP" not in bool_mapped.get("generationConfig", {})
+
+
 def test_gemini_subsequent_session_update_is_dropped_not_resent_as_setup():
     """Regression: Gemini Live accepts exactly one ``setup`` message; a second
     one closes the socket with ``1007 Request contains an invalid argument``.

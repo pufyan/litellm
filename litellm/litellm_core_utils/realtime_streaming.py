@@ -1159,7 +1159,11 @@ class RealTimeStreaming:
                 return await self.backend_ws.recv(decode=False)  # type: ignore[union-attr]
             except TypeError:
                 return await self.backend_ws.recv()  # type: ignore[union-attr]
-        except websockets.exceptions.ConnectionClosed:
+        except websockets.exceptions.ConnectionClosed as e:
+            rcvd = getattr(e, "rcvd", None)
+            close_code = getattr(rcvd, "code", None) if rcvd is not None else getattr(e, "code", None)
+            close_reason = getattr(rcvd, "reason", None) if rcvd is not None else getattr(e, "reason", None)
+            verbose_logger.warning("Realtime backend closed by provider: code=%s reason=%r", close_code, close_reason)
             if not self._supports_backend_reconnect():
                 raise
             if await self._reconnect_backend(reason="connection_closed"):

@@ -87,6 +87,11 @@ _SPEECH_END_SENSITIVITY_MAP: dict[str, EndOfSpeechSensitivityEnum] = {
     "high": "END_SENSITIVITY_HIGH",
     "low": "END_SENSITIVITY_LOW",
 }
+# OpenAI-realtime sampling params -> Gemini Live generationConfig (camelCase).
+_GEMINI_SAMPLING_PARAM_MAP: dict[str, str] = {
+    "top_p": "topP",
+    "top_k": "topK",
+}
 
 
 def _parse_duration_ms(value: object) -> Optional[int]:
@@ -317,6 +322,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "turn_detection",
             "voice",
             "context_window_compression",
+            "top_p",
+            "top_k",
         ]
 
     def _apply_turn_detection(self, optional_params: dict, value: OpenAIRealtimeTurnDetection) -> None:
@@ -339,6 +346,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 optional_params["systemInstruction"] = HttpxContentType(role="user", parts=[{"text": value}])
             elif key == "temperature":
                 optional_params["generationConfig"]["temperature"] = value
+            elif key in _GEMINI_SAMPLING_PARAM_MAP and isinstance(value, (int, float)) and not isinstance(value, bool):
+                optional_params["generationConfig"][_GEMINI_SAMPLING_PARAM_MAP[key]] = value
             elif key == "max_response_output_tokens":
                 optional_params["generationConfig"]["maxOutputTokens"] = value
             elif key == "modalities":
