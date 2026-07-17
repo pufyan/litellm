@@ -94,6 +94,25 @@ _GEMINI_SAMPLING_PARAM_MAP: dict[str, str] = {
 }
 
 
+def _snake_to_camel_keys(value: dict) -> dict:
+    """Convert canonical snake_case keys to Gemini's camelCase, recursively.
+
+    Used for ``context_window_compression``: the canonical contract uses
+    ``sliding_window`` / ``target_tokens`` while Gemini Live expects
+    ``slidingWindow`` / ``targetTokens``. Already-camelCase keys pass through
+    unchanged.
+    """
+
+    def _camel(key: str) -> str:
+        head, *rest = key.split("_")
+        return head + "".join(part.capitalize() for part in rest)
+
+    return {
+        _camel(k) if isinstance(k, str) else k: (_snake_to_camel_keys(v) if isinstance(v, dict) else v)
+        for k, v in value.items()
+    }
+
+
 def _parse_duration_ms(value: object) -> Optional[int]:
     if not isinstance(value, str) or not value.endswith("s"):
         return None
@@ -378,7 +397,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 if speech_config:
                     optional_params["generationConfig"]["speechConfig"] = speech_config
             elif key == "context_window_compression" and isinstance(value, dict):
-                optional_params["contextWindowCompression"] = value
+                optional_params["contextWindowCompression"] = _snake_to_camel_keys(value)
         if len(optional_params["generationConfig"]) == 0:
             optional_params.pop("generationConfig")
         return optional_params

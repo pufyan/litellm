@@ -670,6 +670,23 @@ def test_gemini_context_window_compression_passthrough():
     assert setup_payload["contextWindowCompression"] == compression
 
 
+def test_gemini_context_window_compression_canonical_snake_case_converted_to_camel():
+    config = GeminiRealtimeConfig()
+
+    compression = {"trigger_tokens": 102400, "sliding_window": {"target_tokens": 65536}}
+    messages = config.transform_realtime_request(
+        json.dumps({"type": "session.update", "session": {"context_window_compression": compression}}),
+        "gemini-2.5-flash",
+        session_configuration_request=None,
+    )
+
+    setup_payload = json.loads(messages[0])["setup"]
+    assert setup_payload["contextWindowCompression"] == {
+        "triggerTokens": 102400,
+        "slidingWindow": {"targetTokens": 65536},
+    }
+
+
 def test_gemini_top_p_top_k_mapped_to_generation_config():
     """top_p/top_k must reach Gemini Live as camelCase generationConfig fields.
     Sampling params are silently dropped before this mapping existed."""

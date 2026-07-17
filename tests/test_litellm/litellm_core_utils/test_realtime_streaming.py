@@ -145,6 +145,34 @@ def test_ga_session_allowlist_matches_openai_sdk():
     assert GA_SESSION_ALLOWED_KEYS == frozenset(RealtimeSessionCreateRequest.model_fields.keys())
 
 
+def test_remap_beta_session_to_ga_normalizes_nested_structures():
+    out = RealTimeStreaming._remap_beta_session_to_ga(
+        {
+            "voice": {"name": "Puck", "language_code": "ru-RU"},
+            "turn_detection": {"type": "server_vad", "threshold": 0.5, "start_sensitivity": "high"},
+            "input_audio_transcription": {},
+            "tools": [{"functionDeclarations": [{"name": "f", "parameters": {"type": "OBJECT"}}]}],
+        }
+    )
+    assert out["audio"]["output"]["voice"] == "Puck"
+    assert out["audio"]["input"]["turn_detection"] == {"type": "server_vad", "threshold": 0.5}
+    assert "transcription" not in out["audio"]["input"]
+    assert out["tools"] == [{"type": "function", "name": "f", "parameters": {"type": "object"}}]
+
+
+def test_remap_beta_session_to_ga_normalizes_client_provided_ga_nested_audio():
+    out = RealTimeStreaming._remap_beta_session_to_ga(
+        {
+            "audio": {
+                "input": {"turn_detection": {"type": "server_vad", "end_sensitivity": "low"}},
+                "output": {"voice": {"name": "Puck"}},
+            }
+        }
+    )
+    assert out["audio"]["input"]["turn_detection"] == {"type": "server_vad"}
+    assert out["audio"]["output"]["voice"] == "Puck"
+
+
 def test_remap_beta_session_to_ga_preserves_ga_audio_format_dicts():
     input_format = {"type": "audio/pcm", "rate": 24000}
     output_format = {"type": "audio/G711-ulaw", "rate": 8000}

@@ -147,27 +147,33 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
 
     def _transform_tools_to_bedrock_format(self, tools: List[dict]) -> List[dict]:
         """
-        Transform OpenAI tool format to Bedrock tool format.
+        Transform canonical tools to Bedrock tool format.
+
+        Accepts any inbound tool shape (GA flat, chat-completions nested,
+        Gemini functionDeclarations); normalize_tools_to_canonical flattens
+        them and recursively normalizes the JSON-schema parameters before they
+        are serialized for Nova Sonic.
 
         Args:
-            tools: List of OpenAI format tools
+            tools: List of tools in any supported format
 
         Returns:
             List of Bedrock format tools
         """
-        bedrock_tools = []
-        for tool in tools:
-            if tool.get("type") == "function":
-                function = tool.get("function", {})
-                bedrock_tool = {
-                    "toolSpec": {
-                        "name": function.get("name", ""),
-                        "description": function.get("description", ""),
-                        "inputSchema": {"json": json.dumps(function.get("parameters", {}))},
-                    }
+        from litellm.litellm_core_utils.realtime_schema_normalization import normalize_tools_to_canonical
+
+        canonical = normalize_tools_to_canonical(tools)
+        return [
+            {
+                "toolSpec": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "inputSchema": {"json": json.dumps(tool.get("parameters", {}))},
                 }
-                bedrock_tools.append(bedrock_tool)
-        return bedrock_tools
+            }
+            for tool in (canonical if isinstance(canonical, list) else [])
+            if isinstance(tool, dict) and tool.get("type") == "function"
+        ]
 
     def _map_audio_format_to_sample_rate(self, audio_format: str, is_output: bool = True) -> int:
         """

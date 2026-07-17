@@ -112,6 +112,47 @@ class TestBedrockRealtimeConfig:
         assert schema["type"] == "object"
         assert "location" in schema["properties"]
 
+    def test_transform_tools_accepts_flat_ga_shape(self):
+        """GA flat tools previously produced empty toolSpec names."""
+        config = BedrockRealtimeConfig()
+
+        ga_tools = [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {"type": "object", "properties": {"location": {"type": "string"}}},
+            }
+        ]
+
+        bedrock_tools = config._transform_tools_to_bedrock_format(ga_tools)
+
+        assert len(bedrock_tools) == 1
+        assert bedrock_tools[0]["toolSpec"]["name"] == "get_weather"
+        schema = json.loads(bedrock_tools[0]["toolSpec"]["inputSchema"]["json"])
+        assert schema["type"] == "object"
+
+    def test_transform_tools_normalizes_uppercase_schema_types(self):
+        config = BedrockRealtimeConfig()
+
+        tools = [
+            {
+                "type": "function",
+                "name": "f",
+                "parameters": {
+                    "type": "OBJECT",
+                    "behavior": "BLOCKING",
+                    "properties": {"a": {"type": "STRING"}},
+                },
+            }
+        ]
+
+        bedrock_tools = config._transform_tools_to_bedrock_format(tools)
+        schema = json.loads(bedrock_tools[0]["toolSpec"]["inputSchema"]["json"])
+        assert schema["type"] == "object"
+        assert schema["properties"]["a"]["type"] == "string"
+        assert "behavior" not in schema
+
     def test_audio_format_mapping(self):
         """Test audio format to sample rate mapping"""
         config = BedrockRealtimeConfig()

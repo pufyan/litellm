@@ -6,6 +6,12 @@ import litellm
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
+from litellm.litellm_core_utils.realtime_schema_normalization import (
+    normalize_input_audio_transcription_for_ga,
+    normalize_tools_to_canonical,
+    normalize_turn_detection_for_ga,
+    normalize_voice_for_ga,
+)
 from litellm.llms.base_llm.realtime.transformation import BaseRealtimeConfig
 from litellm.types.llms.openai import (
     OpenAIRealtimeEvents,
@@ -1376,7 +1382,48 @@ class RealTimeStreaming:
                     existing[sub_key] = sub_val
             session["audio"] = existing
 
+        session = RealTimeStreaming._normalize_nested_session_structures(session)
         return {k: v for k, v in session.items() if k in GA_SESSION_ALLOWED_KEYS}
+
+    @staticmethod
+    def _normalize_nested_session_structures(session: dict) -> dict:
+        """Normalize nested payloads the top-level allowlist cannot protect.
+
+        Applies the provider-neutral helpers to ``tools`` (recursive JSON-schema
+        normalization plus tool-shape flattening) and to the nested ``audio``
+        block (``input.turn_detection``, ``input.transcription``,
+        ``output.voice``), covering both remapped beta fields and GA-nested
+        values the client sent directly.
+        """
+        session = dict(session)
+        if "tools" in session:
+            session["tools"] = normalize_tools_to_canonical(session["tools"])
+
+        audio = session.get("audio")
+        if not isinstance(audio, dict):
+            return session
+        audio = {k: (dict(v) if isinstance(v, dict) else v) for k, v in audio.items()}
+
+        audio_input = audio.get("input")
+        if isinstance(audio_input, dict):
+            if "turn_detection" in audio_input:
+                audio_input["turn_detection"] = normalize_turn_detection_for_ga(audio_input["turn_detection"])
+            if "transcription" in audio_input:
+                normalized_transcription = normalize_input_audio_transcription_for_ga(audio_input["transcription"])
+                if normalized_transcription is None:
+                    audio_input.pop("transcription")
+                else:
+                    audio_input["transcription"] = normalized_transcription
+
+        audio_output = audio.get("output")
+        if isinstance(audio_output, dict) and "voice" in audio_output:
+            normalized_voice = normalize_voice_for_ga(audio_output["voice"])
+            if normalized_voice is None:
+                audio_output.pop("voice")
+            else:
+                audio_output["voice"] = normalized_voice
+
+        return {**session, "audio": audio}
 
     @staticmethod
     def _translate_event_to_beta(event: dict) -> Optional[dict]:
