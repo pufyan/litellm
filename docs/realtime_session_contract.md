@@ -101,7 +101,15 @@ Nested risk map, highest risk first:
 4. `session.voice`. OpenAI wants a plain string; a Gemini-style `{ "name", "language_code" }` object breaks it.
 5. `session.context_window_compression`. Nested plus camelCase: Gemini-native `slidingWindow` / `targetTokens` vs canonical `sliding_window` / `target_tokens`.
 
-Who owes the fix: normalizing nested structures is the **provider implementation's responsibility**, not the client's. The contract stays one canonical schema; every provider-specific nested transformation (type case, foreign keys, shape differences) belongs inside that provider's mapping code. The current state — top-level dropping implemented (`GA_SESSION_ALLOWED_KEYS`), nested normalization only partial and case-by-case — is a known implementation gap, not a contract rule. Until the gap is closed, a client sending strictly canonical nested shapes is safe; a client relaying provider-shaped nested data may hit rejections, and the fix for that goes into the provider mapping, never into client guidance. When closing the gap, normalize at every depth of `tools[].parameters` and strip provider-only keys from `turn_detection`, `voice`, `input_audio_transcription`, and `context_window_compression`.
+Who owes the fix: normalizing nested structures is the **provider implementation's responsibility**, not the client's. The contract stays one canonical schema; every provider-specific nested transformation (type case, foreign keys, shape differences) belongs inside that provider's mapping code.
+
+Implementation status: the safety net now exists on every provider path, built on the shared provider-neutral module `litellm/litellm_core_utils/realtime_schema_normalization.py`:
+
+- OpenAI / Azure / xAI: the GA remap normalizes `tools[].parameters` recursively (lowercases schema types at any depth, strips provider-only keys like `behavior`, flattens `functionDeclarations` and chat-style tool shapes), strips non-GA `turn_detection` keys per VAD type, drops empty `transcription` configs, and collapses dict voices to the GA string. Applies to both flat beta fields and GA-nested client input.
+- Bedrock: the tool transform runs the same canonicalization before serializing for Nova Sonic (this also fixed GA flat tools, which previously produced empty tool names).
+- Gemini / Vertex: outbound tools go through `_build_vertex_schema` (recursive); canonical snake_case `context_window_compression` is converted to Gemini's camelCase (`sliding_window` -> `slidingWindow`).
+
+The risk map above remains the checklist for extending the normalizer when providers add new nested surface.
 
 ## Provider support matrix
 
