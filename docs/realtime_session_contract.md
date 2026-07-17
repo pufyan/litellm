@@ -14,7 +14,11 @@ Consequences you must respect:
 
 - A canonical payload never breaks a session. Unsupported fields are dropped, not forwarded, so no backend errors on a field it does not know.
 - The drop is silent. There is no error and no echo telling the client a field was ignored, so the contract and the support matrix below are the source of truth for what actually takes effect on a given provider.
-- Provider defaults are the provider's own. Omitting a field does not send a neutral value; it lets the backend pick its native default.
+- Omitted fields are handled by whether the backend requires them, never by a litellm opinion:
+  - Optional field the client did not send: not forwarded at all, so the backend applies its own native default.
+  - Field the backend requires but the client did not send: filled with that provider's native default value, because the request would be rejected otherwise. This is the only case where an implementation writes a default, and the value must match the provider's documented native default, not an arbitrary litellm choice.
+
+The distinction matters: litellm must not hardcode a default for an optional inference parameter (that would silently override the vendor default and drift when the vendor changes it). Hardcoded defaults are allowed only for fields the provider's protocol makes mandatory.
 
 This is intentionally more flexible than a lowest-common-denominator contract: clients get the full expressive range of every backend from one schema, at the cost of per-provider support gaps that must be documented rather than hidden.
 
@@ -144,7 +148,7 @@ Because the drop and the compression-vs-truncation difference are both silent at
 
 Deviations from a naive reading of the contract, per provider. Keep this list in sync with the mappings.
 
-- Bedrock Nova Sonic: ignores `turn_detection` and `input_audio_transcription`; hardcodes modalities to `["text","audio"]`; ignores `top_k`.
+- Bedrock Nova Sonic: ignores `turn_detection` and `input_audio_transcription`; hardcodes modalities to `["text","audio"]`; ignores `top_k`. Known deviation from the defaults rule: it currently sends hardcoded `temperature`, `top_p` and `max_tokens` even when the client omits them, instead of leaving optional fields unset. These should be sent only when the client provides them, unless Nova Sonic requires them in `inferenceConfiguration`, in which case the fallback must be the vendor's native default.
 - OpenAI GA: has no session-level `temperature` / `top_p` / `top_k`; these union fields are dropped. `context_window_compression` is applied as native `truncation`.
 - Gemini / Vertex AI: audio formats are fixed by the Live model rather than taken from `input_audio_format` / `output_audio_format`. `context_window_compression` compresses context rather than hard-truncating it.
 
@@ -153,6 +157,7 @@ Deviations from a naive reading of the contract, per provider. Keep this list in
 - Client-facing surface is this contract only. Never require a client to send a provider-native shape.
 - All mapping lives in the provider implementation (or the shared OpenAI-compatible remap). Adding a provider means adding its mapping there, not changing the client contract.
 - A field the provider cannot honor is dropped silently; it must not be forwarded to the backend, and it must be recorded in the support matrix and, if its behavior is surprising, in "Provider-specific behavior".
+- Do not hardcode a default for an optional field. If the client omits an optional field, do not send it and let the backend default apply. Write a default only for a field the provider's protocol makes mandatory, and use the provider's native default value.
 - Before adding or unifying a field, enforce the one-name-one-meaning invariant: never reuse a canonical name for a different concept and never let a name's value semantics change per provider. If two things cannot share one meaning, give them two names.
 - Before unifying a new pair of fields, apply the semantic aliasing rule above. When in doubt, keep them separate.
 - Any new union field must land in the field reference (with `Origin: union`), the support matrix, and, if it degrades unevenly, the provider-specific section.
