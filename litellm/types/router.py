@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, get_type_hi
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from typing_extensions import Required, TypedDict
+from typing_extensions import Protocol, Required, TypedDict, runtime_checkable
 
 from litellm._uuid import uuid
 
@@ -117,6 +117,7 @@ class UpdateRouterConfig(BaseModel):
     fallbacks: Optional[List[dict]] = None
     context_window_fallbacks: Optional[List[dict]] = None
     model_group_alias: Optional[Dict[str, Union[str, Dict]]] = {}
+    enable_tag_filtering: Optional[bool] = None
 
     model_config = ConfigDict(protected_namespaces=())
 
@@ -827,6 +828,36 @@ class PreRoutingHookResponse(BaseModel):
 
     model: str
     messages: Optional[List[Dict[str, Any]]]
+
+
+class RoutingContext(BaseModel):
+    """
+    Passed through a Router's `plugins` pipeline before the routing decision is made.
+
+    Each plugin reads and mutates this object; the next plugin sees the previous
+    plugin's changes. `candidate_models` narrows as the pipeline runs -- Router
+    only selects a deployment whose `litellm_params.model` survives the pipeline.
+
+    `raw_messages` and `structured_messages` mirror the pattern
+    `CustomGuardrail.apply_guardrail` uses: the message shape differs by API
+    surface (chat completions, Anthropic /v1/messages, Responses API `input`,
+    ...), so plugins that need a stable, provider-agnostic shape should read
+    `structured_messages` (normalized to OpenAI chat-completions format);
+    plugins that need the exact original payload can read `raw_messages`.
+    """
+
+    raw_messages: list[dict[str, Any]]
+    structured_messages: list[dict[str, Any]]
+    candidate_models: list[str]
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    signals: dict[str, Any] = Field(default_factory=dict)
+
+
+@runtime_checkable
+class RoutingPlugin(Protocol):
+    """Interface a custom routing plugin must implement to run in `Router(plugins=[...])`."""
+
+    async def run(self, context: RoutingContext) -> RoutingContext: ...
 
 
 class RequestType(str, enum.Enum):
