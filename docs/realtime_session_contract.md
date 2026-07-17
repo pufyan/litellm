@@ -83,6 +83,26 @@ The `Origin` column records where the field came from. `OpenAI` fields are the b
 
 The `voice` and `max_response_output_tokens` values cannot be changed once the model has emitted audio in a session. Set them on the first `session.update`.
 
+## Nested structures have no safety net
+
+This is the single most important operational rule of the contract. The GA remap and its allowlist drop only clean the **top level** of `session`. They rename and drop top-level keys, but they do not descend into nested objects. A stray provider-specific key inside a nested structure is forwarded verbatim, and a backend that does not recognize it rejects the whole `session.update`, taking the system prompt and tool config down with it.
+
+So the leniency is asymmetric: top-level union fields are forgiven (silently dropped), but every nested structure must be sent in strict canonical / OpenAI form. Send nested objects as if you were talking to OpenAI GA directly.
+
+Nested risk map, highest risk first:
+
+1. `session.tools[].parameters` (JSON Schema). The worst offender.
+   - Type case: Gemini emits `"STRING"` / `"OBJECT"` (uppercase); OpenAI wants `"string"` / `"object"`.
+   - Recursion: the type appears at any depth under `properties.*`, `items`, `additionalProperties`.
+   - Gemini-only noise: keys like `behavior: "BLOCKING"` are rejected by OpenAI.
+   - Tool shape itself: Gemini `{ "functionDeclarations": [...] }` vs OpenAI flat `{ "type": "function", "name", "parameters" }`.
+2. `session.turn_detection`. Nested `start_sensitivity` / `end_sensitivity` are Gemini-only and leak to OpenAI. Send only `type`, `prefix_padding_ms`, `silence_duration_ms`.
+3. `session.input_audio_transcription`. OpenAI requires a non-empty `{ "model": "..." }`; a Gemini-style empty `{}` is rejected.
+4. `session.voice`. OpenAI wants a plain string; a Gemini-style `{ "name", "language_code" }` object breaks it.
+5. `session.context_window_compression`. Nested plus camelCase: Gemini-native `slidingWindow` / `targetTokens` vs canonical `sliding_window` / `target_tokens`.
+
+Implementation status: top-level dropping is implemented (`GA_SESSION_ALLOWED_KEYS`); recursive normalization of nested structures is not general yet and is handled case by case (for example a tool-parameter type normalizer). Until a recursive normalizer exists, treat nested cleanliness as the client's responsibility and the maintainer's next target. When adding one, normalize at every depth of `tools[].parameters` and strip provider-only keys from `turn_detection`, `voice`, `input_audio_transcription`, and `context_window_compression`.
+
 ## Provider support matrix
 
 The proxy owns the mapping. This table records how complete each backend family is against the canonical contract as of this document.
@@ -169,3 +189,4 @@ Deviations from a naive reading of the contract, per provider. Keep this list in
 - Before adding or unifying a field, enforce the one-name-one-meaning invariant: never reuse a canonical name for a different concept and never let a name's value semantics change per provider. If two things cannot share one meaning, give them two names.
 - Before unifying a new pair of fields, apply the semantic aliasing rule above. When in doubt, keep them separate.
 - Any new union field must land in the field reference (with `Origin: union`), the support matrix, and, if it degrades unevenly, the provider-specific section.
+- The top-level allowlist does not protect nested structures. When a field carries a nested object (`tools[].parameters`, `turn_detection`, `voice`, `input_audio_transcription`, `context_window_compression`), the mapping must normalize that structure at every depth into the target provider's form, not just rename the top-level key. A single foreign nested key rejects the whole `session.update`. See "Nested structures have no safety net".
