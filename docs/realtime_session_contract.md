@@ -156,6 +156,14 @@ Emission conditions differ per provider even for canonical events. The one that 
 
 Rules for contributors on the outbound side mirror the inbound ones: a new provider's event mapping must re-synthesize canonical events (prefer Gemini's re-synthesis approach over xAI's blacklist), drop what it cannot map, and never forward a provider-native event or field to the client.
 
+### Backend reconnection and `litellm.session.*` events
+
+The client-to-proxy WebSocket is the session; it stays up for the session's lifetime. The proxy-to-backend WebSocket is an implementation detail and may be re-established mid-session. Reconnects are triggered by a dropped backend socket (`connection_closed`) or a provider's advance warning (Gemini `goAway`), and recover in one of two modes: `native`, using the provider's own resumption token (Gemini `sessionResumptionUpdate` handle), or `fresh`, opening a new backend session and replaying the accumulated conversation transcript (user and assistant turns, with barge-in notes) to restore context.
+
+Clients observe this through two proxy-emitted events that extend the canonical stream: `litellm.session.reconnecting` `{reason}` followed by `litellm.session.reconnected` `{resumed: "native" | "fresh" | "replayed"}`. Handle them (at minimum, ignore them without crashing on the unknown `litellm.`-prefixed type); do not treat them as provider events.
+
+Current support: backend reconnection is gated on the provider implementation declaring `supports_session_resumption()`, which today only Gemini / Vertex AI do. On OpenAI, Azure and xAI a dropped backend socket ends the client session; the client must reconnect and rebuild state itself. Extending fresh-mode replay to those backends is a known gap: the transcript-replay machinery is provider-independent and only needs the provider config to supply `build_history_replay_messages`.
+
 ## Semantic aliasing policy
 
 ### Hard invariant: one name, one meaning
