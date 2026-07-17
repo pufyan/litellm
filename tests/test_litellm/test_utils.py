@@ -833,6 +833,8 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "supports_assistant_prefill": {"type": "boolean"},
                 "supports_audio_input": {"type": "boolean"},
                 "supports_audio_output": {"type": "boolean"},
+                "supports_native_transcription": {"type": "boolean"},
+                "supports_turn_detection": {"type": "boolean"},
                 "gemini_native_audio": {"type": "boolean"},
                 "gemini_audio_only_live": {"type": "boolean"},
                 "supports_embedding_image_input": {"type": "boolean"},
@@ -4741,3 +4743,26 @@ def test_gemini_image_models_do_not_support_reasoning(
         f"{model} incorrectly classified as reasoning-capable. "
         "Add 'supports_reasoning: false' to its model_cost entry."
     )
+
+
+@pytest.mark.parametrize(
+    "model, native_transcription, turn_detection, sampling",
+    [
+        ("gpt-realtime-1.5", True, True, False),
+        ("gpt-realtime-mini", True, True, False),
+        ("azure/gpt-realtime-1.5-2026-02-23", True, True, False),
+        ("gemini/gemini-live-2.5-flash-preview-native-audio-09-2025", True, True, True),
+    ],
+)
+def test_realtime_capability_flags(
+    model: str, native_transcription: bool, turn_detection: bool, sampling: bool, local_model_cost_map: None
+) -> None:
+    assert litellm.supports_native_transcription(model) is native_transcription
+    assert litellm.utils.supports_turn_detection(model) is turn_detection
+    assert litellm.utils._supports_factory(model, None, "supports_sampling_params") is sampling
+
+
+def test_supports_audio_output_reads_own_flag(local_model_cost_map: None) -> None:
+    """Regression: supports_audio_output used to read the supports_audio_input key."""
+    assert litellm.supports_audio_input("gpt-realtime-whisper") is True
+    assert litellm.supports_audio_output("gpt-realtime-whisper") is False

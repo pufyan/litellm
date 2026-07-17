@@ -3415,7 +3415,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/eu/gpt-4o-realtime-preview-2024-10-01": {
         "cache_creation_input_audio_token_cost": 2.2e-05,
@@ -3434,7 +3437,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/eu/gpt-4o-realtime-preview-2024-12-17": {
         "cache_read_input_audio_token_cost": 2.5e-06,
@@ -3461,7 +3467,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/eu/gpt-5-2025-08-07": {
         "cache_read_input_token_cost": 1.375e-07,
@@ -4651,7 +4660,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/gpt-realtime-2025-08-28": {
         "cache_creation_input_audio_token_cost": 4e-06,
@@ -4683,7 +4695,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/gpt-realtime-1.5-2026-02-23": {
         "cache_creation_input_audio_token_cost": 4e-06,
@@ -4715,7 +4730,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/gpt-realtime-mini-2025-10-06": {
         "cache_creation_input_audio_token_cost": 3e-07,
@@ -4747,7 +4765,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/gpt-4o-mini-transcribe": {
         "input_cost_per_audio_token": 1.25e-06,
@@ -4796,7 +4817,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/gpt-4o-realtime-preview-2024-12-17": {
         "cache_read_input_token_cost": 2.5e-06,
@@ -4822,7 +4846,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/gpt-4o-transcribe": {
         "input_cost_per_audio_token": 2.5e-06,
@@ -7886,7 +7913,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/us/gpt-4o-realtime-preview-2024-10-01": {
         "cache_creation_input_audio_token_cost": 2.2e-05,
@@ -7905,7 +7935,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/us/gpt-4o-realtime-preview-2024-12-17": {
         "cache_read_input_audio_token_cost": 2.5e-06,
@@ -7932,7 +7965,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "azure/us/gpt-5-2025-08-07": {
         "cache_read_input_token_cost": 1.375e-07,
@@ -17698,7 +17734,10 @@
             "search_context_size_medium": 0.035,
             "search_context_size_high": 0.035
         },
-        "gemini_native_audio": true
+        "gemini_native_audio": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": true
     },
     "gemini/gemini-live-2.5-flash-preview-native-audio-09-2025": {
         "cache_read_input_token_cost": 7.5e-08,
@@ -17744,7 +17783,10 @@
             "search_context_size_medium": 0.035,
             "search_context_size_high": 0.035
         },
-        "gemini_native_audio": true
+        "gemini_native_audio": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": true
     },
     "gemini-2.5-flash-lite-preview-06-17": {
         "deprecation_date": "2025-11-18",
@@ -22023,7 +22065,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-4o-mini-realtime-preview-2024-12-17": {
         "cache_creation_input_audio_token_cost": 3e-07,
@@ -22042,7 +22087,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-4o-mini-search-preview": {
         "cache_read_input_token_cost": 7.5e-08,
@@ -22136,7 +22184,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-4o-realtime-preview-2024-12-17": {
         "cache_read_input_token_cost": 2.5e-06,
@@ -22154,7 +22205,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-4o-realtime-preview-2025-06-03": {
         "cache_read_input_token_cost": 2.5e-06,
@@ -22172,7 +22226,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-4o-search-preview": {
         "cache_read_input_token_cost": 1.25e-06,
@@ -24379,7 +24436,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-realtime-1.5": {
         "cache_creation_input_audio_token_cost": 4e-07,
@@ -24411,7 +24471,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-realtime-2": {
         "cache_creation_input_audio_token_cost": 4e-07,
@@ -24443,7 +24506,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-realtime-2.1": {
         "cache_creation_input_audio_token_cost": 4e-07,
@@ -24478,7 +24544,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-realtime-2.1-mini": {
         "cache_creation_input_audio_token_cost": 3e-07,
@@ -24513,7 +24582,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-realtime-mini": {
         "cache_creation_input_audio_token_cost": 3e-07,
@@ -24544,7 +24616,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-realtime-2025-08-28": {
         "cache_creation_input_audio_token_cost": 4e-07,
@@ -24576,7 +24651,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gradient_ai/alibaba-qwen3-32b": {
         "litellm_provider": "gradient_ai",
@@ -43483,7 +43561,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-realtime-mini-2025-12-15": {
         "cache_creation_input_audio_token_cost": 3e-07,
@@ -43516,7 +43597,10 @@
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_system_messages": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": false
     },
     "gpt-realtime-whisper": {
         "input_cost_per_second": 0.0002833333333333333,
@@ -43770,7 +43854,10 @@
         "supports_function_calling": true,
         "supports_vision": true,
         "supports_web_search": true,
-        "gemini_audio_only_live": true
+        "gemini_audio_only_live": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": true
     },
     "gemini/gemini-2.5-flash-native-audio-latest": {
         "input_cost_per_audio_token": 1e-06,
@@ -43886,7 +43973,10 @@
         "supports_web_search": true,
         "tpm": 250000,
         "rpm": 10,
-        "gemini_audio_only_live": true
+        "gemini_audio_only_live": true,
+        "supports_native_transcription": true,
+        "supports_turn_detection": true,
+        "supports_sampling_params": true
     },
     "gemini-2.5-flash-preview-tts": {
         "input_cost_per_token": 3e-07,

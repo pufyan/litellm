@@ -2036,6 +2036,8 @@ if TYPE_CHECKING:
     supports_vision: Callable[..., bool]
     supports_audio_input: Callable[..., bool]
     supports_audio_output: Callable[..., bool]
+    supports_native_transcription: Callable[..., bool]
+    supports_turn_detection: Callable[..., bool]
     supports_system_messages: Callable[..., bool]
     supports_reasoning: Callable[..., bool]
     acreate: Callable[..., Any]

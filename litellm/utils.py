@@ -2429,7 +2429,19 @@ def supports_pdf_input(model: str, custom_llm_provider: Optional[str] = None) ->
 
 def supports_audio_output(model: str, custom_llm_provider: Optional[str] = None) -> bool:
     """Check if a given model supports audio output in a chat completion call"""
-    return _supports_factory(model=model, custom_llm_provider=custom_llm_provider, key="supports_audio_input")
+    return _supports_factory(model=model, custom_llm_provider=custom_llm_provider, key="supports_audio_output")
+
+
+def supports_native_transcription(model: str, custom_llm_provider: Optional[str] = None) -> bool:
+    """Check if a realtime model can emit input-audio transcription events"""
+    return _supports_factory(
+        model=model, custom_llm_provider=custom_llm_provider, key="supports_native_transcription"
+    )
+
+
+def supports_turn_detection(model: str, custom_llm_provider: Optional[str] = None) -> bool:
+    """Check if a realtime model supports server-side turn detection (VAD)"""
+    return _supports_factory(model=model, custom_llm_provider=custom_llm_provider, key="supports_turn_detection")
 
 
 def supports_prompt_caching(model: str, custom_llm_provider: Optional[str] = None) -> bool:
@@ -5496,6 +5508,8 @@ def _get_model_info_helper(
                 supports_prompt_caching=_model_info.get("supports_prompt_caching", None),
                 supports_audio_input=_model_info.get("supports_audio_input", None),
                 supports_audio_output=_model_info.get("supports_audio_output", None),
+                supports_native_transcription=_model_info.get("supports_native_transcription", None),
+                supports_turn_detection=_model_info.get("supports_turn_detection", None),
                 supports_pdf_input=_model_info.get("supports_pdf_input", None),
                 supports_embedding_image_input=_model_info.get("supports_embedding_image_input", None),
                 supports_native_streaming=_model_info.get("supports_native_streaming", None),

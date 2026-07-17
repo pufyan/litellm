@@ -136,6 +136,8 @@ class ProviderSpecificModelInfo(TypedDict, total=False):
     supports_audio_input: Optional[bool]
     supports_embedding_image_input: Optional[bool]
     supports_audio_output: Optional[bool]
+    supports_native_transcription: Optional[bool]
+    supports_turn_detection: Optional[bool]
     supports_pdf_input: Optional[bool]
     supports_native_streaming: Optional[bool]
     supports_native_structured_output: Optional[bool]
