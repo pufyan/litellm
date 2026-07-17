@@ -141,6 +141,21 @@ How each family drops unsupported fields:
 - Gemini / Vertex: `get_supported_openai_params` is the allowlist; `map_openai_params` only maps listed keys and ignores the rest.
 - Bedrock: maps a fixed subset of canonical fields and ignores the rest by construction.
 
+## Server events: the outbound contract
+
+The contract is bidirectional. Inbound, clients send one canonical `session.update`; outbound, clients receive one canonical event stream — the OpenAI Realtime server events (`session.created`, `response.output_audio.delta`, `conversation.item.input_audio_transcription.completed`, `response.done`, and so on). A client never sees a provider-native event shape, regardless of backend.
+
+How each provider family honors this:
+
+- Gemini / Vertex AI: full re-synthesis. Canonical events are constructed from scratch out of Gemini Live frames (`setupComplete` becomes `session.created`, `usageMetadata` becomes canonical usage, model path prefixes are stripped, modalities are lowercased). Unknown native frames are dropped, so nothing Gemini-shaped can leak.
+- Bedrock Nova Sonic: full re-synthesis from Nova Sonic events; unknown events are dropped.
+- OpenAI / Azure: the backend already speaks the canonical format; events pass through, with GA-to-beta event-name translation only for clients that connected with the beta header.
+- xAI: passthrough with a targeted normalizer (drops `ping`, rewrites `role: "tool"` to `"assistant"` on function-call items, injects missing indices, normalizes usage). This is a blacklist approach: known deviations are fixed, unknown future deviations would leak until added to the normalizer. Treat any xAI-shaped surprise in the event stream as a bug in `XAIRealtimeNormalizer`, not as client-visible contract.
+
+Emission conditions differ per provider even for canonical events. The one that surprises people most: `conversation.item.input_audio_transcription.completed`. Gemini Live produces input transcription natively once enabled in setup. OpenAI runs it as a separate ASR process that is off by default; the event fires only when `audio.input.transcription` is configured with a valid transcription model and the audio buffer is committed (by VAD or explicitly), and it arrives asynchronously, possibly after `response.done`. Bedrock does not emit it at all. An identical client therefore hears this event on Gemini, only-with-config on OpenAI, and never on Bedrock; that is a capability difference, not an event-mapping bug.
+
+Rules for contributors on the outbound side mirror the inbound ones: a new provider's event mapping must re-synthesize canonical events (prefer Gemini's re-synthesis approach over xAI's blacklist), drop what it cannot map, and never forward a provider-native event or field to the client.
+
 ## Semantic aliasing policy
 
 ### Hard invariant: one name, one meaning
