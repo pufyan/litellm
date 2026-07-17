@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional, Protocol, Union, cast
 
 import litellm
 from litellm._logging import verbose_logger
@@ -22,6 +22,37 @@ from litellm.types.realtime import (
 )
 
 from .litellm_logging import Logging as LiteLLMLogging
+
+_GA_SESSION_ALLOWED_KEYS_FALLBACK: FrozenSet[str] = frozenset(
+    {
+        "audio",
+        "include",
+        "instructions",
+        "max_output_tokens",
+        "model",
+        "output_modalities",
+        "prompt",
+        "tool_choice",
+        "tools",
+        "tracing",
+        "truncation",
+        "type",
+    }
+)
+
+
+def _derive_ga_session_allowed_keys() -> FrozenSet[str]:
+    try:
+        from openai.types.realtime.realtime_session_create_request import (
+            RealtimeSessionCreateRequest,
+        )
+
+        return frozenset(RealtimeSessionCreateRequest.model_fields.keys())
+    except Exception:
+        return _GA_SESSION_ALLOWED_KEYS_FALLBACK
+
+
+GA_SESSION_ALLOWED_KEYS: FrozenSet[str] = _derive_ga_session_allowed_keys()
 
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
@@ -1270,7 +1301,10 @@ class RealTimeStreaming:
         session.turn_detection          → session.audio.input.turn_detection
         session.input_audio_transcription → session.audio.input.transcription
         ─────────────────────────────────────────────────────────────────────
-        Fields not in the mapping (instructions, tools, etc.) are passed through.
+        GA-valid fields not in the mapping (instructions, tools, etc.) are passed
+        through. Keys that are not part of the GA session schema (e.g. union
+        extensions like temperature/top_p/top_k that only non-OpenAI backends
+        honor) are dropped so the GA upstream never rejects an unknown parameter.
         GA clients that already use the nested shape are unaffected.
         """
         # Work on a shallow copy so we don't mutate the caller's dict
@@ -1342,7 +1376,7 @@ class RealTimeStreaming:
                     existing[sub_key] = sub_val
             session["audio"] = existing
 
-        return session
+        return {k: v for k, v in session.items() if k in GA_SESSION_ALLOWED_KEYS}
 
     @staticmethod
     def _translate_event_to_beta(event: dict) -> Optional[dict]:

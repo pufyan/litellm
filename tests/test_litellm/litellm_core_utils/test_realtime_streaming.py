@@ -99,6 +99,52 @@ def test_remap_beta_session_to_ga_keeps_existing_ga_max_output_tokens():
     assert out["max_output_tokens"] == "inf"
 
 
+def test_remap_beta_session_to_ga_drops_non_ga_union_fields():
+    out = RealTimeStreaming._remap_beta_session_to_ga(
+        {
+            "voice": "marin",
+            "instructions": "hi",
+            "temperature": 0.8,
+            "top_p": 0.95,
+            "top_k": 40,
+            "context_window_compression": {"sliding_window": {}},
+        }
+    )
+    assert "temperature" not in out
+    assert "top_p" not in out
+    assert "top_k" not in out
+    assert "context_window_compression" not in out
+    assert out["instructions"] == "hi"
+    assert out["audio"]["output"]["voice"] == "marin"
+
+
+def test_remap_beta_session_to_ga_keeps_all_ga_schema_fields():
+    ga_session = {
+        "type": "realtime",
+        "audio": {"output": {"voice": "marin"}},
+        "include": [],
+        "instructions": "hi",
+        "max_output_tokens": 4096,
+        "output_modalities": ["audio"],
+        "tool_choice": "auto",
+        "tools": [],
+        "truncation": "auto",
+    }
+    out = RealTimeStreaming._remap_beta_session_to_ga(dict(ga_session))
+    for key in ga_session:
+        assert key in out, f"GA field {key} must survive the remap"
+
+
+def test_ga_session_allowlist_matches_openai_sdk():
+    from openai.types.realtime.realtime_session_create_request import (
+        RealtimeSessionCreateRequest,
+    )
+
+    from litellm.litellm_core_utils.realtime_streaming import GA_SESSION_ALLOWED_KEYS
+
+    assert GA_SESSION_ALLOWED_KEYS == frozenset(RealtimeSessionCreateRequest.model_fields.keys())
+
+
 def test_remap_beta_session_to_ga_preserves_ga_audio_format_dicts():
     input_format = {"type": "audio/pcm", "rate": 24000}
     output_format = {"type": "audio/G711-ulaw", "rate": 8000}
