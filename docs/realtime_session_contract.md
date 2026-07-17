@@ -8,7 +8,7 @@ The contract is a **union superset** built on the OpenAI realtime session schema
 
 1. The base shape is the OpenAI flat session. Field names and value shapes follow OpenAI wherever OpenAI has an equivalent.
 2. Fields that only some providers support are added flat at the same `session` level (no nested `provider_params` namespace). Example: `top_p`, `top_k`, `context_window_compression` come from Gemini but live next to the OpenAI fields.
-3. Each provider implementation owns its own mapping. It maps the canonical fields it understands, applies its own defaults for anything the client omitted, and silently drops any canonical field it does not support.
+3. Each provider implementation owns its own mapping. It maps the canonical fields it understands, silently drops any canonical field it does not support, and follows the omitted-field rule below rather than inventing defaults.
 
 Consequences you must respect:
 
@@ -31,7 +31,9 @@ wss://<proxy-host>/v1/realtime?model=<model_name>
 Authorization: Bearer <litellm_virtual_key>
 ```
 
-Do not send the `OpenAI-Beta: realtime=v1` header. Without it the proxy runs in GA mode and applies the canonical -> provider remap. Sending that header forces legacy beta passthrough for OpenAI-compatible backends and disables the remap, so keep it off unless you specifically need beta event names.
+The model is selected by the `model` query parameter on the URL, not by a `session.model` field. A `session.model` value is optional and, for OpenAI-compatible backends, must be one the GA schema accepts; other providers ignore it.
+
+Do not send the `OpenAI-Beta: realtime=v1` header. Without it the proxy runs in GA mode and applies the canonical -> provider remap described here. Sending that header forces legacy beta passthrough for OpenAI-compatible backends and disables the GA remap and the non-GA-field drop, so the canonical union fields (`temperature`, `top_p`, `top_k`, `context_window_compression`) would then leak to the OpenAI backend and be rejected. Keep the header off unless you specifically need legacy beta event names and are only sending beta-valid fields.
 
 ## Canonical `session.update`
 
@@ -99,7 +101,7 @@ The proxy owns the mapping. This table records how complete each backend family 
 | `temperature` | dropped | yes | yes |
 | `top_p` | dropped | yes | yes |
 | `top_k` | dropped | yes | dropped |
-| `context_window_compression` | as `truncation` | yes (compression) | dropped |
+| `context_window_compression` | dropped (see note) | yes (compression) | dropped |
 
 Bedrock Nova Sonic is the least complete: it ignores `turn_detection` and `input_audio_transcription` and hardcodes modalities. If a backend does not map a field, it is dropped rather than forwarded, so a canonical payload never breaks a session.
 
@@ -112,6 +114,12 @@ Bedrock Nova Sonic is the least complete: it ignores `turn_detection` and `input
 | Bedrock | `bedrock` | `litellm/llms/bedrock/realtime/transformation.py` |
 
 When you add a provider or a new canonical field, the rule is to extend the mapping inside the provider implementation (or the shared remap for OpenAI-compatible backends), never to push provider-specific shapes onto clients.
+
+How each family drops unsupported fields:
+
+- OpenAI-compatible: after `_remap_beta_session_to_ga` rewrites the flat beta fields into their GA nested form, it keeps only keys in `GA_SESSION_ALLOWED_KEYS`. That allowlist is derived at import time from the installed openai SDK (`RealtimeSessionCreateRequest.model_fields`) with a hardcoded fallback, and a test asserts the two stay in sync so the allowlist cannot silently drift when the SDK updates. Anything outside the GA schema (the union extensions) is dropped here.
+- Gemini / Vertex: `get_supported_openai_params` is the allowlist; `map_openai_params` only maps listed keys and ignores the rest.
+- Bedrock: maps a fixed subset of canonical fields and ignores the rest by construction.
 
 ## Semantic aliasing policy
 
@@ -136,20 +144,20 @@ The trap is fields that share a topic but not behavior. The rule for deciding wh
 
 The principle is unify the intent, not the JSON key. A canonical field is a contract about meaning; each provider interprets that meaning in its own terms and degrades documented-ly for values it cannot honor.
 
-Worked example, `context_window_compression`. OpenAI's native `truncation` (an enum-like strategy that drops old context) and Gemini's `contextWindowCompression` (sliding-window compression / summarization) address the same topic, keeping the context window from overflowing, with different behavior. They are unified under the canonical `context_window_compression` by intent, with these documented degradations:
+Worked example, `context_window_compression`. OpenAI's native `truncation` (an enum-like strategy that drops old context) and Gemini's `contextWindowCompression` (sliding-window compression / summarization) address the same topic, keeping the context window from overflowing, with different behavior. The intended unification under the canonical `context_window_compression` is by intent, with these documented degradations:
 
-- OpenAI: maps the canonical value onto native `truncation`. Exact drop-by-count strategies are honored where OpenAI supports them.
-- Gemini / Vertex: enables `contextWindowCompression`. This compresses rather than hard-drops context, so a request for exact truncation becomes compression, not deletion.
+- Gemini / Vertex: honored today. Enables `contextWindowCompression`, which compresses rather than hard-drops context, so a request for exact truncation becomes compression, not deletion.
+- OpenAI: not yet mapped. There is no remap from canonical `context_window_compression` to native `truncation`, so on OpenAI-compatible backends the field is currently dropped by the GA allowlist. Mapping it to `truncation` is the intended next step; a client that needs OpenAI truncation today should send the native `truncation` field, which is GA-valid and passes through.
 - Bedrock Nova Sonic: no equivalent; dropped.
 
-Because the drop and the compression-vs-truncation difference are both silent at runtime, they are documented here so clients can reason about cross-provider behavior.
+Because both the drop and the compression-vs-truncation difference are silent at runtime, they are documented here so clients can reason about cross-provider behavior. This entry is also a live example of the policy: the canonical name is reserved by intent, but the matrix and this note record what actually happens per provider today, not the aspiration.
 
 ## Provider-specific behavior
 
 Deviations from a naive reading of the contract, per provider. Keep this list in sync with the mappings.
 
 - Bedrock Nova Sonic: ignores `turn_detection` and `input_audio_transcription`; hardcodes modalities to `["text","audio"]`; ignores `top_k`. The `sessionStart.inferenceConfiguration` block (`maxTokens`, `topP`, `temperature`) and `promptStart.audioOutputConfiguration.voiceId` are required-by-protocol: the AWS bidirectional-stream event schema presents them as part of the fixed event structure with no optional marker, so the implementation always sends them and falls back to the values from the AWS documentation examples (`maxTokens: 1024`, `topP: 0.9`, `temperature: 0.7`, `voiceId: "matthew"`) when the client omits them. This is the sanctioned required-by-protocol default, not a litellm opinion. Source: https://docs.aws.amazon.com/nova/latest/userguide/input-events.html
-- OpenAI GA: has no session-level `temperature` / `top_p` / `top_k`; these union fields are dropped. `context_window_compression` is applied as native `truncation`.
+- OpenAI GA: has no session-level `temperature` / `top_p` / `top_k`; these union fields are dropped by the GA allowlist. `context_window_compression` is likewise dropped today (no remap to native `truncation` yet); send native `truncation` if you need it on OpenAI. Native GA fields (`instructions`, `tools`, `tool_choice`, `truncation`, `prompt`, `include`, `tracing`) pass through unchanged.
 - Gemini / Vertex AI: audio formats are fixed by the Live model rather than taken from `input_audio_format` / `output_audio_format`. `context_window_compression` compresses context rather than hard-truncating it.
 
 ## Rules for contributors
