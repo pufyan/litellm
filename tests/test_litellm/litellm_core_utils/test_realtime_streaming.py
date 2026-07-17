@@ -145,6 +145,26 @@ def test_ga_session_allowlist_matches_openai_sdk():
     assert GA_SESSION_ALLOWED_KEYS == frozenset(RealtimeSessionCreateRequest.model_fields.keys())
 
 
+class TestXAIEventTypeAllowlist:
+    def test_ga_vocabulary_derived_from_sdk(self):
+        from litellm.llms.xai.realtime.transformation import GA_SERVER_EVENT_TYPES
+
+        assert GA_SERVER_EVENT_TYPES is not None
+        assert "session.created" in GA_SERVER_EVENT_TYPES
+        assert "response.done" in GA_SERVER_EVENT_TYPES
+
+    def test_unknown_provider_event_dropped(self):
+        normalizer = XAIRealtimeNormalizer()
+        assert normalizer.should_drop({"type": "grok.custom.telemetry"}) is True
+        assert normalizer.should_drop({"type": "ping"}) is True
+
+    def test_canonical_events_not_dropped(self):
+        normalizer = XAIRealtimeNormalizer()
+        assert normalizer.should_drop({"type": "session.created"}) is False
+        assert normalizer.should_drop({"type": "response.output_audio.delta"}) is False
+        assert normalizer.should_drop({"type": "conversation.item.input_audio_transcription.completed"}) is False
+
+
 class TestPassthroughBackendReconnect:
     def _make_streaming(self, backend_connector=None):
         streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock(), backend_connector=backend_connector)

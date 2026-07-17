@@ -16,7 +16,36 @@ construction time (see ``handler.py``) so all normalization is isolated here
 and ``RealTimeStreaming`` stays provider-agnostic.
 """
 
-from typing import Any, Optional
+from typing import Any, FrozenSet, Optional
+
+from litellm._logging import verbose_logger
+
+
+def _derive_ga_server_event_types() -> Optional[FrozenSet[str]]:
+    """Derive the canonical GA server-event vocabulary from the openai SDK.
+
+    Returns None when the SDK shape is unavailable; filtering then fails open
+    (unknown event types pass through) instead of dropping legitimate events.
+    """
+    try:
+        import typing
+
+        from openai.types.realtime.realtime_server_event import RealtimeServerEvent
+
+        args = typing.get_args(RealtimeServerEvent)
+        members = typing.get_args(args[0]) if len(args) == 2 else args
+        types = frozenset(
+            literal
+            for member in members
+            for literal in typing.get_args(getattr(member, "model_fields", {}).get("type").annotation)  # type: ignore[union-attr]
+            if isinstance(literal, str)
+        )
+        return types or None
+    except Exception:
+        return None
+
+
+GA_SERVER_EVENT_TYPES: Optional[FrozenSet[str]] = _derive_ga_server_event_types()
 
 
 class XAIRealtimeNormalizer:
@@ -65,8 +94,23 @@ class XAIRealtimeNormalizer:
     # ---------------------------------------------------------------------------
 
     def should_drop(self, event: object) -> bool:
-        """Return True for provider-specific keepalives unknown to GA clients."""
-        return isinstance(event, dict) and event.get("type") == "ping"
+        """Drop provider-specific events unknown to the canonical GA vocabulary.
+
+        Structural guarantee for the outbound contract: any xAI event whose
+        type is outside the GA server-event set derived from the openai SDK is
+        dropped instead of leaking a provider-native shape to the client. When
+        the vocabulary cannot be derived, filtering fails open and only the
+        known ``ping`` keepalive is dropped.
+        """
+        if not isinstance(event, dict):
+            return False
+        event_type = event.get("type")
+        if event_type == "ping":
+            return True
+        if GA_SERVER_EVENT_TYPES is not None and isinstance(event_type, str) and event_type not in GA_SERVER_EVENT_TYPES:
+            verbose_logger.debug("XAIRealtimeNormalizer: dropping non-GA event type %s", event_type)
+            return True
+        return False
 
     def normalize(self, event: dict) -> dict:
         """Apply all xAI normalization passes in order."""
