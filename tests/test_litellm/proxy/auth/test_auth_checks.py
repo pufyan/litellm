@@ -522,6 +522,49 @@ async def test_get_key_object_should_raise_if_reconnect_fails_on_db_connection_e
     assert mock_prisma_client.get_data.await_count == 1
 
 
+def _fake_redis_cache():
+    fake_redis = MagicMock()
+    fake_redis.async_get_cache = AsyncMock(return_value=None)
+    fake_redis.async_set_cache = AsyncMock()
+    fake_redis.async_set_cache_pipeline = AsyncMock()
+    fake_redis.async_delete_cache = AsyncMock()
+    return fake_redis
+
+
+class TestAuthCacheRedisWritePolicy:
+    """Redis auth-cache entries may only be written from fresh DB loads.
+
+    With ``enable_redis_auth_cache`` and multiple replicas, a pod that re-publishes
+    a cache-derived key object to Redis can resurrect a stale auth blob after
+    ``/key/update`` or ``/key/delete`` already deleted it, so limit changes never
+    propagate fleet-wide while traffic keeps refreshing the stale entry's TTL.
+    """
+
+    @pytest.mark.asyncio
+    async def test_get_key_object_db_load_publishes_to_redis(self):
+        mock_prisma_client = MagicMock()
+        mock_prisma_client.get_data = AsyncMock(
+            return_value=UserAPIKeyAuth(token="hashed-token-db")
+        )
+
+        fake_redis = _fake_redis_cache()
+        cache = UserApiKeyCache()
+        cache.redis_cache = fake_redis
+
+        key_obj = await get_key_object(
+            hashed_token="hashed-token-db",
+            prisma_client=mock_prisma_client,
+            user_api_key_cache=cache,
+        )
+
+        assert key_obj.token == "hashed-token-db"
+        fake_redis.async_set_cache.assert_awaited_once()
+        assert (
+            fake_redis.async_set_cache.await_args.kwargs.get("key")
+            or fake_redis.async_set_cache.await_args.args[0]
+        ) == "hashed-token-db"
+
+
 def test_get_cli_jwt_auth_token_default_expiration(valid_sso_user_defined_values):
     """Test generating CLI JWT token with default 24-hour expiration"""
     token = ExperimentalUIJWTToken.get_cli_jwt_auth_token(valid_sso_user_defined_values)
@@ -699,6 +742,38 @@ async def test_default_internal_user_params_with_get_user_object(monkeypatch):
     assert creation_args["models"] == ["gpt-4", "claude-3-opus"]
     assert creation_args["max_budget"] == 200.0
     assert creation_args["user_role"] == "internal_user"
+
+
+@pytest.mark.asyncio
+async def test_get_user_object_wraps_db_outage_as_valueerror_preserving_context():
+    """Pin get_user_object's exception contract: it catches every DB failure in a broad except and
+    re-raises a bare ValueError, so a real outage survives only as __context__ rather than as the
+    exception type. The MCP dcr_bridge admission and refresh paths depend on this to tell a transient
+    outage (retry, 503) from a missing user (fail closed), which is why they classify across the cause
+    chain instead of the top exception's type. If this wrapping ever changes, that classification must
+    change with it, so this test guards the contract the callers rely on."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db = AsyncMock()
+    mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(
+        side_effect=ConnectionError("can't reach database server")
+    )
+    mock_cache = MagicMock()
+    mock_cache.async_get_cache = AsyncMock(return_value=None)
+    mock_cache.async_set_cache = AsyncMock()
+
+    with patch("litellm.proxy.auth.auth_checks._should_check_db", return_value=True):
+        with pytest.raises(ValueError) as exc_info:
+            await get_user_object(
+                user_id="outage-contract-probe-user",
+                prisma_client=mock_prisma_client,
+                user_api_key_cache=mock_cache,
+                user_id_upsert=False,
+                proxy_logging_obj=None,
+            )
+
+    assert isinstance(exc_info.value.__context__, ConnectionError)
 
 
 @pytest.mark.asyncio
@@ -2602,6 +2677,8 @@ async def test_virtual_key_budget_check_reads_from_spend_counter():
             )
         assert exc_info.value.current_cost == 1.5
         assert exc_info.value.max_budget == 1.0
+        assert exc_info.value.entity_type == "key"
+        assert exc_info.value.entity_id == "test-hashed-token"
 
 
 @pytest.mark.asyncio
@@ -2829,6 +2906,8 @@ async def test_team_budget_check_reads_from_spend_counter():
                 proxy_logging_obj=proxy_logging_obj,
             )
         assert exc_info.value.current_cost == 1.5
+        assert exc_info.value.entity_type == "team"
+        assert exc_info.value.entity_id == "test-team"
 
 
 @pytest.mark.asyncio
@@ -2856,6 +2935,8 @@ async def test_end_user_budget_check_reads_from_spend_counter():
             )
         assert exc_info.value.current_cost == 1.5
         assert exc_info.value.max_budget == 1.0
+        assert exc_info.value.entity_type == "end_user"
+        assert exc_info.value.entity_id == "customer-1"
 
 
 @pytest.mark.asyncio
@@ -2894,6 +2975,8 @@ async def test_tag_budget_check_reads_from_spend_counter():
             )
         assert exc_info.value.current_cost == 1.5
         assert exc_info.value.max_budget == 1.0
+        assert exc_info.value.entity_type == "tag"
+        assert exc_info.value.entity_id == "paid-tag"
 
 
 @pytest.mark.asyncio
@@ -2944,6 +3027,8 @@ async def test_team_member_budget_check_reads_from_spend_counter():
                 proxy_logging_obj=proxy_logging_obj,
             )
         assert exc_info.value.current_cost == 1.5
+        assert exc_info.value.entity_type == "team_member"
+        assert exc_info.value.entity_id == "test-user:test-team"
 
 
 class TestGuardrailModificationCheck:
@@ -4413,3 +4498,85 @@ async def test_common_checks_personal_user_budget_blocks_in_gather():
                 request=MagicMock(spec=Request),
             )
     assert "User=u1" in str(over.value)
+
+
+@pytest.mark.asyncio
+async def test_user_budget_enforced_on_team_key():
+    """User budget must be enforced even when the key belongs to a team.
+
+    Previously _user_max_budget_check skipped enforcement for team keys,
+    letting a user with a $100 personal budget spend unlimited through a
+    team key. This regression test ensures that is no longer the case.
+    """
+    from fastapi import Request
+
+    from litellm.proxy.auth.auth_checks import common_checks
+
+    user = LiteLLM_UserTable(user_id="u1", spend=0.0, max_budget=100.0)
+    team = LiteLLM_TeamTable(team_id="t1", max_budget=2100.0)
+    token = UserAPIKeyAuth(token="k1", user_id="u1", team_id="t1")
+
+    async def _spend_by_counter(counter_key, fallback_spend, max_budget=None, **kwargs):
+        return 999.0 if counter_key == "spend:user:u1" else 0.0
+
+    async def _no_membership(*a, **kw):
+        return None
+
+    with patch("litellm.proxy.proxy_server.prisma_client", None), patch(
+        "litellm.proxy.proxy_server.get_current_spend", _spend_by_counter
+    ), patch("litellm.proxy.auth.auth_checks.get_team_membership", _no_membership):
+        with pytest.raises(litellm.BudgetExceededError) as over:
+            await common_checks(
+                request_body={"messages": [{"role": "user", "content": "hi"}]},
+                team_object=team,
+                user_object=user,
+                end_user_object=None,
+                global_proxy_spend=None,
+                general_settings={},
+                route="/chat/completions",
+                llm_router=None,
+                proxy_logging_obj=MagicMock(),
+                valid_token=token,
+                request=MagicMock(spec=Request),
+            )
+    assert "User=u1" in str(over.value)
+
+
+@pytest.mark.asyncio
+async def test_skip_user_budget_on_team_key_flag_restores_old_behavior():
+    """Setting skip_user_budget_on_team_key=True skips user budget for team keys.
+
+    This is the opt-in escape hatch that restores the legacy behavior where
+    user budgets were not enforced when the key belonged to a team.
+    """
+    from fastapi import Request
+
+    from litellm.proxy.auth.auth_checks import common_checks
+
+    user = LiteLLM_UserTable(user_id="u1", spend=0.0, max_budget=100.0)
+    team = LiteLLM_TeamTable(team_id="t1", max_budget=2100.0)
+    token = UserAPIKeyAuth(token="k1", user_id="u1", team_id="t1")
+
+    async def _spend_by_counter(counter_key, fallback_spend, max_budget=None, **kwargs):
+        return 999.0 if counter_key == "spend:user:u1" else 0.0
+
+    async def _no_membership(*a, **kw):
+        return None
+
+    with patch("litellm.proxy.proxy_server.prisma_client", None), patch(
+        "litellm.proxy.proxy_server.get_current_spend", _spend_by_counter
+    ), patch("litellm.proxy.auth.auth_checks.get_team_membership", _no_membership):
+        result = await common_checks(
+            request_body={"messages": [{"role": "user", "content": "hi"}]},
+            team_object=team,
+            user_object=user,
+            end_user_object=None,
+            global_proxy_spend=None,
+            general_settings={"skip_user_budget_on_team_key": True},
+            route="/chat/completions",
+            llm_router=None,
+            proxy_logging_obj=MagicMock(),
+            valid_token=token,
+            request=MagicMock(spec=Request),
+        )
+    assert result is True
