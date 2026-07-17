@@ -1263,6 +1263,7 @@ class RealTimeStreaming:
         ─────────────────────────────────────────────────────────────────────
         session.type                    (inject "realtime" if absent)
         session.modalities              → session.output_modalities
+        session.max_response_output_tokens → session.max_output_tokens
         session.voice                   → session.audio.output.voice
         session.input_audio_format      → session.audio.input.format  (with type/rate)
         session.output_audio_format     → session.audio.output.format (with type/rate)
@@ -1292,7 +1293,13 @@ class RealTimeStreaming:
                 elif "text" in mods_set:
                     session["output_modalities"] = ["text"]
 
-        # 3-7. Lift flat audio fields into the nested audio object
+        # 3. Rename max_response_output_tokens → max_output_tokens
+        if "max_response_output_tokens" in session:
+            renamed = session.pop("max_response_output_tokens")
+            if "max_output_tokens" not in session:
+                session["max_output_tokens"] = renamed
+
+        # 4-8. Lift flat audio fields into the nested audio object
         audio: Dict[str, Any] = {}
         inp: Dict[str, Any] = {}
         out: Dict[str, Any] = {}

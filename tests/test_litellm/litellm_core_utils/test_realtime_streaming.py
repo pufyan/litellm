@@ -85,6 +85,20 @@ def test_remap_beta_session_to_ga_normalizes_modalities_and_audio():
     assert out["audio"]["output"]["voice"] == "alloy"
 
 
+def test_remap_beta_session_to_ga_renames_max_response_output_tokens():
+    out = RealTimeStreaming._remap_beta_session_to_ga({"max_response_output_tokens": 4096})
+    assert "max_response_output_tokens" not in out
+    assert out["max_output_tokens"] == 4096
+
+
+def test_remap_beta_session_to_ga_keeps_existing_ga_max_output_tokens():
+    out = RealTimeStreaming._remap_beta_session_to_ga(
+        {"max_response_output_tokens": 4096, "max_output_tokens": "inf"}
+    )
+    assert "max_response_output_tokens" not in out
+    assert out["max_output_tokens"] == "inf"
+
+
 def test_remap_beta_session_to_ga_preserves_ga_audio_format_dicts():
     input_format = {"type": "audio/pcm", "rate": 24000}
     output_format = {"type": "audio/G711-ulaw", "rate": 8000}
