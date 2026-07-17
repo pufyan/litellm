@@ -163,6 +163,10 @@ class RealTimeStreaming:
         self._resumption_state: Optional[RealtimeResumptionState] = None
         self._reconnecting_backend: bool = False
         self._reconnect_resumed_mode: str = "fresh"
+        # Passthrough (OpenAI-compatible) reconnect support: last GA-shaped
+        # session.update forwarded upstream, replayed into a fresh backend
+        # socket to restore session configuration.
+        self._last_ga_session_update: Optional[str] = None
         # Conversation transcript for history replay on a fresh (non-native)
         # reconnect: user/assistant turns plus service notes such as barge-ins.
         self._transcript_entries: list[RealtimeTranscriptEntry] = []
@@ -605,12 +609,17 @@ class RealTimeStreaming:
         return True
 
     def _supports_backend_reconnect(self) -> bool:
-        return (
-            self.backend_connector is not None
-            and self.provider_config is not None
-            and self.provider_config.supports_session_resumption() is True
-            and self.session_configuration_request is not None
-        )
+        if self.backend_connector is None:
+            return False
+        if self.provider_config is not None:
+            return (
+                self.provider_config.supports_session_resumption() is True
+                and self.session_configuration_request is not None
+            )
+        # Passthrough (OpenAI-compatible) backends have no native resumption
+        # but support a fresh reconnect: replay the cached session.update and
+        # the accumulated transcript into the new socket.
+        return True
 
     async def _send_litellm_session_event(self, event: dict[str, str]) -> None:
         try:
@@ -627,16 +636,19 @@ class RealTimeStreaming:
         """
         import websockets.exceptions
 
-        if self.backend_connector is None or self.provider_config is None:
+        if self.backend_connector is None:
             return False
         self._reconnecting_backend = True
         await self._send_litellm_session_event({"type": "litellm.session.reconnecting", "reason": reason})
         state = self._resumption_state
-        resume_request = (
-            self.provider_config.build_resume_session_request(state, self.session_configuration_request)
-            if state is not None
-            else self.session_configuration_request
-        )
+        if self.provider_config is not None:
+            resume_request = (
+                self.provider_config.build_resume_session_request(state, self.session_configuration_request)
+                if state is not None
+                else self.session_configuration_request
+            )
+        else:
+            resume_request = self._last_ga_session_update
         old_ws = self.backend_ws
         for attempt, delay in enumerate(self._RECONNECT_BACKOFF_SECONDS, start=1):
             try:
@@ -691,15 +703,48 @@ class RealTimeStreaming:
         elif event_type == "response.done":
             self._flush_assistant_transcript()
 
+    @staticmethod
+    def _build_canonical_history_replay_messages(
+        entries: "tuple[RealtimeTranscriptEntry, ...]",
+    ) -> List[str]:
+        """Build GA `conversation.item.create` messages restoring the transcript.
+
+        Used on passthrough (OpenAI-compatible) backends, whose canonical wire
+        format is the contract itself: assistant turns become `output_text`
+        items, user turns and service notes become `input_text` items.
+        """
+        return [
+            json.dumps(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant" if entry.role == "assistant" else "user",
+                        "content": [
+                            {
+                                "type": "output_text" if entry.role == "assistant" else "input_text",
+                                "text": entry.text,
+                            }
+                        ],
+                    },
+                }
+            )
+            for entry in entries
+        ]
+
     async def _replay_transcript_after_fresh_reconnect(self) -> None:
-        if self.provider_config is None or not self._transcript_entries:
+        if not self._transcript_entries:
             return
         self._flush_assistant_transcript()
         entries = (
             RealtimeTranscriptEntry(role="note", text=self._REPLAY_RESTORED_NOTE),
             *self._transcript_entries,
         )
-        replay_messages = self.provider_config.build_history_replay_messages(entries)
+        replay_messages = (
+            self.provider_config.build_history_replay_messages(entries)
+            if self.provider_config is not None
+            else self._build_canonical_history_replay_messages(entries)
+        )
         if not replay_messages:
             return
         for message in replay_messages:
@@ -1249,6 +1294,14 @@ class RealTimeStreaming:
                     if self._should_drop_event_from_client(event):
                         continue
 
+                    self._record_transcript_event(event)
+                    if self._reconnecting_backend and event.get("type") == "session.created":
+                        await self._on_backend_setup_acknowledged_after_reconnect()
+                        # The client already saw session.created; swallow the
+                        # post-reconnect duplicate (litellm.session.reconnected
+                        # is the client-facing signal for this transition).
+                        continue
+
                     if await self._handle_raw_backend_message(event, raw_response):
                         continue
 
@@ -1671,6 +1724,9 @@ class RealTimeStreaming:
                         if isinstance(session, dict):
                             msg_obj["session"] = self._event_normalizer.patch_outgoing_session(session)
                             message = json.dumps(msg_obj)
+
+                    if msg_type == "session.update" and self.provider_config is None and isinstance(message, str):
+                        self._last_ga_session_update = message
 
                 except (json.JSONDecodeError, AttributeError):
                     pass

@@ -170,7 +170,11 @@ The client-to-proxy WebSocket is the session; it stays up for the session's life
 
 Clients observe this through two proxy-emitted events that extend the canonical stream: `litellm.session.reconnecting` `{reason}` followed by `litellm.session.reconnected` `{resumed: "native" | "fresh" | "replayed"}`. Handle them (at minimum, ignore them without crashing on the unknown `litellm.`-prefixed type); do not treat them as provider events.
 
-Current support: backend reconnection is gated on the provider implementation declaring `supports_session_resumption()`, which today only Gemini / Vertex AI do. On OpenAI, Azure and xAI a dropped backend socket ends the client session; the client must reconnect and rebuild state itself. Extending fresh-mode replay to those backends is a known gap: the transcript-replay machinery is provider-independent and only needs the provider config to supply `build_history_replay_messages`.
+Current support:
+
+- Gemini / Vertex AI: full support. `native` mode via the `sessionResumptionUpdate` handle when available, `fresh` mode with provider-format transcript replay otherwise; `goAway` triggers a proactive reconnect before the drop.
+- OpenAI / Azure / xAI: `fresh` mode. There is no native resumption in the OpenAI GA protocol, so on a dropped backend socket the proxy opens a new one, re-sends the last client `session.update` (cached in its final GA form) to restore configuration, replays the accumulated transcript as canonical `conversation.item.create` items (user turns as `input_text`, assistant turns as `output_text`, prefixed with a context-restored note), and swallows the duplicate `session.created` so the client only sees the `litellm.session.*` pair.
+- Bedrock Nova Sonic: not supported, by transport. AWS exposes realtime as `InvokeModelWithBidirectionalStream` (SigV4-signed HTTP/2 event stream, not a WebSocket), so Bedrock bypasses the shared WebSocket machinery entirely; a dropped backend stream ends the client session. A Bedrock-specific reconnect (re-issuing sessionStart/promptStart and replaying history inside its handler) is possible but is a separate implementation, not a configuration of the shared one.
 
 ## Semantic aliasing policy
 

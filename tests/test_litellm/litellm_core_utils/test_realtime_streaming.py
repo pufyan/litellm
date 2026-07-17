@@ -145,6 +145,64 @@ def test_ga_session_allowlist_matches_openai_sdk():
     assert GA_SESSION_ALLOWED_KEYS == frozenset(RealtimeSessionCreateRequest.model_fields.keys())
 
 
+class TestPassthroughBackendReconnect:
+    def _make_streaming(self, backend_connector=None):
+        streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock(), backend_connector=backend_connector)
+        return streaming
+
+    def test_supports_reconnect_with_connector_and_no_provider_config(self):
+        assert self._make_streaming(backend_connector=MagicMock())._supports_backend_reconnect() is True
+
+    def test_no_reconnect_without_connector(self):
+        assert self._make_streaming(backend_connector=None)._supports_backend_reconnect() is False
+
+    def test_canonical_history_replay_message_shapes(self):
+        from litellm.types.realtime import RealtimeTranscriptEntry
+
+        entries = (
+            RealtimeTranscriptEntry(role="user", text="привет"),
+            RealtimeTranscriptEntry(role="assistant", text="здравствуйте"),
+            RealtimeTranscriptEntry(role="note", text="[note]"),
+        )
+        messages = [json.loads(m) for m in RealTimeStreaming._build_canonical_history_replay_messages(entries)]
+        assert all(m["type"] == "conversation.item.create" for m in messages)
+        assert messages[0]["item"]["role"] == "user"
+        assert messages[0]["item"]["content"] == [{"type": "input_text", "text": "привет"}]
+        assert messages[1]["item"]["role"] == "assistant"
+        assert messages[1]["item"]["content"] == [{"type": "output_text", "text": "здравствуйте"}]
+        assert messages[2]["item"]["role"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_replay_after_fresh_reconnect_sends_canonical_items(self):
+        from litellm.types.realtime import RealtimeTranscriptEntry
+
+        streaming = self._make_streaming(backend_connector=MagicMock())
+        streaming.backend_ws = AsyncMock()
+        streaming._transcript_entries = [
+            RealtimeTranscriptEntry(role="user", text="раз"),
+            RealtimeTranscriptEntry(role="assistant", text="два"),
+        ]
+
+        await streaming._replay_transcript_after_fresh_reconnect()
+
+        sent = [json.loads(call.args[0]) for call in streaming.backend_ws.send.call_args_list]
+        assert len(sent) == 3
+        assert sent[0]["item"]["role"] == "user"
+        assert "restored" in sent[0]["item"]["content"][0]["text"].lower() or sent[0]["item"]["content"][0]["text"]
+        assert sent[1]["item"]["content"] == [{"type": "input_text", "text": "раз"}]
+        assert sent[2]["item"]["content"] == [{"type": "output_text", "text": "два"}]
+        assert streaming._reconnect_resumed_mode == "replayed"
+
+    @pytest.mark.asyncio
+    async def test_replay_noop_without_transcript(self):
+        streaming = self._make_streaming(backend_connector=MagicMock())
+        streaming.backend_ws = AsyncMock()
+
+        await streaming._replay_transcript_after_fresh_reconnect()
+
+        streaming.backend_ws.send.assert_not_called()
+
+
 def test_remap_beta_session_to_ga_normalizes_nested_structures():
     out = RealTimeStreaming._remap_beta_session_to_ga(
         {
