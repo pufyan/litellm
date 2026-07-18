@@ -83,6 +83,8 @@ The `Origin` column records where the field came from. `OpenAI` fields are the b
 
 The `voice` and `max_response_output_tokens` values cannot be changed once the model has emitted audio in a session. Set them on the first `session.update`.
 
+Dual input addresses: fields that GA nests under `audio` (`voice`, `input_audio_format`, `output_audio_format`, `turn_detection`, `input_audio_transcription`) are accepted at both addresses — the flat canonical one above and the GA-nested one (`audio.output.voice`, `audio.input.turn_detection`, ...). The proxy always forwards the nested GA form and normalizes both inputs. If a client sends both addresses at once, the flat canonical value wins within each sub-key. Echoed `session.updated` events always show the nested form; do not read the flat address back.
+
 ## Nested structures have no safety net
 
 This is the single most important operational rule of the contract. The GA remap and its allowlist drop only clean the **top level** of `session`. They rename and drop top-level keys, but they do not descend into nested objects. A stray provider-specific key inside a nested structure is forwarded verbatim, and a backend that does not recognize it rejects the whole `session.update`, taking the system prompt and tool config down with it.
