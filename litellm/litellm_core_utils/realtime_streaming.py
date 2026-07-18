@@ -1369,6 +1369,15 @@ class RealTimeStreaming:
         # Work on a shallow copy so we don't mutate the caller's dict
         session = dict(session)
 
+        # 0. One field, one client-facing address: the flat canonical schema is
+        # the only inbound form. Provider-native (GA) aliases from the client —
+        # the nested `audio` block and the renamed keys `output_modalities` /
+        # `max_output_tokens` — are silently dropped per the contract; the
+        # proxy derives the GA form itself from the canonical fields.
+        session.pop("audio", None)
+        session.pop("output_modalities", None)
+        session.pop("max_output_tokens", None)
+
         # 1. Ensure session.type is present
         if "type" not in session:
             session["type"] = "realtime"
@@ -1379,18 +1388,15 @@ class RealTimeStreaming:
         # ["audio"] because audio mode already delivers transcripts via events.
         if "modalities" in session:
             mods = session.pop("modalities")
-            if "output_modalities" not in session:
-                mods_set = {m.lower() for m in (mods or [])}
-                if "audio" in mods_set:
-                    session["output_modalities"] = ["audio"]
-                elif "text" in mods_set:
-                    session["output_modalities"] = ["text"]
+            mods_set = {m.lower() for m in (mods or [])}
+            if "audio" in mods_set:
+                session["output_modalities"] = ["audio"]
+            elif "text" in mods_set:
+                session["output_modalities"] = ["text"]
 
         # 3. Rename max_response_output_tokens → max_output_tokens
         if "max_response_output_tokens" in session:
-            renamed = session.pop("max_response_output_tokens")
-            if "max_output_tokens" not in session:
-                session["max_output_tokens"] = renamed
+            session["max_output_tokens"] = session.pop("max_response_output_tokens")
 
         # 4-8. Lift flat audio fields into the nested audio object
         audio: Dict[str, Any] = {}
@@ -1425,15 +1431,7 @@ class RealTimeStreaming:
             audio["output"] = out
 
         if audio:
-            # Merge with any existing GA-style `audio` block the client already set,
-            # letting the remapped values take precedence within each sub-key.
-            existing = session.get("audio") or {}
-            for sub_key, sub_val in audio.items():
-                if sub_key in existing and isinstance(existing[sub_key], dict) and isinstance(sub_val, dict):
-                    existing[sub_key] = {**existing[sub_key], **sub_val}
-                else:
-                    existing[sub_key] = sub_val
-            session["audio"] = existing
+            session["audio"] = audio
 
         session = RealTimeStreaming._normalize_nested_session_structures(session)
         return {k: v for k, v in session.items() if k in GA_SESSION_ALLOWED_KEYS}
@@ -1660,9 +1658,12 @@ class RealTimeStreaming:
                     # client-provided ``turn_detection`` so a later
                     # ``session.update`` cannot re-enable VAD auto-response
                     # and bypass the transcription guardrail after the
-                    # initial disable. Covers both the flat beta key and the
-                    # nested GA ``audio.input.turn_detection`` shape, since
-                    # the GA remap below also accepts either form. Skipped
+                    # initial disable. Only the flat canonical key exists on
+                    # the client contract (a nested GA ``audio`` block from
+                    # the client is dropped by the remap below), so the
+                    # override always lands on ``session.turn_detection`` —
+                    # injected even when the client omitted the field, so no
+                    # downstream merge can resurrect auto-response. Skipped
                     # when the injection block above already ran for this
                     # message, to avoid redundant double-serialization.
                     if (
@@ -1672,41 +1673,11 @@ class RealTimeStreaming:
                     ):
                         session = msg_obj.get("session")
                         if isinstance(session, dict):
-                            td_overridden = False
                             flat_td = session.get("turn_detection")
-                            flat_td_present = flat_td is not None
-                            if flat_td_present:
-                                if not isinstance(flat_td, dict):
-                                    flat_td = {}
-                                if flat_td.get("create_response") is not False:
-                                    flat_td["create_response"] = False
-                                    session["turn_detection"] = flat_td
-                                    td_overridden = True
-                            nested_td_present = False
-                            audio = session.get("audio")
-                            if isinstance(audio, dict):
-                                audio_input = audio.get("input")
-                                if isinstance(audio_input, dict):
-                                    nested_td = audio_input.get("turn_detection")
-                                    if nested_td is not None:
-                                        nested_td_present = True
-                                        if not isinstance(nested_td, dict):
-                                            nested_td = {}
-                                        if nested_td.get("create_response") is not False:
-                                            nested_td["create_response"] = False
-                                            audio_input["turn_detection"] = nested_td
-                                            td_overridden = True
-                            # Symmetric with the first-update injection block:
-                            # if the client omitted turn_detection entirely on
-                            # a subsequent session.update, still inject the
-                            # ``create_response: False`` override so the
-                            # transcription guardrail cannot be re-enabled by
-                            # any downstream merge that drops the original
-                            # disable.
-                            if not flat_td_present and not nested_td_present:
-                                session["turn_detection"] = {"create_response": False}
-                                td_overridden = True
-                            if td_overridden:
+                            if not isinstance(flat_td, dict):
+                                flat_td = {}
+                            if flat_td.get("create_response") is not False:
+                                session["turn_detection"] = {**flat_td, "create_response": False}
                                 message = json.dumps(msg_obj)
 
                     # GA compatibility: remap beta-style session fields only when

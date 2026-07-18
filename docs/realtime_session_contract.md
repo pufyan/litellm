@@ -83,7 +83,13 @@ The `Origin` column records where the field came from. `OpenAI` fields are the b
 
 The `voice` and `max_response_output_tokens` values cannot be changed once the model has emitted audio in a session. Set them on the first `session.update`.
 
-Dual input addresses: fields that GA nests under `audio` (`voice`, `input_audio_format`, `output_audio_format`, `turn_detection`, `input_audio_transcription`) are accepted at both addresses — the flat canonical one above and the GA-nested one (`audio.output.voice`, `audio.input.turn_detection`, ...). The proxy always forwards the nested GA form and normalizes both inputs. If a client sends both addresses at once, the flat canonical value wins within each sub-key. Echoed `session.updated` events always show the nested form; do not read the flat address back.
+One field, one address. The flat canonical schema above is the **only** inbound form; every canonical field has exactly one client-facing name and location. Provider-native aliases sent by a client are silently dropped, never merged:
+
+- a GA-nested `audio` block (`audio.output.voice`, `audio.input.turn_detection`, `audio.input.transcription`, `audio.*.format`) — dropped; the proxy builds the GA `audio` object itself from the flat fields
+- GA-renamed keys `output_modalities` and `max_output_tokens` — dropped; use `modalities` and `max_response_output_tokens`
+- any provider-native key of any other backend (Gemini/Bedrock shapes) — dropped by the same rule
+
+Clients written directly against the OpenAI GA session shape must switch their `session.update` payloads to the flat canonical form when talking to the proxy; this is a deliberate breaking guarantee that keeps the contract unambiguous. Outbound is unchanged: server events (including the `session.created` / `session.updated` echoes) follow the canonical GA event vocabulary, so configuration reads come from the GA-shaped echo while configuration writes use only the flat canonical schema.
 
 ## Nested structures have no safety net
 

@@ -91,12 +91,23 @@ def test_remap_beta_session_to_ga_renames_max_response_output_tokens():
     assert out["max_output_tokens"] == 4096
 
 
-def test_remap_beta_session_to_ga_keeps_existing_ga_max_output_tokens():
+def test_remap_beta_session_to_ga_canonical_name_wins_over_ga_alias():
+    """One field, one address: the client-sent GA alias is dropped and the
+    canonical name is authoritative."""
     out = RealTimeStreaming._remap_beta_session_to_ga(
         {"max_response_output_tokens": 4096, "max_output_tokens": "inf"}
     )
     assert "max_response_output_tokens" not in out
-    assert out["max_output_tokens"] == "inf"
+    assert out["max_output_tokens"] == 4096
+
+
+def test_remap_beta_session_to_ga_drops_lone_ga_aliases():
+    out = RealTimeStreaming._remap_beta_session_to_ga(
+        {"output_modalities": ["text"], "max_output_tokens": 128, "instructions": "hi"}
+    )
+    assert "output_modalities" not in out
+    assert "max_output_tokens" not in out
+    assert out["instructions"] == "hi"
 
 
 def test_remap_beta_session_to_ga_drops_non_ga_union_fields():
@@ -118,14 +129,11 @@ def test_remap_beta_session_to_ga_drops_non_ga_union_fields():
     assert out["audio"]["output"]["voice"] == "marin"
 
 
-def test_remap_beta_session_to_ga_keeps_all_ga_schema_fields():
+def test_remap_beta_session_to_ga_keeps_canonical_ga_schema_fields():
     ga_session = {
         "type": "realtime",
-        "audio": {"output": {"voice": "marin"}},
         "include": [],
         "instructions": "hi",
-        "max_output_tokens": 4096,
-        "output_modalities": ["audio"],
         "tool_choice": "auto",
         "tools": [],
         "truncation": "auto",
@@ -238,17 +246,27 @@ def test_remap_beta_session_to_ga_normalizes_nested_structures():
     assert out["tools"] == [{"type": "function", "name": "f", "parameters": {"type": "object"}}]
 
 
-def test_remap_beta_session_to_ga_normalizes_client_provided_ga_nested_audio():
+def test_remap_beta_session_to_ga_drops_client_provided_nested_audio_block():
+    """One field, one address: a client-sent GA-nested audio block is dropped;
+    only the flat canonical fields configure audio."""
     out = RealTimeStreaming._remap_beta_session_to_ga(
         {
+            "voice": "marin",
             "audio": {
-                "input": {"turn_detection": {"type": "server_vad", "end_sensitivity": "low"}},
-                "output": {"voice": {"name": "Puck"}},
-            }
+                "input": {"turn_detection": {"type": "server_vad", "threshold": 0.9}},
+                "output": {"voice": "cedar"},
+            },
         }
     )
-    assert out["audio"]["input"]["turn_detection"] == {"type": "server_vad"}
-    assert out["audio"]["output"]["voice"] == "Puck"
+    assert out["audio"] == {"output": {"voice": "marin"}}
+
+
+def test_remap_beta_session_to_ga_without_flat_audio_fields_has_no_audio_block():
+    out = RealTimeStreaming._remap_beta_session_to_ga(
+        {"instructions": "hi", "audio": {"output": {"voice": "cedar"}}}
+    )
+    assert "audio" not in out
+    assert out["instructions"] == "hi"
 
 
 def test_remap_beta_session_to_ga_preserves_ga_audio_format_dicts():
