@@ -412,6 +412,46 @@ You can use LiteLLM through either the Proxy Server or Python SDK. Both give you
 
 Support for more providers. Missing a provider or LLM Platform, raise a [feature request](https://github.com/BerriAI/litellm/issues/new?assignees=&labels=enhancement&projects=&template=feature_request.yml&title=%5BFeature%5D%3A+).
 
+### Run with Docker Compose
+
+The fastest way to run the proxy locally or on a single host. Build the image from this repo (or pull `docker.litellm.ai/berriai/litellm:main-stable` for upstream releases) and start it alongside Postgres with the [`docker-compose.yml`](./docker-compose.yml) in this repo:
+
+```bash
+git clone <this-repo-url> && cd litellm
+cp .env.example .env   # set OPENAI_API_KEY / etc.
+docker compose up -d   # builds the image from source and starts db + litellm
+curl http://localhost:4000/health/liveliness
+```
+
+To run a locally-built image against a separate deploy directory (recommended once you're customizing the proxy config, so `docker compose down` in the deploy dir never touches your source checkout):
+
+```bash
+# in the repo:
+docker build -t litellm-fork:latest .
+
+# in a separate deploy directory with its own docker-compose.yml, config.yaml, .env:
+docker compose up -d
+curl http://localhost:4000/health/readiness
+```
+
+Key environment variables for a fork like this one: set `STORE_MODEL_IN_DB=True` to manage models/keys via the Admin UI or `/model/new` without restarting, and set `LITELLM_LOCAL_MODEL_COST_MAP=True` if you've modified `model_prices_and_context_window.json` locally — otherwise the proxy fetches the model registry from the upstream GitHub repo and your local changes are silently ignored.
+
+After a code change, rebuild the image and recreate the container to pick it up: `docker build -t litellm-fork:latest . && docker compose up -d`.
+
+### Deploy on Kubernetes with Helm
+
+The [Helm chart](./helm/litellm-helm/) at `helm/litellm-helm/` deploys the proxy, an optional bundled Postgres, and (optionally) the Admin UI dashboard.
+
+```bash
+helm repo add litellm-helm https://berriai.github.io/litellm/  # or use ./helm/litellm-helm directly from this repo
+helm install litellm ./helm/litellm-helm \
+  --set masterkey=sk-1234 \
+  --set image.tag=main-latest   # or your own pushed tag when running a fork
+kubectl get pods -l app.kubernetes.io/name=litellm-helm
+```
+
+Pass a proxy `config.yaml` (model list, router/general settings) as a typed map under `proxy_config` in `values.yaml` — the same surface the [Terraform modules](#deploy-on-aws-or-gcp-with-terraform) below use. See [`helm/litellm-helm/README.md`](./helm/litellm-helm/README.md) for the full list of values (database, redis, autoscaling, ingress).
+
 ### Deploy on AWS or GCP with Terraform
 
 Run the LiteLLM proxy as a production-ready componentized stack (gateway, backend, UI on separate services; managed Postgres + Redis + object store) using the published Terraform modules. Both modules are on the [public Terraform Registry](https://registry.terraform.io/namespaces/BerriAI) — no auth needed.
