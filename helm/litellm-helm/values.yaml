@@ -45,7 +45,16 @@ podLabels: {}
 #     maxSurge: 1
 strategy: {}
 
-terminationGracePeriodSeconds: 90
+# !!! IMPORTANT for realtime (WebSocket) traffic !!!
+# This MUST be greater than WS_DRAIN_TIMEOUT (realtime session drain window,
+# default 600s) plus headroom for HTTP drain and dependency teardown, otherwise
+# Kubernetes sends SIGKILL mid-drain and every active realtime session is
+# dropped with an abrupt reset instead of a graceful close. The default below
+# (660) matches the 600s WS_DRAIN_TIMEOUT default. If you lower WS_DRAIN_TIMEOUT
+# (see envVars), you may lower this to match; if you raise it, raise this too.
+# For an HTTP-only deployment (no realtime), 90 is enough; see the graceful
+# shutdown notes on the `lifecycle` and `envVars` keys below.
+terminationGracePeriodSeconds: 660
 topologySpreadConstraints:
   []
   # - maxSkew: 1
@@ -325,6 +334,40 @@ db:
 #         - name: X-Drain-Token
 #           value: <same value as drain_endpoint_token>
 lifecycle: {}
+
+# ============================================================================
+# !!! IMPORTANT: graceful shutdown of realtime (WebSocket) sessions !!!
+# ============================================================================
+#
+# Realtime API sessions run over long-lived WebSockets (minutes to hours). On a
+# rolling update the old pod gets SIGTERM; without graceful handling its active
+# realtime sessions are killed with an abrupt TCP reset the moment SIGKILL lands.
+#
+# The proxy drains them instead: on SIGTERM it stops accepting new realtime
+# connections (returns WebSocket close 1013 so clients reconnect onto a live
+# pod), lets existing sessions run to their natural end for up to
+# WS_DRAIN_TIMEOUT (default 600s = 10 min), then force-closes any stragglers
+# with WebSocket close 1012 (Service Restart) after emitting a
+# litellm.session.reconnecting event so clients know to reconnect and replay.
+#
+# For this to work you MUST budget the pod's shutdown time accordingly:
+#
+#   1. terminationGracePeriodSeconds (above) MUST exceed WS_DRAIN_TIMEOUT plus
+#      headroom, otherwise SIGKILL arrives mid-drain and the whole mechanism is
+#      bypassed. The 660 default already accounts for the 600s WS_DRAIN_TIMEOUT.
+#
+#   2. Tune the window with WS_DRAIN_TIMEOUT under `envVars` if 10 minutes is
+#      wrong for you. Always keep terminationGracePeriodSeconds above it.
+#      Example (shorten to 2 minutes):
+#        envVars:
+#          WS_DRAIN_TIMEOUT: "120"
+#        terminationGracePeriodSeconds: 180
+#
+#   3. A preStop hook (the /health/drain hook documented on `lifecycle`, or a
+#      short `sleep`) is still recommended so the Service removes the pod from
+#      its endpoints before the process starts rejecting connections, avoiding
+#      a race where a just-rejected client reconnects onto the same dying pod.
+# ============================================================================
 
 # Settings for Bitnami postgresql chart (if db.deployStandalone is true, ignored
 #  otherwise)

@@ -171,6 +171,7 @@ class RealTimeStreaming:
         # reconnect: user/assistant turns plus service notes such as barge-ins.
         self._transcript_entries: list[RealtimeTranscriptEntry] = []
         self._assistant_transcript_chunks: list[str] = []
+        self._shutting_down: bool = False
 
     # Per-connection caps for pre-setup audio frames (message count + total bytes).
     _MAX_BUFFERED_MESSAGES: int = 200
@@ -1750,7 +1751,26 @@ class RealTimeStreaming:
         except Exception as e:
             verbose_logger.debug(f"Error in client ack messages: {e}")
 
+    async def shutdown_close(self) -> None:
+        """Force-close this session during graceful shutdown.
+
+        Notifies the client that the session is going away (reusing the existing
+        reconnecting event so an unchanged client reconnects and replays), then
+        closes the client socket with WebSocket code 1012 (Service Restart).
+        """
+        self._shutting_down = True
+        await self._send_litellm_session_event({"type": "litellm.session.reconnecting", "reason": "server_shutdown"})
+        try:
+            await self.websocket.close(code=1012, reason="server shutting down")
+        except (RuntimeError, OSError) as e:
+            verbose_logger.debug(f"Failed to close client socket on shutdown: {e}")
+
     async def bidirectional_forward(self):
+        from litellm.proxy.shutdown.realtime_session_registry import (
+            RealtimeSessionRegistry,
+        )
+
+        RealtimeSessionRegistry.register(self)
         forward_task = asyncio.create_task(self.backend_to_client_send_messages())
         try:
             await self.client_ack_messages()
@@ -1758,6 +1778,7 @@ class RealTimeStreaming:
             verbose_logger.debug("Connection closed")
             forward_task.cancel()
         finally:
+            RealtimeSessionRegistry.unregister(self)
             if not forward_task.done():
                 forward_task.cancel()
                 try:

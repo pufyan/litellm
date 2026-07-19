@@ -3406,3 +3406,32 @@ def test_resumption_marker_fastpath_skips_audio_frames():
     update_frame = json.dumps({"sessionResumptionUpdate": {"newHandle": "h-9", "resumable": True}})
     assert streaming._handle_resumption_service_event(update_frame) == "state"
     assert streaming._resumption_state.handle == "h-9"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_close_notifies_client_and_closes_with_1012():
+    websocket = MagicMock()
+    websocket.send_text = AsyncMock()
+    websocket.close = AsyncMock()
+    streaming = RealTimeStreaming(websocket, MagicMock(), MagicMock())
+
+    await streaming.shutdown_close()
+
+    assert streaming._shutting_down is True
+    sent = json.loads(websocket.send_text.call_args[0][0])
+    assert sent["type"] == "litellm.session.reconnecting"
+    assert sent["reason"] == "server_shutdown"
+    websocket.close.assert_awaited_once()
+    assert websocket.close.call_args.kwargs["code"] == 1012
+
+
+@pytest.mark.asyncio
+async def test_shutdown_close_swallows_close_errors():
+    websocket = MagicMock()
+    websocket.send_text = AsyncMock()
+    websocket.close = AsyncMock(side_effect=RuntimeError("already closed"))
+    streaming = RealTimeStreaming(websocket, MagicMock(), MagicMock())
+
+    await streaming.shutdown_close()
+
+    assert streaming._shutting_down is True

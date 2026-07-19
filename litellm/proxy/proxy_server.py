@@ -499,6 +499,7 @@ from litellm.proxy.response_api_endpoints.endpoints import router as response_ro
 from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.search_endpoints.endpoints import router as search_router
 from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
+from litellm.proxy.shutdown.realtime_session_registry import RealtimeSessionRegistry
 from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
 from litellm.proxy.spend_tracking.spend_management_endpoints import (
     router as spend_management_router,
@@ -1096,6 +1097,9 @@ async def proxy_startup_event(app: FastAPI):
     # Shutdown event - drain in-flight requests before tearing down dependencies
     # so SIGTERM (rolling update, scale-down, liveness kill) doesn't drop them.
     GracefulShutdownManager.start_shutdown()
+    ws_drain_timeout = RealtimeSessionRegistry.get_ws_drain_timeout()
+    await RealtimeSessionRegistry.drain(timeout=ws_drain_timeout)
+    await RealtimeSessionRegistry.force_close_all()
     await GracefulShutdownManager.wait_for_drain()
 
     # Shutdown event - close shared aiohttp session
@@ -9692,6 +9696,10 @@ async def realtime_websocket_endpoint(
     ),
     user_api_key_dict=Depends(user_api_key_auth_websocket),
 ):
+    if GracefulShutdownManager.is_shutting_down():
+        await websocket.close(code=1013, reason="server shutting down, retry")
+        return
+
     requested_protocols = [
         p.strip() for p in (websocket.headers.get("sec-websocket-protocol") or "").split(",") if p.strip()
     ]
