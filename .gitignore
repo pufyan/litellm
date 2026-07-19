@@ -141,3 +141,4 @@ ui/litellm-dashboard/out/
 .mcp.json
 *.log
 litellm_migration_analysis.md
+UPDATE_FROM_UPSTREAM.md
