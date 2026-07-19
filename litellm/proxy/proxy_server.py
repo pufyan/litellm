@@ -1091,15 +1091,19 @@ async def proxy_startup_event(app: FastAPI):
     ## Initialize shared aiohttp session for connection reuse
     shared_aiohttp_session = await _initialize_shared_aiohttp_session()
 
+    ## Install SIGTERM/SIGINT handler to drain realtime WebSocket sessions
+    ## before uvicorn closes their sockets (its shutdown runs before lifespan).
+    RealtimeSessionRegistry.install_signal_drain(asyncio.get_running_loop())
+
     # End of startup event
     yield
 
     # Shutdown event - drain in-flight requests before tearing down dependencies
     # so SIGTERM (rolling update, scale-down, liveness kill) doesn't drop them.
+    # Realtime WebSocket sessions are drained earlier, by the SIGTERM handler
+    # installed at startup, because uvicorn closes their sockets before this
+    # lifespan shutdown runs.
     GracefulShutdownManager.start_shutdown()
-    ws_drain_timeout = RealtimeSessionRegistry.get_ws_drain_timeout()
-    await RealtimeSessionRegistry.drain(timeout=ws_drain_timeout)
-    await RealtimeSessionRegistry.force_close_all()
     await GracefulShutdownManager.wait_for_drain()
 
     # Shutdown event - close shared aiohttp session
@@ -9696,7 +9700,7 @@ async def realtime_websocket_endpoint(
     ),
     user_api_key_dict=Depends(user_api_key_auth_websocket),
 ):
-    if GracefulShutdownManager.is_shutting_down():
+    if RealtimeSessionRegistry.is_draining() or GracefulShutdownManager.is_shutting_down():
         await websocket.close(code=1013, reason="server shutting down, retry")
         return
 

@@ -10,11 +10,14 @@ update tears the process down while realtime sessions are still mid-turn,
 dropping them with an abrupt TCP reset instead of a protocol close.
 
 Realtime sessions are long-lived by nature (minutes to hours), so unlike HTTP
-requests they can not be drained "to completion". The lifespan shutdown lets
-them run to their natural end within ``WS_DRAIN_TIMEOUT`` (default 600s), then
-force-closes whatever remains with WebSocket code 1012 (Service Restart) so
-clients know to reconnect — at which point the pod is already out of the
-Service endpoints and the reconnect lands on a live pod.
+requests they can not be drained "to completion". On SIGTERM/SIGINT a signal
+handler (installed at startup, see ``install_signal_drain``) lets existing
+sessions run to their natural end within ``WS_DRAIN_TIMEOUT`` (default 600s),
+then force-closes whatever remains with WebSocket code 1012 (Service Restart)
+so clients know to reconnect — at which point the pod is already out of the
+Service endpoints and the reconnect lands on a live pod. The handler runs
+before uvicorn's own shutdown, which would otherwise close the sockets first
+and leave the drain nothing to wait on.
 
 The drain window only takes effect if the pod is given time to use it: set
 ``terminationGracePeriodSeconds`` above ``WS_DRAIN_TIMEOUT`` (plus headroom for
@@ -27,7 +30,8 @@ matching the granularity of the other shutdown primitives.
 
 import asyncio
 import os
-from typing import TYPE_CHECKING
+import signal
+from typing import TYPE_CHECKING, Callable
 
 from litellm._logging import verbose_proxy_logger
 
@@ -38,6 +42,7 @@ if TYPE_CHECKING:
 DEFAULT_WS_DRAIN_TIMEOUT = 600.0
 _DRAIN_POLL_INTERVAL = 0.5
 _DRAIN_LOG_INTERVAL = 5.0
+_DRAIN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 
 class RealtimeSessionRegistry:
@@ -47,14 +52,18 @@ class RealtimeSessionRegistry:
     """
 
     _sessions: "frozenset[RealTimeStreaming]" = frozenset()
+    _draining: bool = False
+    _prev_handlers: "dict[int, Callable[[], None]]" = {}
 
     @classmethod
     def register(cls, session: "RealTimeStreaming") -> None:
         cls._sessions = cls._sessions | {session}
+        verbose_proxy_logger.debug("realtime_session_registered active_sessions=%s", len(cls._sessions))
 
     @classmethod
     def unregister(cls, session: "RealTimeStreaming") -> None:
         cls._sessions = cls._sessions - {session}
+        verbose_proxy_logger.debug("realtime_session_unregistered active_sessions=%s", len(cls._sessions))
 
     @classmethod
     def count(cls) -> int:
@@ -83,14 +92,13 @@ class RealtimeSessionRegistry:
         log_interval: float = _DRAIN_LOG_INTERVAL,
     ) -> int:
         initial = cls.count()
-        if initial == 0:
-            return 0
-
         verbose_proxy_logger.info(
             "realtime_drain_started active_sessions=%s timeout_s=%s",
             initial,
             timeout,
         )
+        if initial == 0:
+            return 0
 
         elapsed = 0.0
         since_log = 0.0
@@ -143,5 +151,58 @@ class RealtimeSessionRegistry:
         return len(sessions)
 
     @classmethod
+    def install_signal_drain(cls, loop: "asyncio.AbstractEventLoop") -> None:
+        """Drain realtime sessions on SIGTERM/SIGINT before the server tears down.
+
+        uvicorn closes active WebSockets as part of its own shutdown, which runs
+        before the ASGI lifespan shutdown. Draining from lifespan therefore always
+        sees an empty registry. Instead we intercept the signal first: mark the
+        worker draining (new connections are rejected), let existing sessions run
+        to their natural end within WS_DRAIN_TIMEOUT, force-close the stragglers,
+        then delegate to uvicorn's original handler so its normal shutdown
+        proceeds. The first signal drains; a second one delegates immediately so
+        an operator can still force an early exit.
+        """
+        for signum in _DRAIN_SIGNALS:
+            try:
+                prev = signal.getsignal(signum)
+                if callable(prev):
+                    cls._prev_handlers[signum] = prev  # type: ignore[assignment]
+                loop.add_signal_handler(signum, cls._on_signal, signum, loop)
+            except (NotImplementedError, RuntimeError, ValueError) as e:
+                verbose_proxy_logger.warning("realtime drain signal handler not installed for %s: %s", signum, e)
+
+    @classmethod
+    def _delegate_to_prev(cls, signum: int) -> None:
+        prev = cls._prev_handlers.get(signum)
+        if prev is not None:
+            prev()
+
+    @classmethod
+    def _on_signal(cls, signum: int, loop: "asyncio.AbstractEventLoop") -> None:
+        if cls._draining:
+            cls._delegate_to_prev(signum)
+            return
+        cls._draining = True
+        if cls.count() == 0:
+            cls._delegate_to_prev(signum)
+            return
+        loop.create_task(cls._drain_then_delegate(signum))
+
+    @classmethod
+    async def _drain_then_delegate(cls, signum: int) -> None:
+        try:
+            await cls.drain(timeout=cls.get_ws_drain_timeout())
+            await cls.force_close_all()
+        finally:
+            cls._delegate_to_prev(signum)
+
+    @classmethod
+    def is_draining(cls) -> bool:
+        return cls._draining
+
+    @classmethod
     def reset(cls) -> None:
         cls._sessions = frozenset()
+        cls._draining = False
+        cls._prev_handlers = {}

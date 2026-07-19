@@ -131,3 +131,67 @@ async def test_force_close_all_survives_a_failing_session():
 
     assert closed == 2
     assert good.closed is True
+
+
+import signal
+
+
+def test_not_draining_by_default():
+    assert RealtimeSessionRegistry.is_draining() is False
+
+
+def test_on_signal_with_no_sessions_delegates_immediately():
+    called = {"n": 0}
+    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda: called.__setitem__("n", called["n"] + 1)}
+    loop = asyncio.new_event_loop()
+    try:
+        RealtimeSessionRegistry._on_signal(signal.SIGTERM, loop)
+    finally:
+        loop.close()
+    assert RealtimeSessionRegistry.is_draining() is True
+    assert called["n"] == 1
+
+
+def test_second_signal_delegates_without_new_drain():
+    called = {"n": 0}
+    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda: called.__setitem__("n", called["n"] + 1)}
+    RealtimeSessionRegistry.register(FakeSession())
+    RealtimeSessionRegistry._draining = True
+    loop = asyncio.new_event_loop()
+    try:
+        RealtimeSessionRegistry._on_signal(signal.SIGTERM, loop)
+    finally:
+        loop.close()
+    assert called["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_drain_then_delegate_closes_sessions_and_delegates():
+    called = {"n": 0}
+    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda: called.__setitem__("n", called["n"] + 1)}
+    a = FakeSession()
+    RealtimeSessionRegistry.register(a)
+
+    async def leave_soon():
+        await asyncio.sleep(0.1)
+        RealtimeSessionRegistry.unregister(a)
+
+    task = asyncio.create_task(leave_soon())
+    await RealtimeSessionRegistry._drain_then_delegate(signal.SIGTERM)
+    await task
+
+    assert called["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_drain_then_delegate_force_closes_on_timeout(monkeypatch):
+    monkeypatch.setenv("WS_DRAIN_TIMEOUT", "0.2")
+    called = {"n": 0}
+    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda: called.__setitem__("n", called["n"] + 1)}
+    a = FakeSession()
+    RealtimeSessionRegistry.register(a)
+
+    await RealtimeSessionRegistry._drain_then_delegate(signal.SIGTERM)
+
+    assert a.closed is True
+    assert called["n"] == 1
