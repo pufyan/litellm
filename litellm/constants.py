@@ -167,6 +167,7 @@ DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET = int(
 
 # Provider-specific API base URLs
 XAI_API_BASE = "https://api.x.ai/v1"
+YANDEX_REALTIME_API_BASE = "https://rest-assistant.api.cloud.yandex.net"
 OPEN_SANDBOX_API_BASE_ENV_VAR = "OPEN_SANDBOX_API_BASE"
 OPEN_SANDBOX_API_KEY_ENV_VAR = "OPEN_SANDBOX_API_KEY"
 OPEN_SANDBOX_DEFAULT_TEMPLATE = "opensandbox/code-interpreter:v1.1.0"

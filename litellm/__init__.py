@@ -587,6 +587,7 @@ perplexity_models: Set = set()
 watsonx_models: Set = set()
 gemini_models: Set = set()
 xai_models: Set = set()
+yandex_models: Set = set()
 zai_models: Set = set()
 deepseek_models: Set = set()
 tencent_models: Set = set()
@@ -797,6 +798,8 @@ def add_known_models(model_cost_map: Optional[Dict] = None):
             text_completion_inception_models.add(key)
         elif value.get("litellm_provider") == "xai":
             xai_models.add(key)
+        elif value.get("litellm_provider") == "yandex":
+            yandex_models.add(key)
         elif value.get("litellm_provider") == "zai":
             zai_models.add(key)
         elif value.get("litellm_provider") == "fal_ai":
@@ -995,6 +998,7 @@ model_list = list(
     | text_completion_codestral_models
     | text_completion_inception_models
     | xai_models
+    | yandex_models
     | zai_models
     | fal_ai_models
     | deepseek_models
@@ -1094,6 +1098,7 @@ models_by_provider: dict = {
     "text-completion-codestral": text_completion_codestral_models,
     "text-completion-inception": text_completion_inception_models,
     "xai": xai_models,
+    "yandex": yandex_models,
     "zai": zai_models,
     "fal_ai": fal_ai_models,
     "deepseek": deepseek_models,
