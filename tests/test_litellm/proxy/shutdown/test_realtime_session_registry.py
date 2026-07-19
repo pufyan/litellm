@@ -142,7 +142,7 @@ def test_not_draining_by_default():
 
 def test_on_signal_with_no_sessions_delegates_immediately():
     called = {"n": 0}
-    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda: called.__setitem__("n", called["n"] + 1)}
+    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda s, f: called.__setitem__("n", called["n"] + 1)}
     loop = asyncio.new_event_loop()
     try:
         RealtimeSessionRegistry._on_signal(signal.SIGTERM, loop)
@@ -154,7 +154,7 @@ def test_on_signal_with_no_sessions_delegates_immediately():
 
 def test_second_signal_delegates_without_new_drain():
     called = {"n": 0}
-    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda: called.__setitem__("n", called["n"] + 1)}
+    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda s, f: called.__setitem__("n", called["n"] + 1)}
     RealtimeSessionRegistry.register(FakeSession())
     RealtimeSessionRegistry._draining = True
     loop = asyncio.new_event_loop()
@@ -168,7 +168,7 @@ def test_second_signal_delegates_without_new_drain():
 @pytest.mark.asyncio
 async def test_drain_then_delegate_closes_sessions_and_delegates():
     called = {"n": 0}
-    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda: called.__setitem__("n", called["n"] + 1)}
+    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda s, f: called.__setitem__("n", called["n"] + 1)}
     a = FakeSession()
     RealtimeSessionRegistry.register(a)
 
@@ -187,7 +187,7 @@ async def test_drain_then_delegate_closes_sessions_and_delegates():
 async def test_drain_then_delegate_force_closes_on_timeout(monkeypatch):
     monkeypatch.setenv("WS_DRAIN_TIMEOUT", "0.2")
     called = {"n": 0}
-    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda: called.__setitem__("n", called["n"] + 1)}
+    RealtimeSessionRegistry._prev_handlers = {signal.SIGTERM: lambda s, f: called.__setitem__("n", called["n"] + 1)}
     a = FakeSession()
     RealtimeSessionRegistry.register(a)
 
@@ -195,3 +195,15 @@ async def test_drain_then_delegate_force_closes_on_timeout(monkeypatch):
 
     assert a.closed is True
     assert called["n"] == 1
+
+
+def test_delegate_calls_prev_with_signal_signal_signature():
+    """uvicorn's Server.handle_exit is installed via signal.signal and requires
+    (signum, frame); a zero-arg call raised TypeError and left the server
+    running. Guard the two-arg contract."""
+    received = {}
+    RealtimeSessionRegistry._prev_handlers = {
+        signal.SIGTERM: lambda s, f: received.update(sig=s, frame=f)
+    }
+    RealtimeSessionRegistry._delegate_to_prev(signal.SIGTERM)
+    assert received == {"sig": signal.SIGTERM, "frame": None}

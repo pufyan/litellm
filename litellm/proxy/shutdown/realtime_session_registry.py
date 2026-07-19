@@ -175,8 +175,12 @@ class RealtimeSessionRegistry:
     @classmethod
     def _delegate_to_prev(cls, signum: int) -> None:
         prev = cls._prev_handlers.get(signum)
-        if prev is not None:
-            prev()
+        if prev is None:
+            return
+        # uvicorn installs Server.handle_exit via signal.signal, so it expects
+        # the (signum, frame) signature of a signal.signal handler, not the
+        # zero-arg callback shape of loop.add_signal_handler.
+        prev(signum, None)
 
     @classmethod
     def _on_signal(cls, signum: int, loop: "asyncio.AbstractEventLoop") -> None:
