@@ -187,9 +187,7 @@ def test_gemini_realtime_interrupted_emits_speech_started():
     # The existing interrupted -> response.done mapping is preserved.
     assert "response.done" in types
     # speech-start precedes response.done (flush/cancel, then lifecycle reset).
-    assert types.index("input_audio_buffer.speech_started") < types.index(
-        "response.done"
-    )
+    assert types.index("input_audio_buffer.speech_started") < types.index("response.done")
 
 
 def test_gemini_model_turn_event_mapping():
@@ -414,9 +412,7 @@ def test_gemini_response_done_includes_completed_output_item():
         realtime_response_transform_input=transform_input,
     )
 
-    response_done_events = [
-        event for event in turn_complete_result["response"] if event["type"] == "response.done"
-    ]
+    response_done_events = [event for event in turn_complete_result["response"] if event["type"] == "response.done"]
     assert len(response_done_events) == 1
     response_done = response_done_events[0]["response"]
 
@@ -473,8 +469,7 @@ def test_gemini_interrupted_closes_item_opened_without_audio_delta():
     response_done = next(e for e in events if e["type"] == "response.done")
     output_ids = [item["id"] for item in response_done["response"]["output"]]
     assert "item-opened-by-transcript" in output_ids, (
-        "response.done.output must include the item that was opened but never "
-        "closed by an audio delta before barge-in"
+        "response.done.output must include the item that was opened but never closed by an audio delta before barge-in"
     )
 
     # The close must precede response.done in the emitted order.
@@ -591,8 +586,7 @@ def test_gemini_trailing_turn_complete_after_interrupt_is_suppressed():
 
     second_types = [e["type"] for e in turn_complete_result["response"] if "type" in e]
     assert "response.done" not in second_types, (
-        "the trailing bare turnComplete right after an interrupt must not emit "
-        "a second, empty response.done"
+        "the trailing bare turnComplete right after an interrupt must not emit a second, empty response.done"
     )
 
 
@@ -2375,3 +2369,63 @@ def test_is_setup_message_and_is_content_message():
     assert config.is_content_message({"clientContent": {}}) is True
     assert config.is_content_message({"toolResponse": {}}) is True
     assert config.is_content_message({"setup": {}}) is False
+
+
+def test_gemini_multi_item_message_path_allocates_real_incrementing_indices():
+    """Regression test for the hardcoded output_index/content_index=0 bug in the
+    message/content path (mirrors the fix already applied to xAI and Bedrock's
+    bug class): two distinct items produced within the correlation module's
+    shared state must get distinct, increasing output_index values, and each
+    item's content part must get its own content_index — not both pinned at 0.
+
+    Gemini's own protocol doesn't naturally produce two items under one
+    response_id without an explicit reset (only tool-calls do, already covered
+    by test_gemini_realtime_multi_tool_calls_have_unique_item_ids); this test
+    exercises the message-path helpers directly with two distinct item ids to
+    prove the underlying index-allocation is correct if/when it does."""
+    config = GeminiRealtimeConfig()
+
+    session_configuration_request_str = json.dumps(
+        {
+            "setup": {
+                "model": "gemini-1.5-flash",
+                "generationConfig": {"responseModalities": ["AUDIO"]},
+            }
+        }
+    )
+
+    first_item_events = config.return_new_content_delta_events(
+        response_id="resp_shared",
+        output_item_id="item_A",
+        conversation_id="conv_shared",
+        delta_type="text",
+        session_configuration_request=session_configuration_request_str,
+    )
+    second_item_events = config.return_new_content_delta_events(
+        response_id="resp_shared",
+        output_item_id="item_B",
+        conversation_id="conv_shared",
+        delta_type="audio",
+        session_configuration_request=session_configuration_request_str,
+    )
+
+    item_added_a = next(e for e in first_item_events if e["type"] == "response.output_item.added")
+    item_added_b = next(e for e in second_item_events if e["type"] == "response.output_item.added")
+    assert item_added_a["output_index"] == 0
+    assert item_added_b["output_index"] == 1
+
+    content_part_a = next(e for e in first_item_events if e["type"] == "response.content_part.added")
+    content_part_b = next(e for e in second_item_events if e["type"] == "response.content_part.added")
+    assert content_part_a["content_index"] == 0
+    assert content_part_b["content_index"] == 0  # scoped per item, not global
+
+    # A second content part on item_A's own delta path (its own content_done)
+    # must get output_index consistent with item_A (0), not item_B's.
+    done_event = config.transform_content_done_event(
+        delta_chunks=None,
+        current_output_item_id="item_A",
+        current_response_id="resp_shared",
+        delta_type="text",
+    )
+    assert done_event["output_index"] == 0
+    assert done_event["content_index"] == 0

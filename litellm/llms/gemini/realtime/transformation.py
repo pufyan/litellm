@@ -55,6 +55,11 @@ from litellm.types.llms.vertex_ai import (
     HttpxBlobType,
     HttpxContentType,
 )
+from litellm.litellm_core_utils.realtime_correlation import (
+    RealtimeCorrelationState,
+    track_content_index,
+    track_output_index,
+)
 from litellm.types.realtime import (
     ALL_DELTA_TYPES,
     RealtimeGoAwayNotice,
@@ -153,6 +158,10 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         # the turn was just closed by an interrupt so the very next bare
         # RESPONSE_DONE (and only that one) is suppressed.
         self._turn_closed_by_interrupt: bool = False
+        # Real output_index/content_index tracking (shared realtime_correlation
+        # module) — replaces hardcoded 0s so multi-item/multi-part responses get
+        # correct, monotonically increasing indices.
+        self._correlation_state: RealtimeCorrelationState = RealtimeCorrelationState()
 
     def is_setup_message(self, msg_obj: dict) -> bool:
         return "setup" in msg_obj
@@ -759,6 +768,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         _temperature = generation_config.get("temperature")
         _max_output_tokens = generation_config.get("maxOutputTokens")
 
+        self._correlation_state, output_index = track_output_index(self._correlation_state, response_id, output_item_id)
+
         response_items: List[OpenAIRealtimeEvents] = []
         response_created = OpenAIRealtimeStreamResponseBaseObject(
             type="response.created",
@@ -782,7 +793,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             type="response.output_item.added",
             event_id="event_{}".format(uuid.uuid4()),
             response_id=response_id,
-            output_index=0,
+            output_index=output_index,
             item={
                 "id": output_item_id,
                 "object": "realtime.item",
@@ -815,11 +826,14 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 },
             )
         )
+        self._correlation_state, content_index = track_content_index(
+            self._correlation_state, response_id, output_item_id, delta_type
+        )
         ## - return response.content_part.added
         response_content_part_added = OpenAIRealtimeResponseContentPartAdded(
             type="response.content_part.added",
-            content_index=0,
-            output_index=0,
+            content_index=content_index,
+            output_index=output_index,
             event_id="event_{}".format(uuid.uuid4()),
             item_id=output_item_id,
             part=(
@@ -856,12 +870,16 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         except Exception as e:
             raise ValueError(f"Error transforming content delta events: {e}, got message: {message}")
 
+        self._correlation_state, output_index = track_output_index(self._correlation_state, response_id, output_item_id)
+        self._correlation_state, content_index = track_content_index(
+            self._correlation_state, response_id, output_item_id, delta_type
+        )
         return OpenAIRealtimeResponseDelta(
             type=("response.output_text.delta" if delta_type == "text" else "response.output_audio.delta"),
-            content_index=0,
+            content_index=content_index,
             event_id="event_{}".format(uuid.uuid4()),
             item_id=output_item_id,
-            output_index=0,
+            output_index=output_index,
             response_id=response_id,
             delta=delta,
         )
@@ -881,23 +899,29 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             current_output_item_id = "item_{}".format(uuid.uuid4())
         if current_response_id is None:
             current_response_id = "resp_{}".format(uuid.uuid4())
+        self._correlation_state, output_index = track_output_index(
+            self._correlation_state, current_response_id, current_output_item_id
+        )
+        self._correlation_state, content_index = track_content_index(
+            self._correlation_state, current_response_id, current_output_item_id, delta_type
+        )
         if delta_type == "text":
             return OpenAIRealtimeResponseTextDone(
                 type="response.output_text.done",
-                content_index=0,
+                content_index=content_index,
                 event_id="event_{}".format(uuid.uuid4()),
                 item_id=current_output_item_id,
-                output_index=0,
+                output_index=output_index,
                 response_id=current_response_id,
                 text=delta,
             )
         elif delta_type == "audio":
             return OpenAIRealtimeResponseAudioDone(
                 type="response.output_audio.done",
-                content_index=0,
+                content_index=content_index,
                 event_id="event_{}".format(uuid.uuid4()),
                 item_id=current_output_item_id,
-                output_index=0,
+                output_index=output_index,
                 response_id=current_response_id,
             )
 
@@ -916,16 +940,22 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             current_output_item_id = "item_{}".format(uuid.uuid4())
         if current_response_id is None:
             current_response_id = "resp_{}".format(uuid.uuid4())
+        self._correlation_state, output_index = track_output_index(
+            self._correlation_state, current_response_id, current_output_item_id
+        )
+        self._correlation_state, content_index = track_content_index(
+            self._correlation_state, current_response_id, current_output_item_id, delta_type
+        )
         returned_items: List[OpenAIRealtimeEvents] = []
 
         delta_done_event_text = cast(Optional[str], delta_done_event.get("text"))
         # response.content_part.done
         response_content_part_done = OpenAIRealtimeContentPartDone(
             type="response.content_part.done",
-            content_index=0,
+            content_index=content_index,
             event_id="event_{}".format(uuid.uuid4()),
             item_id=current_output_item_id,
-            output_index=0,
+            output_index=output_index,
             part=(
                 {"type": "text", "text": delta_done_event_text}
                 if delta_done_event_text and delta_type == "text"
@@ -941,7 +971,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         response_output_item_done = OpenAIRealtimeOutputItemDone(
             type="response.output_item.done",
             event_id="event_{}".format(uuid.uuid4()),
-            output_index=0,
+            output_index=output_index,
             response_id=current_response_id,
             item={
                 "id": current_output_item_id,
@@ -964,8 +994,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         returned_items.append(response_output_item_done)
         return returned_items
 
-    @staticmethod
     def _return_incomplete_output_item_done(
+        self,
         current_output_item_id: str,
         current_response_id: str,
     ) -> OpenAIRealtimeOutputItemDone:
@@ -978,10 +1008,13 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         told about. Emit a ``status: "incomplete"`` done event so the item's
         lifecycle is always closed before ``response.done``.
         """
+        self._correlation_state, output_index = track_output_index(
+            self._correlation_state, current_response_id, current_output_item_id
+        )
         return OpenAIRealtimeOutputItemDone(
             type="response.output_item.done",
             event_id="event_{}".format(uuid.uuid4()),
-            output_index=0,
+            output_index=output_index,
             response_id=current_response_id,
             item={
                 "id": current_output_item_id,
@@ -1441,6 +1474,12 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                             delta_type="audio",
                         )
                     )
+                self._correlation_state, _transcript_output_index = track_output_index(
+                    self._correlation_state, current_response_id, current_output_item_id
+                )
+                self._correlation_state, _transcript_content_index = track_content_index(
+                    self._correlation_state, current_response_id, current_output_item_id, "audio"
+                )
                 returned_message.append(
                     cast(
                         OpenAIRealtimeEvents,
@@ -1449,8 +1488,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                             "event_id": "event_{}".format(uuid.uuid4()),
                             "transcript": output_tx["text"],
                             "item_id": current_output_item_id,
-                            "content_index": 0,
-                            "output_index": 0,
+                            "content_index": _transcript_content_index,
+                            "output_index": _transcript_output_index,
                             "response_id": current_response_id,
                             "delta": output_tx["text"],
                         },
@@ -1677,7 +1716,9 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 _is_trailing_bare_done_after_interrupt = (
                     current_response_id is None and current_output_item_id is None and self._turn_closed_by_interrupt
                 )
-                if current_response_id is None and (_has_pending_function_call or _is_trailing_bare_done_after_interrupt):
+                if current_response_id is None and (
+                    _has_pending_function_call or _is_trailing_bare_done_after_interrupt
+                ):
                     # Trailing bare turnComplete/interrupted with nothing to report:
                     # either a toolCall follow-up (Vertex emits ~5 bookkeeping tokens
                     # before the answer) or the second of Gemini's two barge-in
