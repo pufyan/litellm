@@ -352,6 +352,277 @@ def test_gemini_realtime_transformation_generation_complete():
     assert contains_audio_done_event, "Expected audio done event"
 
 
+def test_gemini_response_done_includes_completed_output_item():
+    """response.done must carry the completed message item in its `output`
+    list, not an empty list, so clients that reconstruct state from
+    response.done alone (rather than the earlier response.output_item.done)
+    don't silently lose the assistant's turn."""
+    config = GeminiRealtimeConfig()
+
+    session_configuration_request_str = json.dumps(
+        {
+            "setup": {
+                "model": "gemini-1.5-flash",
+                "generationConfig": {"responseModalities": ["AUDIO"]},
+            }
+        }
+    )
+
+    transform_input = {
+        "session_configuration_request": session_configuration_request_str,
+        "current_output_item_id": None,
+        "current_response_id": None,
+        "current_conversation_id": None,
+        "current_delta_chunks": None,
+        "current_item_chunks": None,
+        "current_delta_type": None,
+    }
+
+    # Frame 1: audio delta establishes the response/item ids.
+    delta_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"modelTurn": {"parts": [{"inlineData": {"data": "abcd"}}]}}}),
+        "gemini-1.5-flash",
+        MagicMock(),
+        realtime_response_transform_input=transform_input,
+    )
+    transform_input = {**transform_input, **{k: delta_result[k] for k in transform_input if k in delta_result}}
+    item_id = delta_result["current_output_item_id"]
+    response_id = delta_result["current_response_id"]
+    assert item_id is not None
+    assert response_id is not None
+
+    # Frame 2: generationComplete emits response.output_item.done and
+    # populates current_item_chunks.
+    gen_complete_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"generationComplete": True}}),
+        "gemini-1.5-flash",
+        MagicMock(),
+        realtime_response_transform_input=transform_input,
+    )
+    transform_input = {
+        **transform_input,
+        **{k: gen_complete_result[k] for k in transform_input if k in gen_complete_result},
+    }
+    assert transform_input["current_item_chunks"], "expected output_item.done to be buffered"
+
+    # Frame 3: turnComplete emits response.done — it must reuse the buffered
+    # item_chunks instead of dropping them.
+    turn_complete_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"turnComplete": True}}),
+        "gemini-1.5-flash",
+        MagicMock(),
+        realtime_response_transform_input=transform_input,
+    )
+
+    response_done_events = [
+        event for event in turn_complete_result["response"] if event["type"] == "response.done"
+    ]
+    assert len(response_done_events) == 1
+    response_done = response_done_events[0]["response"]
+
+    assert response_done["output"], "response.done.output must not be empty for a completed message turn"
+    assert response_done["output"][0]["id"] == item_id
+    assert response_done["id"] == response_id
+
+
+def test_gemini_interrupted_closes_item_opened_without_audio_delta():
+    """Barge-in can land after ``outputTranscription`` opened an item
+    (response.output_item.added) but before any audio delta closed it with
+    response.output_item.done. Without an explicit close, response.done.output
+    silently drops an item the client was already told about via
+    output_item.added — this reproduces that gap and asserts it's closed as
+    "incomplete" before response.done."""
+    config = GeminiRealtimeConfig()
+
+    session_configuration_request_str = json.dumps(
+        {
+            "setup": {
+                "model": "gemini-2.5-flash-native-audio",
+                "generationConfig": {"responseModalities": ["AUDIO"]},
+            }
+        }
+    )
+
+    # State as it would be after outputTranscription opened the item on a
+    # prior frame: ids are set, but current_item_chunks is empty because no
+    # audio delta ever closed it.
+    result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"interrupted": True, "turnComplete": True}}),
+        "gemini-2.5-flash-native-audio",
+        MagicMock(),
+        realtime_response_transform_input={
+            "session_configuration_request": session_configuration_request_str,
+            "current_output_item_id": "item-opened-by-transcript",
+            "current_response_id": "resp-in-progress",
+            "current_conversation_id": None,
+            "current_delta_chunks": [],
+            "current_item_chunks": None,
+            "current_delta_type": "audio",
+        },
+    )
+
+    events = result["response"]
+    types = [event["type"] for event in events]
+    assert "response.output_item.done" in types
+    assert "response.done" in types
+
+    output_item_done = next(e for e in events if e["type"] == "response.output_item.done")
+    assert output_item_done["item"]["id"] == "item-opened-by-transcript"
+    assert output_item_done["item"]["status"] == "incomplete"
+
+    response_done = next(e for e in events if e["type"] == "response.done")
+    output_ids = [item["id"] for item in response_done["response"]["output"]]
+    assert "item-opened-by-transcript" in output_ids, (
+        "response.done.output must include the item that was opened but never "
+        "closed by an audio delta before barge-in"
+    )
+
+    # The close must precede response.done in the emitted order.
+    assert types.index("response.output_item.done") < types.index("response.done")
+
+
+def test_gemini_interrupted_does_not_duplicate_already_closed_item():
+    """If the item was already closed (present in current_item_chunks) before
+    interrupted arrives, no duplicate output_item.done should be synthesized."""
+    config = GeminiRealtimeConfig()
+
+    session_configuration_request_str = json.dumps(
+        {
+            "setup": {
+                "model": "gemini-2.5-flash-native-audio",
+                "generationConfig": {"responseModalities": ["AUDIO"]},
+            }
+        }
+    )
+
+    existing_done_event = {
+        "type": "response.output_item.done",
+        "event_id": "event_existing",
+        "output_index": 0,
+        "response_id": "resp-in-progress",
+        "item": {
+            "id": "item-already-closed",
+            "object": "realtime.item",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "audio", "transcript": ""}],
+        },
+    }
+
+    result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"interrupted": True, "turnComplete": True}}),
+        "gemini-2.5-flash-native-audio",
+        MagicMock(),
+        realtime_response_transform_input={
+            "session_configuration_request": session_configuration_request_str,
+            "current_output_item_id": "item-already-closed",
+            "current_response_id": "resp-in-progress",
+            "current_conversation_id": None,
+            "current_delta_chunks": [],
+            "current_item_chunks": [existing_done_event],
+            "current_delta_type": "audio",
+        },
+    )
+
+    events = result["response"]
+    output_item_done_events = [e for e in events if e["type"] == "response.output_item.done"]
+    assert len(output_item_done_events) == 0, "item already closed must not be re-synthesized"
+
+    response_done = next(e for e in events if e["type"] == "response.done")
+    output_ids = [item["id"] for item in response_done["response"]["output"]]
+    assert output_ids == ["item-already-closed"]
+
+
+def test_gemini_trailing_turn_complete_after_interrupt_is_suppressed():
+    """Gemini sends barge-in as two separate frames: `interrupted` (closes the
+    turn, emits response.done) followed by a bare `turnComplete` for the same
+    barge-in. Without suppression the second frame produces a spurious, empty
+    response.done with a brand-new random response_id — pure protocol noise
+    the client never asked for. Reproduces the live two-frame sequence and
+    asserts only one response.done is emitted across both frames."""
+    config = GeminiRealtimeConfig()
+
+    session_configuration_request_str = json.dumps(
+        {
+            "setup": {
+                "model": "gemini-2.5-flash-native-audio",
+                "generationConfig": {"responseModalities": ["AUDIO"]},
+            }
+        }
+    )
+
+    # Frame 1: interrupted — closes the open item, emits the real response.done,
+    # and resets current_response_id/current_output_item_id to None (mirrors
+    # what the main loop does after this branch runs).
+    interrupted_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"interrupted": True}}),
+        "gemini-2.5-flash-native-audio",
+        MagicMock(),
+        realtime_response_transform_input={
+            "session_configuration_request": session_configuration_request_str,
+            "current_output_item_id": "item-open-at-interrupt",
+            "current_response_id": "resp-open-at-interrupt",
+            "current_conversation_id": None,
+            "current_delta_chunks": [],
+            "current_item_chunks": None,
+            "current_delta_type": "audio",
+        },
+    )
+    first_types = [e["type"] for e in interrupted_result["response"]]
+    assert first_types.count("response.done") == 1
+
+    # Frame 2: the trailing bare turnComplete Gemini sends right after,
+    # with state already reset to None by frame 1.
+    turn_complete_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"turnComplete": True}}),
+        "gemini-2.5-flash-native-audio",
+        MagicMock(),
+        realtime_response_transform_input={
+            "session_configuration_request": session_configuration_request_str,
+            "current_output_item_id": None,
+            "current_response_id": None,
+            "current_conversation_id": None,
+            "current_delta_chunks": [],
+            "current_item_chunks": None,
+            "current_delta_type": "audio",
+        },
+    )
+
+    second_types = [e["type"] for e in turn_complete_result["response"] if "type" in e]
+    assert "response.done" not in second_types, (
+        "the trailing bare turnComplete right after an interrupt must not emit "
+        "a second, empty response.done"
+    )
+
+
+def test_gemini_bare_turn_complete_without_prior_interrupt_still_emits_response_done():
+    """A bare turnComplete with no prior content is legitimate (e.g. a short
+    text-only turn) when it did NOT follow an interrupt — must not be
+    suppressed by the barge-in trailing-frame guard."""
+    config = GeminiRealtimeConfig()
+    logging_obj = MagicMock()
+    logging_obj.litellm_trace_id = "trace_bare_turn_complete_no_interrupt"
+
+    result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"turnComplete": True}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": None,
+            "current_response_id": None,
+            "current_conversation_id": None,
+            "current_delta_chunks": [],
+            "current_item_chunks": [],
+            "current_delta_type": None,
+        },
+    )
+
+    types = [e["type"] for e in result["response"] if "type" in e]
+    assert "response.done" in types
+
+
 def test_gemini_3_1_flash_live_preview_model_cost_map_entry():
     for key in (
         "gemini-3.1-flash-live-preview",

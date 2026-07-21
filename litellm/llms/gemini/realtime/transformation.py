@@ -146,6 +146,13 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         # Gemini Live sometimes emits usageMetadata in a standalone frame between
         # turns; buffer it here so the next response.done carries the token counts.
         self._pending_usage_metadata: Optional[dict] = None
+        # Gemini sends `interrupted` and `turnComplete` as two separate frames on
+        # barge-in. The first frame's RESPONSE_DONE branch already closed the turn
+        # and reset current_response_id/current_output_item_id to None; the second
+        # frame would otherwise produce a spurious empty response.done. Track that
+        # the turn was just closed by an interrupt so the very next bare
+        # RESPONSE_DONE (and only that one) is suppressed.
+        self._turn_closed_by_interrupt: bool = False
 
     def is_setup_message(self, msg_obj: dict) -> bool:
         return "setup" in msg_obj
@@ -957,6 +964,35 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         returned_items.append(response_output_item_done)
         return returned_items
 
+    @staticmethod
+    def _return_incomplete_output_item_done(
+        current_output_item_id: str,
+        current_response_id: str,
+    ) -> OpenAIRealtimeOutputItemDone:
+        """Close an item left open by barge-in (``serverContent.interrupted``).
+
+        ``outputTranscription`` can open an item (``response.output_item.added``)
+        before the matching audio delta arrives; if the model is interrupted in
+        that gap, no ``response.output_item.done`` is ever sent for it, so
+        ``response.done.output`` silently drops the item the client was already
+        told about. Emit a ``status: "incomplete"`` done event so the item's
+        lifecycle is always closed before ``response.done``.
+        """
+        return OpenAIRealtimeOutputItemDone(
+            type="response.output_item.done",
+            event_id="event_{}".format(uuid.uuid4()),
+            output_index=0,
+            response_id=current_response_id,
+            item={
+                "id": current_output_item_id,
+                "object": "realtime.item",
+                "type": "message",
+                "status": "incomplete",
+                "role": "assistant",
+                "content": [],
+            },
+        )
+
     def _consume_usage_metadata_for_response_done(self, frame: dict) -> Optional[dict]:
         """Pop usageMetadata from the frame (authoritative) or drain the pending buffer.
 
@@ -1158,9 +1194,19 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         ):
             current_response_id = current_response_id or "resp_{}".format(uuid.uuid4())
             if not current_output_item_id:
+                # A real new turn is starting; the barge-in trailing-frame guard
+                # only applies to the one bare RESPONSE_DONE right after an
+                # interrupt, never to a turn that goes on to produce content.
+                self._turn_closed_by_interrupt = False
                 # send the list of standard 'new' content.delta events
                 current_output_item_id = "item_{}".format(uuid.uuid4())
                 current_conversation_id = current_conversation_id or "conv_{}".format(uuid.uuid4())
+                verbose_logger.debug(
+                    "RT_PROBE new delta item: response_id=%s item_id=%s delta_type=%s",
+                    current_response_id,
+                    current_output_item_id,
+                    delta_type,
+                )
                 returned_message = self.return_new_content_delta_events(
                     session_configuration_request=session_configuration_request,
                     response_id=current_response_id,
@@ -1181,6 +1227,12 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             openai_event == OpenAIRealtimeEventTypes.RESPONSE_TEXT_DONE
             or openai_event == OpenAIRealtimeEventTypes.RESPONSE_AUDIO_DONE
         ):
+            verbose_logger.debug(
+                "RT_PROBE content_done: incoming current_response_id=%s current_output_item_id=%s delta_type=%s",
+                current_response_id,
+                current_output_item_id,
+                delta_type,
+            )
             transformed_content_done_event = self.transform_content_done_event(
                 current_output_item_id=current_output_item_id,
                 current_response_id=current_response_id,
@@ -1288,6 +1340,23 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         current_delta_type: Optional[ALL_DELTA_TYPES] = realtime_response_transform_input["current_delta_type"]
         returned_message: List[OpenAIRealtimeEvents] = []
 
+        _sc_for_log = json_message.get("serverContent") if isinstance(json_message, dict) else None
+        verbose_logger.debug(
+            "RT_PROBE frame start: serverContent_keys=%s has_modelTurn=%s has_generationComplete=%s "
+            "has_interrupted=%s has_turnComplete=%s has_outputTranscription=%s has_toolCall=%s "
+            "-> state_in: response_id=%s output_item_id=%s item_chunks_ids=%s",
+            sorted(_sc_for_log.keys()) if isinstance(_sc_for_log, dict) else None,
+            isinstance(_sc_for_log, dict) and "modelTurn" in _sc_for_log,
+            isinstance(_sc_for_log, dict) and bool(_sc_for_log.get("generationComplete")),
+            isinstance(_sc_for_log, dict) and bool(_sc_for_log.get("interrupted")),
+            isinstance(_sc_for_log, dict) and bool(_sc_for_log.get("turnComplete")),
+            isinstance(_sc_for_log, dict) and "outputTranscription" in _sc_for_log,
+            isinstance(json_message, dict) and "toolCall" in json_message,
+            current_response_id,
+            current_output_item_id,
+            [c.get("item", {}).get("id") for c in current_item_chunks] if current_item_chunks else None,
+        )
+
         server_content = json_message.get("serverContent")
         if isinstance(server_content, dict):
             # Surface Gemini's native barge-in. Gemini emits
@@ -1296,6 +1365,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             # OpenAI-realtime ``input_audio_buffer.speech_started`` too, so clients
             # that flush playback / cancel on speech-start actually interrupt.
             if server_content.get("interrupted"):
+                self._turn_closed_by_interrupt = True
                 returned_message.append(
                     cast(
                         OpenAIRealtimeEvents,
@@ -1307,6 +1377,32 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                         },
                     )
                 )
+                # Barge-in can land while an item is open (response.output_item.added
+                # already sent, e.g. by outputTranscription below) but before its
+                # audio delta closed it. Close it here as "incomplete" so
+                # response.done.output never drops an item the client already
+                # knows about.
+                _item_already_closed = current_item_chunks and any(
+                    chunk.get("item", {}).get("id") == current_output_item_id for chunk in current_item_chunks
+                )
+                _should_synthesize_close = (
+                    current_output_item_id is not None and current_response_id is not None and not _item_already_closed
+                )
+                verbose_logger.debug(
+                    "RT_PROBE interrupted: synthesizing_incomplete_close=%s current_response_id=%s "
+                    "current_output_item_id=%s item_already_closed=%s current_item_chunks_ids=%s",
+                    _should_synthesize_close,
+                    current_response_id,
+                    current_output_item_id,
+                    bool(_item_already_closed),
+                    [c.get("item", {}).get("id") for c in current_item_chunks] if current_item_chunks else None,
+                )
+                if _should_synthesize_close:
+                    incomplete_done_event = self._return_incomplete_output_item_done(
+                        current_output_item_id=current_output_item_id,
+                        current_response_id=current_response_id,
+                    )
+                    returned_message.append(cast(OpenAIRealtimeEvents, incomplete_done_event))
             input_tx = server_content.get("inputTranscription")
             if isinstance(input_tx, dict) and input_tx.get("text"):
                 returned_message.append(
@@ -1327,8 +1423,15 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 if current_response_id is None:
                     current_response_id = "resp_{}".format(uuid.uuid4())
                 if current_output_item_id is None:
+                    self._turn_closed_by_interrupt = False
                     current_output_item_id = "item_{}".format(uuid.uuid4())
                     current_conversation_id = current_conversation_id or "conv_{}".format(uuid.uuid4())
+                    verbose_logger.debug(
+                        "RT_PROBE outputTranscription opened item first (no prior audio delta): "
+                        "response_id=%s item_id=%s",
+                        current_response_id,
+                        current_output_item_id,
+                    )
                     returned_message.extend(
                         self.return_new_content_delta_events(
                             session_configuration_request=session_configuration_request,
@@ -1571,22 +1674,61 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 _has_pending_function_call = current_item_chunks and any(
                     chunk.get("item", {}).get("type") == "function_call" for chunk in current_item_chunks
                 )
-                if current_response_id is None and _has_pending_function_call:
-                    # Trailing bare turnComplete after a toolCall (Vertex emits ~5
-                    # bookkeeping tokens before the follow-up answer). Suppress the
-                    # empty response.done so collect_until("response.done") clients
-                    # don't stop prematurely; buffer usage for the next real turn.
+                _is_trailing_bare_done_after_interrupt = (
+                    current_response_id is None and current_output_item_id is None and self._turn_closed_by_interrupt
+                )
+                if current_response_id is None and (_has_pending_function_call or _is_trailing_bare_done_after_interrupt):
+                    # Trailing bare turnComplete/interrupted with nothing to report:
+                    # either a toolCall follow-up (Vertex emits ~5 bookkeeping tokens
+                    # before the answer) or the second of Gemini's two barge-in
+                    # frames (`interrupted` then `turnComplete`) arriving after the
+                    # first frame's response.done already closed the turn. Suppress
+                    # the empty response.done so collect_until("response.done")
+                    # clients don't stop prematurely / receive a spurious extra done;
+                    # buffer usage for the next real turn.
+                    verbose_logger.debug(
+                        "RT_PROBE response.done suppressed: trailing_bare_done_after_interrupt=%s "
+                        "pending_function_call=%s",
+                        _is_trailing_bare_done_after_interrupt,
+                        bool(_has_pending_function_call),
+                    )
+                    self._turn_closed_by_interrupt = False
                     standalone_usage_metadata = json_message.get("usageMetadata")
                     if isinstance(standalone_usage_metadata, dict):
                         self._pending_usage_metadata = standalone_usage_metadata
                     server_content_handled = True
                     continue
+                # A same-frame ``interrupted`` block may have just synthesized an
+                # "incomplete" output_item.done above (barge-in landing while an
+                # item was open but not yet closed by an audio delta). Fold it in
+                # here since current_item_chunks only reflects prior frames.
+                _already_closed_ids = (
+                    {chunk.get("item", {}).get("id") for chunk in current_item_chunks} if current_item_chunks else set()
+                )
+                _same_frame_done_items = [
+                    event
+                    for event in returned_message
+                    if event.get("type") == "response.output_item.done"
+                    and event.get("item", {}).get("id") not in _already_closed_ids
+                ]
+                _effective_item_chunks = (current_item_chunks or []) + cast(
+                    List[OpenAIRealtimeOutputItemDone], _same_frame_done_items
+                )
+                _sc = json_message.get("serverContent")
+                verbose_logger.debug(
+                    "RT_PROBE response.done: interrupted=%s current_response_id=%s current_output_item_id=%s "
+                    "current_item_chunks_ids=%s",
+                    isinstance(_sc, dict) and _sc.get("interrupted"),
+                    current_response_id,
+                    current_output_item_id,
+                    [c.get("item", {}).get("id") for c in _effective_item_chunks] if _effective_item_chunks else None,
+                )
                 transformed_response_done_event = self.transform_response_done_event(
                     message=BidiGenerateContentServerMessage(**json_message),  # type: ignore
                     current_response_id=current_response_id,
                     current_conversation_id=current_conversation_id,
                     session_configuration_request=session_configuration_request,
-                    output_items=None,
+                    output_items=_effective_item_chunks or None,
                 )
                 returned_message.append(transformed_response_done_event)
                 current_output_item_id = None
@@ -1659,9 +1801,22 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             current_item_chunks=current_item_chunks,
         )
 
-        for msg in returned_message:
-            event_type = msg.get("type") if isinstance(msg, dict) else "unknown"
-            verbose_logger.debug("Realtime Response Transform: OpenAI event=%s", event_type)
+        verbose_logger.debug(
+            "RT_PROBE frame summary: emitted_events=%s -> state_after: response_id=%s output_item_id=%s "
+            "item_chunks_ids=%s",
+            [
+                (
+                    msg.get("type"),
+                    msg.get("item_id") or msg.get("item", {}).get("id"),
+                    msg.get("response_id") or msg.get("response", {}).get("id"),
+                )
+                for msg in returned_message
+                if isinstance(msg, dict)
+            ],
+            current_response_id,
+            current_output_item_id,
+            [c.get("item", {}).get("id") for c in current_item_chunks] if current_item_chunks else None,
+        )
 
         return {
             "response": returned_message,
