@@ -11,7 +11,7 @@ guaranteeing every still-open item gets an "incomplete" close first (the
 barge-in case) and being a safe no-op when called on an already-closed state.
 """
 
-from typing import List, Literal, Optional, Sequence, Tuple, Union
+from typing import List, Literal, Optional, Sequence, Tuple, Union, cast
 
 from litellm.types.llms.openai import OpenAIRealtimeEvents, ResponseAPIUsage
 
@@ -263,6 +263,63 @@ def close_response(
     )
     all_events.append(done_event)
     return RealtimeCorrelationState(response=None), tuple(all_events)
+
+
+def track_output_index(
+    state: RealtimeCorrelationState,
+    response_id: str,
+    item_id: str,
+) -> Tuple[RealtimeCorrelationState, int]:
+    """Idempotent query: return the `output_index` already assigned to `item_id`,
+    or allocate the next one if this is the first time it's been seen.
+
+    Unlike `open_item`, this never emits events — it's for providers (e.g. xAI)
+    whose backend already sent the real wire event and only needs the shared
+    module's index bookkeeping, not synthesized lifecycle events. Also unlike
+    `open_item`, a missing response is opened silently rather than raising,
+    since the caller here is reacting to an already-arrived backend event, not
+    driving the lifecycle forward itself.
+    """
+    if state.response is None or state.response.response_id != response_id:
+        state = RealtimeCorrelationState(response=OpenResponse(response_id=response_id, conversation_id=response_id))
+    assert state.response is not None
+    existing = _find_open_item(state.response, item_id)
+    if existing is not None:
+        return state, existing.output_index
+    new_state, _ = open_item(state, item_id)
+    assert new_state.response is not None
+    tracked = _find_open_item(new_state.response, item_id)
+    assert tracked is not None
+    return new_state, tracked.output_index
+
+
+def track_content_index(
+    state: RealtimeCorrelationState,
+    response_id: str,
+    item_id: str,
+    content_part_key: str,
+) -> Tuple[RealtimeCorrelationState, int]:
+    """Idempotent query: return the `content_index` already assigned to
+    `content_part_key` within `item_id`, or allocate the next one (scoped to
+    that item) if this is the first time it's been seen.
+
+    `content_part_key` disambiguates multiple content parts on the same item
+    when the backend doesn't provide its own content_index (e.g. keyed by
+    modality — "text"/"audio" — for providers that emit at most one part per
+    modality per item). Never emits events, mirroring `track_output_index`.
+    """
+    state, _ = track_output_index(state, response_id, item_id)
+    assert state.response is not None
+    item = _find_open_item(state.response, item_id)
+    assert item is not None
+    for index, part in enumerate(item.content_parts):
+        if part.delta_type == content_part_key:
+            return state, index
+    new_state, _ = open_content_part(state, item_id, cast(ContentDeltaType, content_part_key))
+    assert new_state.response is not None
+    updated_item = _find_open_item(new_state.response, item_id)
+    assert updated_item is not None
+    return new_state, len(updated_item.content_parts) - 1
 
 
 def cancel_response(

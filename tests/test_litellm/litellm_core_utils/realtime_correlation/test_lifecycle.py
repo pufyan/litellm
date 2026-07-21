@@ -13,6 +13,8 @@ from litellm.litellm_core_utils.realtime_correlation import (
     open_item,
     open_response,
     tool_call_events,
+    track_content_index,
+    track_output_index,
 )
 from litellm.litellm_core_utils.realtime_correlation.lifecycle import CorrelationEvent
 from litellm.litellm_core_utils.realtime_correlation.state import RealtimeCorrelationError
@@ -257,3 +259,77 @@ def test_full_lifecycle_matches_single_item_happy_path():
     assert _get(output[0], "status") == "completed"
     assert _get(output[0], "content") == [{"type": "text", "text": "hi"}]
     assert state.response is None
+
+
+def test_track_output_index_allocates_monotonically_across_items():
+    state = RealtimeCorrelationState()
+    state, idx_a = track_output_index(state, "resp_1", "item_A")
+    state, idx_b = track_output_index(state, "resp_1", "item_B")
+
+    assert (idx_a, idx_b) == (0, 1)
+
+
+def test_track_output_index_is_idempotent_for_the_same_item_id():
+    state = RealtimeCorrelationState()
+    state, first = track_output_index(state, "resp_1", "item_A")
+    state, second = track_output_index(state, "resp_1", "item_A")
+
+    assert first == second == 0
+    # Repeated tracking must not add a second OpenItem entry for the same id —
+    # a mutation that dropped the idempotency check would still return the
+    # correct index by chance (first-match lookup) while silently duplicating
+    # the item in state.
+    assert state.response is not None
+    assert len(state.response.open_items) == 1
+
+
+def test_track_output_index_opens_a_response_implicitly_when_none_is_open():
+    state = RealtimeCorrelationState()
+    assert state.response is None
+
+    state, idx = track_output_index(state, "resp_1", "item_A")
+
+    assert idx == 0
+    assert state.response is not None
+    assert state.response.response_id == "resp_1"
+
+
+def test_track_output_index_emits_no_events():
+    """Unlike open_item, track_output_index must never synthesize wire events —
+    the caller (e.g. xAI's normalizer) already has the real backend event."""
+    state = RealtimeCorrelationState()
+    state, _ = track_output_index(state, "resp_1", "item_A")
+
+    assert state.response is not None
+    # No event-emitting side effect: open_items holds the tracked item, but no
+    # response.output_item.added was ever built for it (nothing to assert on
+    # the return value itself since track_output_index only returns an int).
+    assert len(state.response.open_items) == 1
+
+
+def test_track_content_index_allocates_monotonically_scoped_per_item():
+    state = RealtimeCorrelationState()
+    state, text_idx = track_content_index(state, "resp_1", "item_A", "text")
+    state, audio_idx = track_content_index(state, "resp_1", "item_A", "audio")
+
+    assert (text_idx, audio_idx) == (0, 1)
+
+
+def test_track_content_index_is_idempotent_for_the_same_key():
+    state = RealtimeCorrelationState()
+    state, first = track_content_index(state, "resp_1", "item_A", "text")
+    state, second = track_content_index(state, "resp_1", "item_A", "text")
+
+    assert first == second == 0
+
+
+def test_track_content_index_is_scoped_per_item_not_global():
+    """Regression guard: item_B's first content part must also get index 0,
+    not continue item_A's counter — content_index resets per item."""
+    state = RealtimeCorrelationState()
+    state, _ = track_content_index(state, "resp_1", "item_A", "text")
+    state, _ = track_content_index(state, "resp_1", "item_A", "audio")
+
+    state, item_b_idx = track_content_index(state, "resp_1", "item_B", "text")
+
+    assert item_b_idx == 0

@@ -16,9 +16,14 @@ construction time (see ``handler.py``) so all normalization is isolated here
 and ``RealTimeStreaming`` stays provider-agnostic.
 """
 
-from typing import Any, FrozenSet, Optional
+from typing import Any, FrozenSet, Optional, Tuple
 
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.realtime_correlation import (
+    RealtimeCorrelationState,
+    track_content_index,
+    track_output_index,
+)
 
 
 def _derive_ga_server_event_types() -> Optional[FrozenSet[str]]:
@@ -107,19 +112,25 @@ class XAIRealtimeNormalizer:
         event_type = event.get("type")
         if event_type == "ping":
             return True
-        if GA_SERVER_EVENT_TYPES is not None and isinstance(event_type, str) and event_type not in GA_SERVER_EVENT_TYPES:
+        if (
+            GA_SERVER_EVENT_TYPES is not None
+            and isinstance(event_type, str)
+            and event_type not in GA_SERVER_EVENT_TYPES
+        ):
             verbose_logger.debug("XAIRealtimeNormalizer: dropping non-GA event type %s", event_type)
             return True
         return False
 
-    def normalize(self, event: dict) -> dict:
+    def normalize(
+        self, event: "dict[str, Any]", state: RealtimeCorrelationState
+    ) -> "Tuple[dict[str, Any], RealtimeCorrelationState]":
         """Apply all xAI normalization passes in order."""
         event = self._normalize_content_part_events(event)
         event_type = event.get("type") or ""
         event = self._normalize_conversation_item_added(event, event_type)
-        event = self._inject_missing_indices(event, event_type)
+        event, state = self._inject_missing_indices(event, event_type, state)
         event = self._normalize_response_usage_event(event, event_type)
-        return event
+        return event, state
 
     def patch_outgoing_session(self, session: dict) -> dict:
         """Patch a client ``session.update`` payload before forwarding to xAI.
@@ -247,25 +258,90 @@ class XAIRealtimeNormalizer:
     # Pass 3: inject missing output_index / content_index
     # ---------------------------------------------------------------------------
 
-    def _inject_missing_indices(self, event: dict, event_type: str) -> dict:
-        """Inject ``output_index`` / ``content_index`` defaults when absent.
+    # Which logical content-part modality an event belongs to. output_audio and
+    # output_audio_transcript are two facets of the SAME content part (audio
+    # bytes + its transcript), so both map to "audio" and must resolve to the
+    # same content_index — mirrors Gemini's reference behavior (always
+    # content_index=0 for output_audio_transcript.delta alongside output_audio.delta).
+    _CONTENT_PART_MODALITY = {
+        "response.content_part.added": "content",
+        "response.content_part.done": "content",
+        "response.output_text.delta": "text",
+        "response.output_text.done": "text",
+        "response.output_audio.delta": "audio",
+        "response.output_audio.done": "audio",
+        "response.output_audio_transcript.delta": "audio",
+        "response.output_audio_transcript.done": "audio",
+    }
+
+    # Events whose id lives at a top-level "item_id" field, per the OpenAI GA
+    # realtime event shapes (litellm/types/llms/openai.py). The two
+    # response.output_item.* events are the exception (see _event_item_id).
+    _EVENTS_WITH_TOP_LEVEL_ITEM_ID = frozenset(
+        [
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.output_audio_transcript.delta",
+            "response.output_audio_transcript.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+        ]
+    )
+
+    @staticmethod
+    def _event_item_id(event: "dict[str, Any]", event_type: str) -> Optional[str]:
+        """Extract the item id an event refers to.
+
+        response.output_item.added/.done carry it nested at item.id (they have
+        no top-level item_id field); every other index-bearing event type
+        carries a top-level item_id.
+        """
+        if event_type in ("response.output_item.added", "response.output_item.done"):
+            item = event.get("item")
+            return item.get("id") if isinstance(item, dict) else None
+        if event_type in XAIRealtimeNormalizer._EVENTS_WITH_TOP_LEVEL_ITEM_ID:
+            item_id = event.get("item_id")
+            return item_id if isinstance(item_id, str) else None
+        return None
+
+    def _inject_missing_indices(
+        self, event: "dict[str, Any]", event_type: str, state: RealtimeCorrelationState
+    ) -> "Tuple[dict[str, Any], RealtimeCorrelationState]":
+        """Inject real ``output_index`` / ``content_index`` when xAI omits them.
 
         xAI omits both fields on every streaming response event; pydantic GA
-        clients require them as non-optional ints.  Defaulting to 0 is correct
-        for single-turn single-item responses and harmless for well-formed events.
+        clients require them as non-optional ints. Previously defaulted to a
+        hardcoded 0 (correct only for single-item responses); now resolved via
+        the shared realtime_correlation module so multi-item/multi-part
+        responses get real, monotonically increasing indices.
         """
         needs_output = event_type in self._EVENTS_NEEDING_OUTPUT_INDEX
         needs_content = event_type in self._EVENTS_NEEDING_CONTENT_INDEX
         if not needs_output and not needs_content:
-            return event
+            return event, state
+
+        response_id = event.get("response_id")
+        item_id = self._event_item_id(event, event_type)
+        if not isinstance(response_id, str) or not isinstance(item_id, str):
+            # Can't resolve a real index without both ids; leave the event
+            # unpatched rather than guessing.
+            return event, state
+
         patch: dict[str, Any] = {}
         if needs_output and "output_index" not in event:
-            patch["output_index"] = 0
+            state, output_index = track_output_index(state, response_id, item_id)
+            patch["output_index"] = output_index
         if needs_content and "content_index" not in event:
-            patch["content_index"] = 0
+            content_part_key = self._CONTENT_PART_MODALITY.get(event_type, "content")
+            state, content_index = track_content_index(state, response_id, item_id, content_part_key)
+            patch["content_index"] = content_index
         if not patch:
-            return event
-        return {**event, **patch}
+            return event, state
+        return {**event, **patch}, state
 
     # ---------------------------------------------------------------------------
     # Pass 4: response usage normalisation

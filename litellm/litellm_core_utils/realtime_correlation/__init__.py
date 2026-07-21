@@ -15,6 +15,8 @@ from .lifecycle import (
     open_item,
     open_response,
     tool_call_events,
+    track_content_index,
+    track_output_index,
 )
 from .state import (
     ClosedItem,
@@ -38,6 +40,8 @@ __all__ = [
     "open_item",
     "open_response",
     "tool_call_events",
+    "track_content_index",
+    "track_output_index",
     "ClosedItem",
     "ContentDeltaType",
     "ItemStatus",

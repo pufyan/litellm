@@ -6,6 +6,7 @@ import litellm
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
+from litellm.litellm_core_utils.realtime_correlation import RealtimeCorrelationState
 from litellm.litellm_core_utils.realtime_schema_normalization import (
     normalize_input_audio_transcription_for_ga,
     normalize_tools_to_canonical,
@@ -70,7 +71,7 @@ else:
 
 class RealtimeEventNormalizer(Protocol):
     def should_drop(self, event: object) -> bool: ...
-    def normalize(self, event: dict) -> dict: ...
+    def normalize(self, event: dict, state: RealtimeCorrelationState) -> "tuple[dict, RealtimeCorrelationState]": ...
     def patch_outgoing_session(self, session: dict) -> dict: ...
 
 
@@ -157,6 +158,9 @@ class RealTimeStreaming:
         self._is_transcription_session: bool = force_transcription_model is not None
         # Optional per-provider GA event normalizer (e.g. XAIRealtimeNormalizer).
         self._event_normalizer = event_normalizer
+        # Correlation-id state threaded through the normalizer path (real
+        # output_index/content_index tracking, see litellm_core_utils.realtime_correlation).
+        self._correlation_state: RealtimeCorrelationState = RealtimeCorrelationState()
         # Backend session resumption: latest provider resumption token and
         # whether a backend reconnect is currently in flight (client messages
         # are buffered while True).
@@ -809,7 +813,8 @@ class RealTimeStreaming:
     def _normalize_event_for_ga_client(self, event: dict) -> dict:
         """Apply per-provider GA normalization before forwarding to clients."""
         if self._event_normalizer is not None:
-            return self._event_normalizer.normalize(event)
+            event, self._correlation_state = self._event_normalizer.normalize(event, self._correlation_state)
+            return event
         return event
 
     def _event_to_client_json(self, event: dict) -> str:
