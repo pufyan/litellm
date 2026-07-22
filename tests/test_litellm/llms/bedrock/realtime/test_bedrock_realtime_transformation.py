@@ -829,6 +829,223 @@ class TestBedrockRealtimeResponseTransformation:
         response_ids = [event["response_id"] for event in all_events if "response_id" in event]
         assert len(set(response_ids)) == 1, "Response IDs should be consistent"
 
+    def test_output_index_stable_for_repeated_events_on_same_item(self):
+        """output_index for the same (response_id, item_id) must not drift across
+        multiple events referencing it (contentStart -> textOutput -> contentEnd)."""
+        config = BedrockRealtimeConfig()
+        logging_obj = MagicMock()
+        logging_obj.litellm_trace_id = "trace_123"
+
+        content_start = {"event": {"contentStart": {"role": "ASSISTANT", "type": "TEXT"}}}
+        result1 = config.transform_realtime_response(
+            json.dumps(content_start),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": None,
+                "current_response_id": None,
+                "current_conversation_id": None,
+                "current_delta_chunks": [],
+                "current_item_chunks": [],
+                "current_delta_type": None,
+            },
+        )
+        output_item_added = [msg for msg in result1["response"] if msg["type"] == "response.output_item.added"][0]
+
+        text_output = {"event": {"textOutput": {"content": "Hello"}}}
+        result2 = config.transform_realtime_response(
+            json.dumps(text_output),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": result1["current_output_item_id"],
+                "current_response_id": result1["current_response_id"],
+                "current_conversation_id": result1["current_conversation_id"],
+                "current_delta_chunks": result1["current_delta_chunks"],
+                "current_item_chunks": [],
+                "current_delta_type": result1["current_delta_type"],
+            },
+        )
+        text_delta = [msg for msg in result2["response"] if msg["type"] == "response.text.delta"][0]
+
+        content_end = {"event": {"contentEnd": {}}}
+        result3 = config.transform_realtime_response(
+            json.dumps(content_end),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": result1["current_output_item_id"],
+                "current_response_id": result1["current_response_id"],
+                "current_conversation_id": result1["current_conversation_id"],
+                "current_delta_chunks": result2["current_delta_chunks"],
+                "current_item_chunks": [],
+                "current_delta_type": result2["current_delta_type"],
+            },
+        )
+        output_item_done = [msg for msg in result3["response"] if msg["type"] == "response.output_item.done"][0]
+
+        assert output_item_added["output_index"] == text_delta["output_index"] == output_item_done["output_index"]
+
+    def test_content_index_differs_between_text_and_audio_parts_on_same_item(self):
+        """Two content parts of different modality on the same item must get distinct
+        content_index values (0 and 1), not both hardcoded to 0."""
+        config = BedrockRealtimeConfig()
+        logging_obj = MagicMock()
+        logging_obj.litellm_trace_id = "trace_123"
+
+        content_start_text = {"event": {"contentStart": {"role": "ASSISTANT", "type": "TEXT"}}}
+        result1 = config.transform_realtime_response(
+            json.dumps(content_start_text),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": None,
+                "current_response_id": None,
+                "current_conversation_id": None,
+                "current_delta_chunks": [],
+                "current_item_chunks": [],
+                "current_delta_type": None,
+            },
+        )
+        text_part_added = [msg for msg in result1["response"] if msg["type"] == "response.content_part.added"][0]
+
+        # Same item_id, but this time an AUDIO content part starts on it too.
+        content_start_audio = {"event": {"contentStart": {"role": "ASSISTANT", "type": "AUDIO"}}}
+        result2 = config.transform_realtime_response(
+            json.dumps(content_start_audio),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": result1["current_output_item_id"],
+                "current_response_id": result1["current_response_id"],
+                "current_conversation_id": result1["current_conversation_id"],
+                "current_delta_chunks": [],
+                "current_item_chunks": [],
+                "current_delta_type": None,
+            },
+        )
+        audio_part_added = [msg for msg in result2["response"] if msg["type"] == "response.content_part.added"][0]
+
+        assert text_part_added["content_index"] == 0
+        assert audio_part_added["content_index"] == 1
+
+    def test_new_response_restarts_output_index_from_zero(self):
+        """A new response_id must not inherit output_index allocations from a
+        previous, unrelated response."""
+        config = BedrockRealtimeConfig()
+        logging_obj = MagicMock()
+        logging_obj.litellm_trace_id = "trace_123"
+
+        first_content_start = {"event": {"contentStart": {"role": "ASSISTANT", "type": "TEXT"}}}
+        result1 = config.transform_realtime_response(
+            json.dumps(first_content_start),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": None,
+                "current_response_id": None,
+                "current_conversation_id": None,
+                "current_delta_chunks": [],
+                "current_item_chunks": [],
+                "current_delta_type": None,
+            },
+        )
+        first_output_item_added = [
+            msg for msg in result1["response"] if msg["type"] == "response.output_item.added"
+        ][0]
+        assert first_output_item_added["output_index"] == 0
+
+        # Brand-new response/item, unrelated to the first one.
+        second_content_start = {"event": {"contentStart": {"role": "ASSISTANT", "type": "TEXT"}}}
+        result2 = config.transform_realtime_response(
+            json.dumps(second_content_start),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": None,
+                "current_response_id": None,
+                "current_conversation_id": None,
+                "current_delta_chunks": [],
+                "current_item_chunks": [],
+                "current_delta_type": None,
+            },
+        )
+        second_output_item_added = [
+            msg for msg in result2["response"] if msg["type"] == "response.output_item.added"
+        ][0]
+        assert second_output_item_added["output_index"] == 0
+
+    def test_response_done_output_contains_completed_text_item(self):
+        """response.done.response.output must not always be [] (LIT bug fix): the
+        text produced during contentEnd should show up as a completed output item."""
+        config = BedrockRealtimeConfig()
+        logging_obj = MagicMock()
+        logging_obj.litellm_trace_id = "trace_123"
+
+        content_start = {"event": {"contentStart": {"role": "ASSISTANT", "type": "TEXT"}}}
+        result1 = config.transform_realtime_response(
+            json.dumps(content_start),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": None,
+                "current_response_id": None,
+                "current_conversation_id": None,
+                "current_delta_chunks": [],
+                "current_item_chunks": [],
+                "current_delta_type": None,
+            },
+        )
+
+        text_output = {"event": {"textOutput": {"content": "Hello, world!"}}}
+        result2 = config.transform_realtime_response(
+            json.dumps(text_output),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": result1["current_output_item_id"],
+                "current_response_id": result1["current_response_id"],
+                "current_conversation_id": result1["current_conversation_id"],
+                "current_delta_chunks": result1["current_delta_chunks"],
+                "current_item_chunks": [],
+                "current_delta_type": result1["current_delta_type"],
+            },
+        )
+
+        content_end = {"event": {"contentEnd": {"stopReason": "END_TURN"}}}
+        result3 = config.transform_realtime_response(
+            json.dumps(content_end),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": result2["current_output_item_id"],
+                "current_response_id": result2["current_response_id"],
+                "current_conversation_id": result2["current_conversation_id"],
+                "current_delta_chunks": result2["current_delta_chunks"],
+                "current_item_chunks": [],
+                "current_delta_type": result2["current_delta_type"],
+            },
+        )
+
+        response_done = [msg for msg in result3["response"] if msg["type"] == "response.done"][0]
+        output = response_done["response"]["output"]
+        assert len(output) == 1
+        assert output[0]["status"] == "completed"
+        assert output[0]["content"][0]["text"] == "Hello, world!"
+
+        # Accumulated item chunks must be reset for the next response.
+        assert result3["current_item_chunks"] is None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
