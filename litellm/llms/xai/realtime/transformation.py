@@ -16,7 +16,7 @@ construction time (see ``handler.py``) so all normalization is isolated here
 and ``RealTimeStreaming`` stays provider-agnostic.
 """
 
-from typing import Any, FrozenSet, Optional, Tuple
+from typing import Any, FrozenSet, Optional
 
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.realtime_correlation import (
@@ -93,6 +93,11 @@ class XAIRealtimeNormalizer:
         # so that ``response.content_part.done`` events missing ``part`` can be
         # back-filled from earlier ``content_part.added`` / delta-done events.
         self._content_part_by_key: dict[tuple, dict[str, Any]] = {}
+        # Correlation-id state for real output_index/content_index tracking
+        # (see litellm_core_utils.realtime_correlation) — owned here, not
+        # threaded through the caller, mirroring GeminiRealtimeConfig/
+        # BedrockRealtimeConfig's own _correlation_state attribute.
+        self._correlation_state: RealtimeCorrelationState = RealtimeCorrelationState()
 
     # ---------------------------------------------------------------------------
     # Public interface consumed by RealTimeStreaming
@@ -121,16 +126,14 @@ class XAIRealtimeNormalizer:
             return True
         return False
 
-    def normalize(
-        self, event: "dict[str, Any]", state: RealtimeCorrelationState
-    ) -> "Tuple[dict[str, Any], RealtimeCorrelationState]":
+    def normalize(self, event: "dict[str, Any]") -> "dict[str, Any]":
         """Apply all xAI normalization passes in order."""
         event = self._normalize_content_part_events(event)
         event_type = event.get("type") or ""
         event = self._normalize_conversation_item_added(event, event_type)
-        event, state = self._inject_missing_indices(event, event_type, state)
+        event = self._inject_missing_indices(event, event_type)
         event = self._normalize_response_usage_event(event, event_type)
-        return event, state
+        return event
 
     def patch_outgoing_session(self, session: dict) -> dict:
         """Patch a client ``session.update`` payload before forwarding to xAI.
@@ -308,9 +311,7 @@ class XAIRealtimeNormalizer:
             return item_id if isinstance(item_id, str) else None
         return None
 
-    def _inject_missing_indices(
-        self, event: "dict[str, Any]", event_type: str, state: RealtimeCorrelationState
-    ) -> "Tuple[dict[str, Any], RealtimeCorrelationState]":
+    def _inject_missing_indices(self, event: "dict[str, Any]", event_type: str) -> "dict[str, Any]":
         """Inject real ``output_index`` / ``content_index`` when xAI omits them.
 
         xAI omits both fields on every streaming response event; pydantic GA
@@ -322,26 +323,28 @@ class XAIRealtimeNormalizer:
         needs_output = event_type in self._EVENTS_NEEDING_OUTPUT_INDEX
         needs_content = event_type in self._EVENTS_NEEDING_CONTENT_INDEX
         if not needs_output and not needs_content:
-            return event, state
+            return event
 
         response_id = event.get("response_id")
         item_id = self._event_item_id(event, event_type)
         if not isinstance(response_id, str) or not isinstance(item_id, str):
             # Can't resolve a real index without both ids; leave the event
             # unpatched rather than guessing.
-            return event, state
+            return event
 
         patch: dict[str, Any] = {}
         if needs_output and "output_index" not in event:
-            state, output_index = track_output_index(state, response_id, item_id)
+            self._correlation_state, output_index = track_output_index(self._correlation_state, response_id, item_id)
             patch["output_index"] = output_index
         if needs_content and "content_index" not in event:
             content_part_key = self._CONTENT_PART_MODALITY.get(event_type, "content")
-            state, content_index = track_content_index(state, response_id, item_id, content_part_key)
+            self._correlation_state, content_index = track_content_index(
+                self._correlation_state, response_id, item_id, content_part_key
+            )
             patch["content_index"] = content_index
         if not patch:
-            return event, state
-        return {**event, **patch}, state
+            return event
+        return {**event, **patch}
 
     # ---------------------------------------------------------------------------
     # Pass 4: response usage normalisation
