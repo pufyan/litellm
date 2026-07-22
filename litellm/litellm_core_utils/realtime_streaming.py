@@ -1685,8 +1685,20 @@ class RealTimeStreaming:
 
                     # GA compatibility: remap beta-style session fields only when
                     # the upstream is in GA mode. Beta upstreams expect the flat
-                    # session shape unchanged.
-                    if msg_type == "session.update" and not self._backend_uses_beta_protocol:
+                    # session shape unchanged. Scoped to provider_config is None
+                    # (the OpenAI-compatible raw-passthrough wire path: OpenAI/
+                    # Azure/xAI) because GA_SESSION_ALLOWED_KEYS is the OpenAI GA
+                    # schema's allowlist and drops union fields (temperature/
+                    # top_p/top_k/context_window_compression) that Gemini/Bedrock
+                    # own mapping code (map_openai_params /
+                    # transform_session_update_event) can actually honor — those
+                    # providers have their own flat-canonical-shape normalization
+                    # and must see the client's session.update unfiltered.
+                    if (
+                        msg_type == "session.update"
+                        and not self._backend_uses_beta_protocol
+                        and self.provider_config is None
+                    ):
                         session = msg_obj.get("session", {})
                         if isinstance(session, dict):
                             session = self._remap_beta_session_to_ga(session)

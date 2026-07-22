@@ -1157,6 +1157,57 @@ def test_capture_transcription_usage_deduplicates_when_already_stored():
 
 
 @pytest.mark.asyncio
+async def test_client_ack_forwards_union_fields_unfiltered_to_provider_config():
+    """Regression: the GA remap's GA_SESSION_ALLOWED_KEYS allowlist is the
+    OpenAI GA schema and does not include temperature/top_p/top_k/
+    context_window_compression. It must not run for providers with their own
+    provider_config (Gemini/Bedrock), or their own mapping code for these
+    union fields never receives them."""
+    websocket = MagicMock()
+    backend_ws = MagicMock()
+    logging_obj = MagicMock()
+    logging_obj.pre_call = MagicMock()
+
+    websocket.receive_text = AsyncMock(
+        side_effect=[
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "temperature": 0.8,
+                        "top_p": 0.95,
+                        "top_k": 40,
+                        "context_window_compression": {"sliding_window": {}},
+                    },
+                }
+            ),
+            Exception("client done"),
+        ]
+    )
+
+    provider_config = MagicMock()
+    provider_config.transform_realtime_request = MagicMock(side_effect=lambda m, *a, **k: [m])
+    backend_ws.send = AsyncMock()
+
+    streaming = RealTimeStreaming(
+        websocket=websocket,
+        backend_ws=backend_ws,
+        logging_obj=logging_obj,
+        provider_config=provider_config,
+        model="gemini-2.5-flash",
+    )
+
+    await streaming.client_ack_messages()
+
+    sent_message = provider_config.transform_realtime_request.call_args.args[0]
+    sent_session = json.loads(sent_message)["session"]
+    assert sent_session["temperature"] == 0.8
+    assert sent_session["top_p"] == 0.95
+    assert sent_session["top_k"] == 40
+    assert sent_session["context_window_compression"] == {"sliding_window": {}}
+
+
+@pytest.mark.asyncio
 async def test_client_ack_caches_setup_to_prevent_duplicate_session_update_setup():
     websocket = MagicMock()
     backend_ws = MagicMock()

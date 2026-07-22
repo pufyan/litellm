@@ -145,7 +145,7 @@ Bedrock Nova Sonic is the least complete: it ignores `turn_detection` and `input
 
 | Family | Providers | Mapping code |
 |---|---|---|
-| OpenAI-compatible | `openai`, `azure`, `xai` | `litellm/litellm_core_utils/realtime_streaming.py` (`_remap_beta_session_to_ga`) plus per-provider event normalizers (e.g. `litellm/llms/xai/realtime/transformation.py`, `XAIRealtimeNormalizer`) |
+| OpenAI-compatible | `openai`, `azure`, `xai` | `litellm/litellm_core_utils/realtime_streaming.py` (`_remap_beta_session_to_ga`) plus per-provider event normalizers (e.g. `litellm/llms/xai/realtime/transformation.py`, `XAIRealtimeNormalizer`). `_remap_beta_session_to_ga` only runs on this passthrough path (`provider_config is None`) — its `GA_SESSION_ALLOWED_KEYS` allowlist is the OpenAI GA schema and would otherwise strip union fields (`temperature`, `top_p`, `top_k`, `context_window_compression`) before they ever reach Gemini's or Bedrock's own mapping code. |
 | Gemini | `gemini`, `vertex_ai` | `litellm/llms/gemini/realtime/transformation.py` (Vertex extends `GeminiRealtimeConfig`) |
 | Bedrock | `bedrock` | `litellm/llms/bedrock/realtime/transformation.py` |
 | Shared outbound correlation | `xai`, `gemini`/`vertex_ai`, `bedrock` | `litellm/litellm_core_utils/realtime_correlation/` — the `(response_id, item_id, output_index, content_index)` index/lifecycle machinery all three call into so they don't each reimplement it (and diverge) independently. See its own README for the full event-by-event contract. Not used by `openai`/`azure`, which need no reconstruction (see "Server events" below). |
