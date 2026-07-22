@@ -685,7 +685,7 @@ def test_gemini_realtime_tool_call_transformation():
     assert function_call_event["call_id"] == "call_123"
     assert function_call_event["name"] == "get_weather"
     assert function_call_event["response_id"] == "resp_123"
-    assert function_call_event["item_id"] == "item_123_tool_0"
+    assert function_call_event["item_id"] == "item_call_123"
     assert function_call_event["output_index"] == 0
 
     # Verify arguments are properly serialized as JSON string
@@ -1349,11 +1349,77 @@ def test_gemini_realtime_multi_tool_calls_have_unique_item_ids():
     assert len(responses) == 2
     assert responses[0]["response_id"] == "resp_123"
     assert responses[1]["response_id"] == "resp_123"
-    assert responses[0]["item_id"] == "item_123_tool_0"
-    assert responses[1]["item_id"] == "item_123_tool_1"
+    assert responses[0]["item_id"] == "item_call_1"
+    assert responses[1]["item_id"] == "item_call_2"
     assert responses[0]["item_id"] != responses[1]["item_id"]
     assert responses[0]["output_index"] == 0
     assert responses[1]["output_index"] == 1
+
+
+def test_gemini_tool_call_output_index_visible_to_shared_correlation_state():
+    """Tool-call items must be tracked through the shared realtime_correlation
+    module (not a disconnected local idx/item_id scheme). If a text item is
+    already open in the current response when a toolCall frame arrives for the
+    SAME response/output_item_id, the tool-call item must get the NEXT
+    output_index (1) from the shared correlation state, not collide with the
+    already-open text item's index (0) the way a disconnected local idx scheme
+    would."""
+    config = GeminiRealtimeConfig()
+    logging_obj = MagicMock()
+    logging_obj.litellm_trace_id = "test-trace-123"
+
+    text_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"modelTurn": {"parts": [{"text": "partial "}]}}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": None,
+            "current_response_id": None,
+            "current_conversation_id": None,
+            "current_delta_chunks": [],
+            "current_item_chunks": [],
+            "current_delta_type": None,
+        },
+    )
+    text_output_item_added = [
+        ev for ev in text_result["response"] if ev["type"] == "response.output_item.added"
+    ][0]
+    assert text_output_item_added["output_index"] == 0
+
+    # A toolCall frame arrives referencing the still-open response/output_item.
+    tool_result = config.transform_realtime_response(
+        json.dumps(
+            {
+                "toolCall": {
+                    "functionCalls": [
+                        {"id": "call_1", "name": "get_weather", "args": {"location": "SF"}},
+                    ]
+                }
+            }
+        ),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": text_result["current_output_item_id"],
+            "current_response_id": text_result["current_response_id"],
+            "current_conversation_id": text_result["current_conversation_id"],
+            "current_delta_chunks": text_result["current_delta_chunks"],
+            "current_item_chunks": text_result["current_item_chunks"],
+            "current_delta_type": text_result["current_delta_type"],
+        },
+    )
+
+    tool_output_item_added = [
+        ev for ev in tool_result["response"] if ev["type"] == "response.output_item.added"
+    ][0]
+    assert tool_output_item_added["output_index"] == 1
+
+    response_done = [ev for ev in tool_result["response"] if ev["type"] == "response.done"][0]
+    output_indices = {item["id"]: idx for idx, item in enumerate(response_done["response"]["output"])}
+    assert text_output_item_added["item"]["id"] in output_indices
+    assert tool_output_item_added["item"]["id"] in output_indices
 
 
 def test_gemini_session_update_includes_input_audio_transcription_default():

@@ -32,6 +32,7 @@ from litellm.types.llms.openai import (
     OpenAIRealtimeAudioDirectionConfig,
     OpenAIRealtimeAudioFormat,
     OpenAIRealtimeContentPartDone,
+    OpenAIRealtimeConversationItemAdded,
     OpenAIRealtimeDoneEvent,
     OpenAIRealtimeEvents,
     OpenAIRealtimeEventTypes,
@@ -57,6 +58,8 @@ from litellm.types.llms.vertex_ai import (
 )
 from litellm.litellm_core_utils.realtime_correlation import (
     RealtimeCorrelationState,
+    ToolCallRequest,
+    tool_call_events,
     track_content_index,
     track_output_index,
 )
@@ -1040,20 +1043,15 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         self._pending_usage_metadata = None
         return buffered
 
-    def transform_tool_call_events(
-        self,
-        tool_call_message: dict,
-        response_id: Optional[str] = None,
-        output_item_id: Optional[str] = None,
-    ) -> List[OpenAIRealtimeFunctionCallArgumentsDone]:
+    def _resolve_tool_call_requests(self, tool_call_message: dict) -> List[ToolCallRequest]:
+        """Resolve raw Gemini functionCalls into ToolCallRequest objects for the
+        shared realtime_correlation module, updating the call_id -> name LRU cache
+        used elsewhere (e.g. function_call_output routing) as a side effect."""
         function_calls = tool_call_message.get("functionCalls", [])
-        resolved_response_id = response_id or f"resp_{uuid.uuid4()}"
-        resolved_output_item_id = output_item_id or f"item_{uuid.uuid4()}"
-
         verbose_logger.debug(f"Gemini Realtime: Transforming {len(function_calls)} tool call(s) to OpenAI format")
 
-        events: List[OpenAIRealtimeFunctionCallArgumentsDone] = []
-        for idx, fc in enumerate(function_calls):
+        requests: List[ToolCallRequest] = []
+        for fc in function_calls:
             call_id = fc.get("id", "") or f"call_{uuid.uuid4().hex[:16]}"
             name = fc.get("name", "")
 
@@ -1063,20 +1061,15 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 while len(self._tool_call_id_to_name) > self._TOOL_CALL_ID_TO_NAME_MAX:
                     self._tool_call_id_to_name.popitem(last=False)
 
-            events.append(
-                OpenAIRealtimeFunctionCallArgumentsDone(
-                    type="response.function_call_arguments.done",
-                    event_id=f"event_{uuid.uuid4()}",
-                    response_id=resolved_response_id,
-                    item_id=f"{resolved_output_item_id}_tool_{idx}",
-                    output_index=idx,
+            requests.append(
+                ToolCallRequest(
                     call_id=call_id,
                     name=name,
                     arguments=json.dumps(fc.get("args", {})),
                 )
             )
 
-        return events
+        return requests
 
     @staticmethod
     def get_nested_value(obj: dict, path: str) -> Any:
@@ -1561,152 +1554,131 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
                 if current_response_id is None:
                     current_response_id = f"resp_{uuid.uuid4()}"
-                    current_output_item_id = f"item_{uuid.uuid4()}"
-                    returned_message.append(
-                        {
-                            "type": "response.created",
-                            "event_id": f"event_{uuid.uuid4()}",
-                            "response": {
-                                "object": "realtime.response",
-                                "id": current_response_id,
-                                "status": "in_progress",
-                                "status_details": None,
-                                "output": [],
-                                "conversation_id": current_conversation_id,
-                                "modalities": tool_call_modalities,
-                                "temperature": tool_call_generation_config.get("temperature"),
-                                "max_output_tokens": tool_call_generation_config.get("maxOutputTokens"),
-                            },
-                        }
-                    )
 
-                tool_call_events = self.transform_tool_call_events(
-                    value,
+                tool_call_requests = self._resolve_tool_call_requests(value)
+                # The shared lifecycle module only knows generic message-item shape
+                # (id/object/type/status/role/content); function_call-specific wire
+                # fields (call_id/name/arguments) aren't part of its contract and
+                # must be patched back in here, keyed by the same item_id scheme
+                # tool_call_events() uses internally (f"item_{call_id}").
+                request_by_item_id = {f"item_{req.call_id}": req for req in tool_call_requests}
+
+                def _patch_function_call_item(item: OpenAIRealtimeStreamResponseOutputItem) -> None:
+                    request = request_by_item_id.get(item.get("id", ""))
+                    if request is None:
+                        return
+                    item["call_id"] = request.call_id
+                    item["name"] = request.name
+                    item["arguments"] = request.arguments if item.get("status") == "completed" else ""
+                    item.pop("role", None)
+                    item.pop("content", None)
+
+                self._correlation_state, tool_events = tool_call_events(
+                    self._correlation_state,
                     response_id=current_response_id,
-                    output_item_id=current_output_item_id,
+                    conversation_id=current_conversation_id,
+                    calls=tool_call_requests,
                 )
-                for idx, tool_call in enumerate(tool_call_events):
-                    item_id = tool_call["item_id"]
-                    function_call_item: OpenAIRealtimeStreamResponseOutputItem = {
-                        "id": item_id,
-                        "object": "realtime.item",
-                        "type": "function_call",
-                        "status": "completed",
-                        "call_id": tool_call["call_id"],
-                        "name": tool_call["name"],
-                        "arguments": tool_call["arguments"],
-                    }
-                    returned_message.append(
-                        OpenAIRealtimeStreamResponseOutputItemAdded(
-                            type="response.output_item.added",
-                            event_id=f"event_{uuid.uuid4()}",
-                            response_id=current_response_id,
-                            output_index=idx,
-                            item={
-                                **function_call_item,
-                                "status": "in_progress",
-                                "arguments": "",
-                            },
-                        )
-                    )
-                    # conversation.item.added is required for Pipecat 1.3.x to
-                    # register the call_id into _pending_function_calls before
-                    # response.function_call_arguments.done fires.
-                    returned_message.append(
-                        cast(
-                            OpenAIRealtimeEvents,
-                            {
-                                "type": "conversation.item.added",
-                                "event_id": f"event_{uuid.uuid4()}",
-                                "previous_item_id": None,
-                                "item": {
-                                    **function_call_item,
-                                    "status": "in_progress",
-                                    "arguments": "",
-                                },
-                            },
-                        )
-                    )
-                    # Gemini delivers args in one shot; emit a single delta before .done
-                    # so clients that accumulate deltas get the full payload.
-                    returned_message.append(
-                        cast(
-                            OpenAIRealtimeEvents,
-                            {
-                                "type": "response.function_call_arguments.delta",
-                                "event_id": f"event_{uuid.uuid4()}",
-                                "response_id": current_response_id,
-                                "item_id": item_id,
-                                "output_index": idx,
-                                "call_id": tool_call["call_id"],
-                                "delta": tool_call["arguments"],
-                            },
-                        )
-                    )
-                    returned_message.append(tool_call)
-                    # Fresh copy — downstream handlers may mutate the item dict.
-                    returned_message.append(
-                        OpenAIRealtimeOutputItemDone(
-                            type="response.output_item.done",
-                            event_id=f"event_{uuid.uuid4()}",
-                            response_id=current_response_id,
-                            output_index=idx,
-                            item={**function_call_item},
-                        )
-                    )
 
-                resolved_tool_call_usage_metadata = self._consume_usage_metadata_for_response_done(json_message)
-                if resolved_tool_call_usage_metadata is not None:
-                    _tool_call_chat_completion_usage = VertexGeminiConfig._calculate_usage(
-                        completion_response=cast(
-                            BidiGenerateContentServerMessage,
-                            {
-                                **json_message,
-                                "usageMetadata": resolved_tool_call_usage_metadata,
-                            },
-                        ),
-                    )
-                else:
-                    _tool_call_chat_completion_usage = get_empty_usage()
-                tool_call_responses_api_usage = (
-                    LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
-                        _tool_call_chat_completion_usage,
-                    )
-                )
-                _tool_usage_dict = tool_call_responses_api_usage.model_dump()
-                self._add_pipecat_usage_detail_aliases(_tool_usage_dict)
-                tool_call_done_event = OpenAIRealtimeDoneEvent(
-                    type="response.done",
-                    event_id=f"event_{uuid.uuid4()}",
-                    response=OpenAIRealtimeResponseDoneObject(
-                        id=current_response_id,
-                        object="realtime.response",
-                        status="completed",
-                        status_details=None,  # type: ignore[typeddict-item]
-                        output=[
-                            {
-                                "id": te["item_id"],
-                                "object": "realtime.item",
-                                "type": "function_call",
-                                "status": "completed",
-                                "call_id": te["call_id"],
-                                "name": te["name"],
-                                "arguments": te["arguments"],
-                            }
-                            for te in tool_call_events
-                        ],
-                        conversation_id=current_conversation_id,
-                        modalities=tool_call_modalities,
-                        usage=_tool_usage_dict,
-                    ),
-                )
-                tool_call_temperature = tool_call_generation_config.get("temperature")
-                if tool_call_temperature is not None:
-                    tool_call_done_event["response"]["temperature"] = tool_call_temperature
-                tool_call_max_output_tokens = tool_call_generation_config.get("maxOutputTokens")
-                if tool_call_max_output_tokens is not None:
-                    tool_call_done_event["response"]["max_output_tokens"] = cast(int, tool_call_max_output_tokens)
-                returned_message.append(tool_call_done_event)
+                for tool_event in tool_events:
+                    if tool_event["type"] == "response.created":
+                        response_created_event = cast(OpenAIRealtimeStreamResponseBaseObject, tool_event)
+                        response_created_event["response"]["modalities"] = tool_call_modalities
+                        tool_call_created_temperature = tool_call_generation_config.get("temperature")
+                        if tool_call_created_temperature is not None:
+                            response_created_event["response"]["temperature"] = tool_call_created_temperature
+                        tool_call_created_max_output_tokens = tool_call_generation_config.get("maxOutputTokens")
+                        if tool_call_created_max_output_tokens is not None:
+                            response_created_event["response"]["max_output_tokens"] = cast(
+                                int, tool_call_created_max_output_tokens
+                            )
+                        returned_message.append(response_created_event)
+                    elif tool_event["type"] == "response.output_item.added":
+                        output_item_added_event = cast(OpenAIRealtimeStreamResponseOutputItemAdded, tool_event)
+                        _patch_function_call_item(output_item_added_event["item"])
+                        returned_message.append(output_item_added_event)
+                    elif tool_event["type"] == "response.output_item.done":
+                        output_item_done_event = cast(OpenAIRealtimeOutputItemDone, tool_event)
+                        _patch_function_call_item(output_item_done_event["item"])
+                        returned_message.append(output_item_done_event)
+                    elif tool_event["type"] == "conversation.item.added":
+                        # conversation.item.added is required for Pipecat 1.3.x to
+                        # register the call_id into _pending_function_calls before
+                        # response.function_call_arguments.done fires — already
+                        # emitted by open_item() for every item, just needs patching.
+                        conversation_item_added_event = cast(OpenAIRealtimeConversationItemAdded, tool_event)
+                        conversation_added_item = conversation_item_added_event.get("item")
+                        assert conversation_added_item is not None
+                        _patch_function_call_item(conversation_added_item)
+                        returned_message.append(conversation_item_added_event)
+                    elif tool_event["type"] == "response.function_call_arguments.done":
+                        function_call_done_event = cast(OpenAIRealtimeFunctionCallArgumentsDone, tool_event)
+                        # Gemini delivers args in one shot; emit a single delta before
+                        # .done so clients that accumulate deltas get the full payload.
+                        returned_message.append(
+                            cast(
+                                OpenAIRealtimeEvents,
+                                {
+                                    "type": "response.function_call_arguments.delta",
+                                    "event_id": f"event_{uuid.uuid4()}",
+                                    "response_id": function_call_done_event["response_id"],
+                                    "item_id": function_call_done_event["item_id"],
+                                    "output_index": function_call_done_event["output_index"],
+                                    "call_id": function_call_done_event["call_id"],
+                                    "delta": function_call_done_event["arguments"],
+                                },
+                            )
+                        )
+                        returned_message.append(function_call_done_event)
+                    elif tool_event["type"] == "response.content_part.done":
+                        # function_call items never open a content part in the shared
+                        # module, so this never actually fires for tool calls; skip
+                        # defensively rather than forward an unexpected event type.
+                        continue
+                    elif tool_event["type"] == "response.done":
+                        response_done_event = cast(OpenAIRealtimeDoneEvent, tool_event)
+                        for output_item in response_done_event["response"].get("output", []):
+                            _patch_function_call_item(output_item)
+                        resolved_tool_call_usage_metadata = self._consume_usage_metadata_for_response_done(
+                            json_message
+                        )
+                        if resolved_tool_call_usage_metadata is not None:
+                            _tool_call_chat_completion_usage = VertexGeminiConfig._calculate_usage(
+                                completion_response=cast(
+                                    BidiGenerateContentServerMessage,
+                                    {
+                                        **json_message,
+                                        "usageMetadata": resolved_tool_call_usage_metadata,
+                                    },
+                                ),
+                            )
+                        else:
+                            _tool_call_chat_completion_usage = get_empty_usage()
+                        tool_call_responses_api_usage = (
+                            LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+                                _tool_call_chat_completion_usage,
+                            )
+                        )
+                        _tool_usage_dict = tool_call_responses_api_usage.model_dump()
+                        self._add_pipecat_usage_detail_aliases(_tool_usage_dict)
+                        response_done_event["response"]["usage"] = _tool_usage_dict
+                        response_done_event["response"]["modalities"] = tool_call_modalities
+                        tool_call_temperature = tool_call_generation_config.get("temperature")
+                        if tool_call_temperature is not None:
+                            response_done_event["response"]["temperature"] = tool_call_temperature
+                        tool_call_max_output_tokens = tool_call_generation_config.get("maxOutputTokens")
+                        if tool_call_max_output_tokens is not None:
+                            response_done_event["response"]["max_output_tokens"] = cast(
+                                int, tool_call_max_output_tokens
+                            )
+                        returned_message.append(response_done_event)
+                    else:
+                        # tool_call_events() never emits SpeechStartedEvent (the only
+                        # other CorrelationEvent member) — it has no cancel_response()
+                        # call in its implementation — so every remaining event here
+                        # is a plain OpenAIRealtimeEvents member handled above by type.
+                        returned_message.append(cast(OpenAIRealtimeEvents, tool_event))
+
                 current_output_item_id = None
                 current_response_id = None
             elif openai_event == OpenAIRealtimeEventTypes.RESPONSE_DONE:
