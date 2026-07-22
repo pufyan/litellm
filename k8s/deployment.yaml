@@ -81,11 +81,14 @@ spec:
           subPath: config.yaml
           readOnly: true
         resources:
+          # На ноде 4 CPU, из них ~3.5 уже разобраны другими сервисами, поэтому
+          # запрос держим у реального потребления в простое, а не у пиковой нагрузки:
+          # прокси почти всё время ждёт ответа провайдера, а не считает.
           requests:
-            cpu: 500m
-            memory: 2Gi
+            cpu: 200m
+            memory: 1Gi
           limits:
-            memory: 8Gi
+            memory: 4Gi
         startupProbe:
           # Первый старт выполняет prisma migrate deploy на пустой базе, поэтому
           # запас по времени большой: 5 с × 60 = до 5 минут до первой liveness-проверки.
