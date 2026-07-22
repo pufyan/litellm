@@ -613,6 +613,86 @@ class TestBedrockRealtimeResponseTransformation:
         args = json.loads(function_call["arguments"])
         assert args["location"] == "San Francisco"
 
+    def test_tool_use_item_is_recorded_for_response_done_output(self):
+        """toolUse must contribute a function_call item to response.done.output,
+        same as text/audio items already do via transform_content_end_event —
+        regression for the case where response.done.output silently dropped
+        tool calls because transform_tool_use_event never touched
+        current_item_chunks."""
+        config = BedrockRealtimeConfig()
+        logging_obj = MagicMock()
+        logging_obj.litellm_trace_id = "trace_123"
+
+        # Text item already open in the response (contentStart -> textOutput),
+        # then a toolUse arrives referencing the SAME still-open output item,
+        # then contentEnd/END_TURN closes the whole response.
+        content_start = config.transform_realtime_response(
+            json.dumps({"event": {"contentStart": {"role": "ASSISTANT", "type": "TEXT"}}}),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": None,
+                "current_response_id": None,
+                "current_conversation_id": None,
+                "current_delta_chunks": [],
+                "current_item_chunks": [],
+                "current_delta_type": None,
+            },
+        )
+
+        tool_use_message = {
+            "event": {
+                "toolUse": {
+                    "toolUseId": "tool_call_123",
+                    "toolName": "get_weather",
+                    "input": json.dumps({"location": "San Francisco"}),
+                }
+            }
+        }
+        tool_result = config.transform_realtime_response(
+            json.dumps(tool_use_message),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": content_start["current_output_item_id"],
+                "current_response_id": content_start["current_response_id"],
+                "current_conversation_id": content_start["current_conversation_id"],
+                "current_delta_chunks": content_start["current_delta_chunks"],
+                "current_item_chunks": content_start["current_item_chunks"],
+                "current_delta_type": content_start["current_delta_type"],
+            },
+        )
+
+        function_call_event = [
+            msg for msg in tool_result["response"] if msg["type"] == "response.function_call_arguments.done"
+        ][0]
+        assert function_call_event["output_index"] == 0
+
+        content_end_message = {"event": {"contentEnd": {"stopReason": "END_TURN", "type": "TEXT"}}}
+        final_result = config.transform_realtime_response(
+            json.dumps(content_end_message),
+            "amazon.nova-sonic-v1:0",
+            logging_obj,
+            realtime_response_transform_input={
+                "session_configuration_request": json.dumps({"configured": True}),
+                "current_output_item_id": tool_result["current_output_item_id"],
+                "current_response_id": tool_result["current_response_id"],
+                "current_conversation_id": tool_result["current_conversation_id"],
+                "current_delta_chunks": tool_result["current_delta_chunks"],
+                "current_item_chunks": tool_result["current_item_chunks"],
+                "current_delta_type": tool_result["current_delta_type"],
+            },
+        )
+
+        response_done = [msg for msg in final_result["response"] if msg["type"] == "response.done"][0]
+        output = response_done["response"]["output"]
+        function_call_items = [item for item in output if item.get("type") == "function_call"]
+        assert len(function_call_items) == 1
+        assert function_call_items[0]["call_id"] == "tool_call_123"
+        assert function_call_items[0]["name"] == "get_weather"
+
     def test_transform_content_end_text(self):
         """Test contentEnd for text response"""
         config = BedrockRealtimeConfig()

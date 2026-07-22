@@ -145,9 +145,10 @@ Bedrock Nova Sonic is the least complete: it ignores `turn_detection` and `input
 
 | Family | Providers | Mapping code |
 |---|---|---|
-| OpenAI-compatible | `openai`, `azure`, `xai` | `litellm/litellm_core_utils/realtime_streaming.py` (`_remap_beta_session_to_ga`) plus per-provider event normalizers |
+| OpenAI-compatible | `openai`, `azure`, `xai` | `litellm/litellm_core_utils/realtime_streaming.py` (`_remap_beta_session_to_ga`) plus per-provider event normalizers (e.g. `litellm/llms/xai/realtime/transformation.py`, `XAIRealtimeNormalizer`) |
 | Gemini | `gemini`, `vertex_ai` | `litellm/llms/gemini/realtime/transformation.py` (Vertex extends `GeminiRealtimeConfig`) |
 | Bedrock | `bedrock` | `litellm/llms/bedrock/realtime/transformation.py` |
+| Shared outbound correlation | `xai`, `gemini`/`vertex_ai`, `bedrock` | `litellm/litellm_core_utils/realtime_correlation/` — the `(response_id, item_id, output_index, content_index)` index/lifecycle machinery all three call into so they don't each reimplement it (and diverge) independently. See its own README for the full event-by-event contract. Not used by `openai`/`azure`, which need no reconstruction (see "Server events" below). |
 
 When you add a provider or a new canonical field, the rule is to extend the mapping inside the provider implementation (or the shared remap for OpenAI-compatible backends), never to push provider-specific shapes onto clients.
 
@@ -166,7 +167,16 @@ How each provider family honors this:
 - Gemini / Vertex AI: full re-synthesis. Canonical events are constructed from scratch out of Gemini Live frames (`setupComplete` becomes `session.created`, `usageMetadata` becomes canonical usage, model path prefixes are stripped, modalities are lowercased). Unknown native frames are dropped, so nothing Gemini-shaped can leak.
 - Bedrock Nova Sonic: full re-synthesis from Nova Sonic events; unknown events are dropped.
 - OpenAI / Azure: the backend already speaks the canonical format; events pass through, with GA-to-beta event-name translation only for clients that connected with the beta header.
-- xAI: passthrough with a targeted normalizer (rewrites `role: "tool"` to `"assistant"` on function-call items, injects missing indices, normalizes usage) plus a structural event-type allowlist: any event whose type is outside the canonical GA server-event vocabulary (derived from the openai SDK, ~46 types) is dropped, so unknown provider-native events cannot leak by construction. Payload-level deviations inside known event types still rely on the targeted fixes; treat any xAI-shaped surprise there as a bug in `XAIRealtimeNormalizer`.
+- xAI: passthrough with a targeted normalizer (rewrites `role: "tool"` to `"assistant"` on function-call items, injects missing indices via the shared correlation tracker described below, normalizes usage) plus a structural event-type allowlist: any event whose type is outside the canonical GA server-event vocabulary (derived from the openai SDK, ~46 types) is dropped, so unknown provider-native events cannot leak by construction. Payload-level deviations inside known event types still rely on the targeted fixes; treat any xAI-shaped surprise there as a bug in `XAIRealtimeNormalizer`.
+
+### Correlation keys and `response.done.output` completeness
+
+Every streaming event carries a `(response_id, item_id, output_index, content_index)` correlation key so a client can tell which phrase/item a delta or "done" signal belongs to — this matters most during barge-in, when an old response may not be fully closed yet while a new one starts. xAI, Gemini/Vertex, and Bedrock all build this key through the shared `litellm/litellm_core_utils/realtime_correlation/` module instead of each computing it independently (previously a source of provider-specific bugs — hardcoded `output_index=0`, and `response.done.output` silently empty or missing barge-in items). Guarantees that hold for all three:
+
+- `output_index` / `content_index` are real, monotonically increasing values scoped to their response/item, never a hardcoded constant.
+- `response.done.output` always contains every item the response ever opened, each with a `completed` or `incomplete` status — an item interrupted mid-phrase by barge-in still appears (as `incomplete`), it does not silently disappear.
+- Depth of integration differs slightly per provider: Gemini's tool-call path builds its whole event sequence through the shared module's `tool_call_events()`; xAI and Bedrock's tool-call paths use only the module's index tracking, not full event construction. See `litellm/litellm_core_utils/realtime_correlation/README.md` for the exact per-provider breakdown and the full event-by-event contract.
+- OpenAI / Azure need none of this — the backend already emits correct indices and a complete `response.done.output`, so there is no reconstruction layer for this family at all.
 
 Capability discovery: these differences are machine-readable. Realtime models in the registry (`model_prices_and_context_window.json`) carry `supports_native_transcription`, `supports_turn_detection` and `supports_sampling_params`; clients can query them via `/model/info` before opening a session, and code can use `litellm.supports_native_transcription(model)` / `litellm.supports_turn_detection(model)`. Consult these instead of discovering capabilities by observing which events arrive.
 

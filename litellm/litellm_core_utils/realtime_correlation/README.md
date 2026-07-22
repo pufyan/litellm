@@ -224,9 +224,68 @@ response.done                        (output=[{id:item_1, status:incomplete, ...
   (`realtime_schema_normalization.py`).
 - **Не занимается session resumption / reconnect** — отдельная подсистема
   (`RealtimeBackendConnector`).
-- **Пока не подключён ни к одному провайдеру.** На момент написания это
-  standalone-модуль с полным тестовым покрытием; миграция xAI → Gemini/Vertex →
-  Bedrock на него — отдельная работа, ещё не выполненная.
+- **Не навязывает единственный способ интеграции для tool calls.** Полная
+  последовательность событий из раздела 8 (`tool_call_events`) используется
+  целиком только у Gemini — она предполагает, что один tool call = один
+  самостоятельный logical turn. Это не универсально: у Bedrock `toolUse`
+  структурно приходит внутри уже открытого content-цикла, поэтому его
+  tool-call путь осознанно переиспользует модуль только частично (индексация
+  через `track_output_index`, без `open_item`/`close_item`/`close_response`).
+  Это архитектурное решение под конкретный протокол провайдера, не
+  недоделанная миграция — см. ниже "Кто на что реально мигрирован".
+
+## Кто на что реально мигрирован
+
+Все три провайдера (кроме OpenAI/Azure, которым это не нужно — см. ниже) уже
+подключены к модулю, но с разной глубиной интеграции:
+
+- **xAI** (`litellm/llms/xai/realtime/transformation.py`,
+  `XAIRealtimeNormalizer`) — использует только query-функции
+  `track_output_index`/`track_content_index` для инъекции пропущенных индексов
+  в уже готовые события бэкенда (xAI structurally OpenAI-compatible, событий
+  сам не строит). Нормализатор владеет своим `self._correlation_state` сам
+  (не получает его параметром снаружи). Отдельного tool-call пути нет — xAI не
+  выделяет tool calls в отдельный поток обработки, они идут через тот же
+  passthrough + normalize.
+- **Gemini/Vertex** (`litellm/llms/gemini/realtime/transformation.py`,
+  `GeminiRealtimeConfig`) — самая полная интеграция. Обычный text/audio-путь
+  использует `track_output_index`/`track_content_index`; tool-call путь
+  использует полноценную `tool_call_events()` (раздел 8), которая сама строит
+  `response.created`/`response.output_item.added`/
+  `response.function_call_arguments.done`/`response.output_item.done`/
+  `response.done` — Gemini лишь патчит обратно `call_id`/`name`/`arguments` на
+  уже построенные события (эти поля вне контракта generic item-shape модуля).
+- **Bedrock** (`litellm/llms/bedrock/realtime/transformation.py`,
+  `BedrockRealtimeConfig`) — обычный text/audio-путь использует
+  `track_output_index`/`track_content_index` так же, как Gemini/xAI.
+  **Tool-call путь — сознательно НЕ через `tool_call_events()`, но полностью
+  учтён.** Структурная причина: у Bedrock `toolUse` приходит внутри уже
+  открытого `contentStart`/`contentEnd` content-цикла (тот же
+  `output_item_id`, что у text/audio), а `response.done` строится позже,
+  отдельным `contentEnd`/`END_TURN`-событием — `tool_call_events()` не
+  подходит напрямую, потому что она сама закрывает весь response
+  (`close_response()`) за один вызов, а Bedrock response должен остаться
+  открытым до END_TURN. Более того, `open_item`/`close_item` тоже не
+  используются для регистрации самого tool-call item: `open_item` безусловно
+  добавляет новый `OpenItem` даже при повторном `item_id` (не idempotent, в
+  отличие от `track_output_index`), а `close_item` сохраняет `item_type`
+  уже открытого item — если тот же `output_item_id` был открыт как
+  `"message"` предшествующим text/audio `contentStart`, `close_item` дал бы
+  `type: "message"` в `response.done.output` для tool-call turn вместо
+  `"function_call"`. Поэтому `transform_tool_use_event` берёт `output_index`
+  через `track_output_index` (не трогая `open_items`/`closed_items` в
+  `self._correlation_state` вообще для tool calls) и вручную добавляет
+  корректно типизированный `function_call` item в `current_item_chunks` —
+  тот же паттерн, которым `transform_content_end_event` уже накапливает
+  text/audio items. Итог для клиента: `response.done.output` полон и
+  единообразен (правильный `type` на каждом item, независимо от того,
+  tool call это или текст/аудио), даже если внутренний механизм получения
+  этого результата не идентичен Gemini дословно.
+- **OpenAI/Azure** — не используют модуль и не должны. У них нет
+  transform-слоя вообще (raw passthrough): backend уже присылает корректные
+  `output_index`/`content_index`/`response.done.output`, пересобирать их
+  заново не нужно и негде — класс бага, который чинил этот модуль, там
+  структурно не может существовать.
 
 ## История и мотивация (кратко)
 

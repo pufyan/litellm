@@ -1069,7 +1069,8 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
         event: dict,
         current_output_item_id: Optional[str],
         current_response_id: Optional[str],
-    ) -> tuple[List[OpenAIRealtimeEvents], str, str]:
+        current_item_chunks: Optional[List[OpenAIRealtimeOutputItemDone]],
+    ) -> tuple[List[OpenAIRealtimeEvents], str, str, Optional[List[OpenAIRealtimeOutputItemDone]]]:
         """
         Transform Bedrock toolUse event to OpenAI format.
 
@@ -1077,15 +1078,16 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
             event: Bedrock toolUse event
             current_output_item_id: Current output item ID
             current_response_id: Current response ID
+            current_item_chunks: Output items completed so far in this response
 
         Returns:
-            Tuple of (events, tool_call_id, tool_name) for tracking
+            Tuple of (events, tool_call_id, tool_name, updated_item_chunks) for tracking
         """
         verbose_logger.debug("Handling toolUse")
         tool_use = event["toolUse"]
 
         if not current_output_item_id or not current_response_id:
-            return [], "", ""
+            return [], "", "", current_item_chunks
 
         # Parse the tool input
         tool_input = {}
@@ -1098,9 +1100,17 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
         tool_call_id = tool_use.get("toolUseId", "")
         tool_name = tool_use.get("toolName", "")
 
+        # Index bookkeeping only: current_output_item_id may already be open as
+        # a "message" item from a preceding contentStart (Bedrock can mix text/
+        # audio and a tool call within the same content cycle) — open_item/
+        # close_item aren't used here since they'd overwrite that item_type in
+        # the shared state, and this event's own response.done still comes
+        # later via the existing contentEnd/END_TURN path, not from here.
         self._correlation_state, output_index = track_output_index(
             self._correlation_state, current_response_id, current_output_item_id
         )
+
+        arguments_json = json.dumps(tool_input)
 
         # Create a function call arguments done event
         # This is a custom event format that matches what clients expect
@@ -1114,13 +1124,35 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
             "output_index": output_index,
             "call_id": tool_call_id,
             "name": tool_name,
-            "arguments": json.dumps(tool_input),
+            "arguments": arguments_json,
         }
+
+        # Record the function_call item for response.done.output the same way
+        # transform_content_end_event already does for text/audio items — kept
+        # separate from the shared module's open_item/closed_items bookkeeping
+        # (see comment above) to preserve the correct item.type on the wire.
+        function_call_item_done = OpenAIRealtimeOutputItemDone(
+            type="response.output_item.done",
+            event_id=f"event_{uuid.uuid4()}",
+            response_id=current_response_id,
+            output_index=output_index,
+            item={
+                "id": current_output_item_id,
+                "object": "realtime.item",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": tool_call_id,
+                "name": tool_name,
+                "arguments": arguments_json,
+            },
+        )
+        updated_item_chunks = (current_item_chunks or []) + [function_call_item_done]
 
         return (
             [cast(OpenAIRealtimeEvents, function_call_event)],
             tool_call_id,
             tool_name,
+            updated_item_chunks,
         )
 
     def transform_conversation_item_create_tool_result_event(self, json_message: dict) -> List[str]:
@@ -1292,8 +1324,8 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
                 returned_messages.extend(done_events)
 
         elif "toolUse" in event:
-            events, tool_call_id, tool_name = self.transform_tool_use_event(
-                event, current_output_item_id, current_response_id
+            events, tool_call_id, tool_name, current_item_chunks = self.transform_tool_use_event(
+                event, current_output_item_id, current_response_id, current_item_chunks
             )
             returned_messages.extend(events)
             # Store tool call info for potential use
