@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: production
+  labels:
+    app: litellm
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "4000"
+        # Со слэшем: прокси монтирует ASGI-приложение метрик как Mount,
+        # и запрос к /metrics отвечает 307 на /metrics/.
+        prometheus.io/path: "/metrics/"
+    spec:
+      # Через прокси идут realtime WebSocket сессии длиной в телефонный разговор.
+      # При выкатке под должен дожить активные звонки, а не оборвать их: старый под
+      # перестаёт принимать новые соединения (maxUnavailable: 0 поднимает новый заранее)
+      # и получает 5 минут на завершение текущих.
+      terminationGracePeriodSeconds: 300
+      containers:
+      - name: litellm
+        image: git.aitomaton.online/aitomaton/litellm:latest
+        imagePullPolicy: Always
+        args:
+        - "--config"
+        - "/app/config.yaml"
+        - "--port"
+        - "4000"
+        - "--num_workers"
+        - "1"
+        - "--use_v2_migration_resolver"
+        ports:
+        - containerPort: 4000
+          name: http
+          protocol: TCP
+        lifecycle:
+          preStop:
+            # Сразу выводит под из балансировки (liveliness/readiness начинают отдавать 503)
+            # и ждёт дренажа HTTP-запросов, не обрывая уже открытые realtime сессии.
+            # exec, а не httpGet: подстановка $(VAR) работает только в command/args/env,
+            # в httpHeaders значение осталось бы литералом. curl в wolfi-base нет, python3 есть.
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - |
+                python3 -c "
+                import os, urllib.request
+                req = urllib.request.Request('http://127.0.0.1:4000/health/drain',
+                                             headers={'X-Drain-Token': os.environ.get('DRAIN_ENDPOINT_TOKEN', '')})
+                try:
+                    print(urllib.request.urlopen(req, timeout=60).read().decode())
+                except Exception as e:
+                    print('drain failed:', e)
+                "
+        envFrom:
+        - secretRef:
+            name: litellm-secrets
+        - configMapRef:
+            name: litellm-env
+        volumeMounts:
+        - name: config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+          readOnly: true
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            memory: 8Gi
+        startupProbe:
+          # Первый старт выполняет prisma migrate deploy на пустой базе, поэтому
+          # запас по времени большой: 5 с × 60 = до 5 минут до первой liveness-проверки.
+          httpGet:
+            path: /health/liveliness
+            port: 4000
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          httpGet:
+            path: /health/liveliness
+            port: 4000
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/readiness
+            port: 4000
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      volumes:
+      - name: config
+        configMap:
+          name: litellm-config
+      imagePullSecrets:
+      - name: gitea-registry-secret

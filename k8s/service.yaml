@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: production
+  labels:
+    app: litellm
+spec:
+  type: ClusterIP
+  # Статический ClusterIP: Admin UI открывается из WireGuard VPN по фиксированному
+  # адресу http://10.43.100.100:4000/ui/ (Service CIDR 10.43.0.0/16 маршрутизируется
+  # internal-клиентам VPN). Без закрепления адрес менялся бы при пересоздании Service.
+  clusterIP: 10.43.100.100
+  ports:
+  - port: 4000
+    targetPort: 4000
+    protocol: TCP
+    name: http
+  selector:
+    app: litellm

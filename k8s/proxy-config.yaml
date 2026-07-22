@@ -1,0 +1,69 @@
+# Статическая конфигурация LiteLLM proxy (production).
+#
+# Разделение ответственности:
+#   - этот файл (ConfigMap litellm-config)  — поведение прокси: лимиты, ретеншн, логи, роутинг;
+#   - PostgreSQL (litellm_db)               — модели, виртуальные ключи, команды, бюджеты и лимиты.
+#     Их заводят через Admin UI, а не коммитом сюда (store_model_in_db: true).
+#
+# Изменения этого файла применяются деплоем: workflow пересоздаёт ConfigMap и рестартует Deployment.
+
+model_list: []
+
+general_settings:
+  # Модели, ключи и лимиты живут в БД и редактируются через UI.
+  store_model_in_db: true
+  store_prompts_in_spend_logs: false
+
+  # Ретеншн журнала трат. PVC PostgreSQL — общие 20 Gi на всю инфраструктуру,
+  # а голосовой трафик пишет строку на каждый запрос, поэтому чистим ежедневно.
+  maximum_spend_logs_retention_period: "30d"
+  maximum_spend_logs_retention_interval: "1d"
+
+  # Пул соединений к PostgreSQL. Прокси делит базу с остальными сервисами кластера.
+  database_connection_pool_limit: 20
+
+  # Батчинг записи трат: снижает нагрузку на БД при потоке realtime-событий.
+  proxy_batch_write_at: 60
+
+  # При недоступности БД запросы отклоняются — иначе виртуальные ключи перестают
+  # проверяться, и прокси на время аварии становится открытым.
+  allow_requests_on_db_unavailable: false
+
+  # Эндпоинт /health/drain, который вызывает preStop-хук пода: помечает воркер
+  # как выключающийся, после чего /health/liveliness и /health/readiness отдают 503
+  # и под сразу уходит из балансировки, не набирая новых соединений.
+  # Токен приходит из env DRAIN_ENDPOINT_TOKEN (см. litellm-secrets), поэтому
+  # секрета в этом файле нет.
+  # Важно: счётчик in-flight считает только HTTP-запросы
+  # (litellm/proxy/middleware/in_flight_requests_middleware.py:37 — scope["type"] != "http"
+  # проходит мимо счётчика), поэтому активные realtime WebSocket сессии этот дренаж
+  # НЕ ждёт. Их доживание обеспечивает terminationGracePeriodSeconds пода.
+  enable_drain_endpoint: true
+
+litellm_settings:
+  # Провайдеры отличаются набором поддерживаемых параметров; неподдерживаемые
+  # отбрасываем вместо падения запроса.
+  drop_params: true
+
+  num_retries: 2
+  request_timeout: 600
+
+  # Структурированные логи — их забирает Loki.
+  json_logs: true
+
+  # Тела запросов и ответов в логи не пишем: через прокси идут транскрипты
+  # телефонных разговоров, это персональные данные.
+  turn_off_message_logging: true
+
+  # Метрики для Prometheus на /metrics.
+  callbacks: ["prometheus"]
+
+  # По умолчанию /metrics закрыт авторизацией (litellm/proxy/middleware/prometheus_auth_middleware.py:42),
+  # и скрейпер получал бы 401. Сервис живёт на ClusterIP без Ingress, снаружи кластера
+  # эндпоинт недоступен, поэтому авторизацию для него снимаем.
+  require_auth_for_metrics_endpoint: false
+
+router_settings:
+  routing_strategy: simple-shuffle
+  allowed_fails: 3
+  cooldown_time: 30

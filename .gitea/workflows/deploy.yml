@@ -1,0 +1,134 @@
+name: Build and Deploy LiteLLM
+
+on:
+  push:
+    branches: [ master ]
+    paths-ignore:
+    - '**.md'
+    - 'docs/**'
+    - 'tests/**'
+    - 'cookbook/**'
+    - '.github/**'
+    - 'ui/litellm-dashboard/**.test.*'
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: https://${{ secrets.DOCKER_USERNAME }}:${{ secrets.REPO_TOKEN }}@git.aitomaton.online/aitomaton/checkout@v4
+      with:
+        # Репозиторий ~1 ГБ; полная история для сборки не нужна.
+        fetch-depth: 1
+
+    - name: Log in to Gitea Registry
+      run: |
+        echo "${{ secrets.REGISTRY_TOKEN }}" | docker login git.aitomaton.online \
+          --username "${{ secrets.DOCKER_USERNAME }}" \
+          --password-stdin
+
+    - name: Build and push Docker image
+      env:
+        # Корневой Dockerfile использует syntax=docker/dockerfile:1.7 и --mount=type=cache
+        # (кэш npm/uv между сборками), поэтому нужен BuildKit — встроенный в docker build,
+        # никаких сторонних сборщиков. Проверено на runner-хосте: Docker 20.10.24 его поддерживает.
+        DOCKER_BUILDKIT: "1"
+      run: |
+        IMAGE=git.aitomaton.online/${{ gitea.repository_owner }}/litellm
+        docker build -t $IMAGE:${{ gitea.sha }} -t $IMAGE:latest .
+        docker push $IMAGE:${{ gitea.sha }}
+        docker push $IMAGE:latest
+
+    - name: Cache kubectl binary
+      uses: https://${{ secrets.DOCKER_USERNAME }}:${{ secrets.REPO_TOKEN }}@git.aitomaton.online/aitomaton/cache@v4
+      id: kubectl-cache
+      with:
+        path: /tmp/kubectl-bin
+        key: kubectl-${{ runner.os }}-v1.34.1
+
+    - name: Download kubectl
+      if: steps.kubectl-cache.outputs.cache-hit != 'true'
+      run: |
+        mkdir -p /tmp/kubectl-bin
+        curl -LO "https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        mv kubectl /tmp/kubectl-bin/kubectl
+
+    - name: Setup kubectl
+      run: |
+        sudo cp /tmp/kubectl-bin/kubectl /usr/local/bin/kubectl
+        kubectl version --client
+
+    - name: Configure kubectl
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBECONFIG_CONTENT }}" > ~/.kube/config
+        chmod 600 ~/.kube/config
+
+    - name: Create/Update runtime Secret
+      env:
+        DATABASE_URL: ${{ secrets.LITELLM_DATABASE_URL }}
+        LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+        LITELLM_SALT_KEY: ${{ secrets.LITELLM_SALT_KEY }}
+        UI_PASSWORD: ${{ secrets.LITELLM_UI_PASSWORD }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_LIVE_API_KEY }}
+        DRAIN_ENDPOINT_TOKEN: ${{ secrets.LITELLM_DRAIN_TOKEN }}
+        UI_USERNAME: ${{ vars.LITELLM_UI_USERNAME || 'admin' }}
+      run: |
+        kubectl -n production create secret generic litellm-secrets \
+          --from-literal=DATABASE_URL="$DATABASE_URL" \
+          --from-literal=LITELLM_MASTER_KEY="$LITELLM_MASTER_KEY" \
+          --from-literal=LITELLM_SALT_KEY="$LITELLM_SALT_KEY" \
+          --from-literal=UI_USERNAME="$UI_USERNAME" \
+          --from-literal=UI_PASSWORD="$UI_PASSWORD" \
+          --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
+          --from-literal=DRAIN_ENDPOINT_TOKEN="$DRAIN_ENDPOINT_TOKEN" \
+          --dry-run=client -o yaml | kubectl -n production apply -f -
+
+    - name: Create/Update env ConfigMap
+      env:
+        STORE_MODEL_IN_DB: ${{ vars.LITELLM_STORE_MODEL_IN_DB || 'True' }}
+        LITELLM_LOG: ${{ vars.LITELLM_LOG_LEVEL || 'INFO' }}
+        REDIS_HOST: ${{ vars.LITELLM_REDIS_HOST || 'redis.infra.svc.cluster.local' }}
+        REDIS_PORT: ${{ vars.LITELLM_REDIS_PORT || '6379' }}
+        GRACEFUL_SHUTDOWN_TIMEOUT: ${{ vars.LITELLM_GRACEFUL_SHUTDOWN_TIMEOUT || '30' }}
+      run: |
+        kubectl -n production create configmap litellm-env \
+          --from-literal=STORE_MODEL_IN_DB="$STORE_MODEL_IN_DB" \
+          --from-literal=LITELLM_LOG="$LITELLM_LOG" \
+          --from-literal=REDIS_HOST="$REDIS_HOST" \
+          --from-literal=REDIS_PORT="$REDIS_PORT" \
+          --from-literal=GRACEFUL_SHUTDOWN_TIMEOUT="$GRACEFUL_SHUTDOWN_TIMEOUT" \
+          --dry-run=client -o yaml | kubectl -n production apply -f -
+
+    - name: Create/Update proxy config ConfigMap
+      run: |
+        kubectl -n production create configmap litellm-config \
+          --from-file=config.yaml=k8s/config.yaml \
+          --dry-run=client -o yaml | kubectl -n production apply -f -
+
+    - name: Deploy to k8s
+      run: |
+        kubectl -n production apply -f k8s/service.yaml
+        kubectl -n production apply -f k8s/deployment.yaml
+        # Иммутабельный тег вместо latest: даёт воспроизводимый откат
+        # (kubectl rollout undo) и сам по себе триггерит выкатку.
+        kubectl -n production set image deployment/litellm \
+          litellm=git.aitomaton.online/${{ gitea.repository_owner }}/litellm:${{ gitea.sha }}
+        kubectl -n production rollout status deployment/litellm --timeout=10m
+
+    - name: Show deployment status
+      run: |
+        echo "=== Deployment ==="
+        kubectl -n production get deployment litellm -o wide
+        echo "=== Pods ==="
+        kubectl -n production get pods -l app=litellm -o wide
+        echo "=== Service ==="
+        kubectl -n production get svc litellm
+        echo "=== Logs ==="
+        kubectl -n production logs -l app=litellm --tail=50 || true
+        echo "=== Endpoints ==="
+        echo "API (внутри кластера): http://litellm.production.svc.cluster.local:4000"
+        echo "Realtime:              ws://litellm.production.svc.cluster.local:4000/v1/realtime?model=<model>"
+        echo "Admin UI (через VPN):  http://10.43.100.100:4000/ui/"
