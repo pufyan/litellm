@@ -93,6 +93,10 @@ jobs:
         REDIS_HOST: ${{ vars.LITELLM_REDIS_HOST || 'redis.infra.svc.cluster.local' }}
         REDIS_PORT: ${{ vars.LITELLM_REDIS_PORT || '6379' }}
         GRACEFUL_SHUTDOWN_TIMEOUT: ${{ vars.LITELLM_GRACEFUL_SHUTDOWN_TIMEOUT || '30' }}
+        # Сколько активные realtime-сессии доживают после SIGTERM. Должно оставаться
+        # заметно меньше terminationGracePeriodSeconds пода (480), иначе SIGKILL
+        # прилетит посреди дренажа.
+        WS_DRAIN_TIMEOUT: ${{ vars.LITELLM_WS_DRAIN_TIMEOUT || '420' }}
       run: |
         kubectl -n production create configmap litellm-env \
           --from-literal=STORE_MODEL_IN_DB="$STORE_MODEL_IN_DB" \
@@ -100,12 +104,18 @@ jobs:
           --from-literal=REDIS_HOST="$REDIS_HOST" \
           --from-literal=REDIS_PORT="$REDIS_PORT" \
           --from-literal=GRACEFUL_SHUTDOWN_TIMEOUT="$GRACEFUL_SHUTDOWN_TIMEOUT" \
+          --from-literal=WS_DRAIN_TIMEOUT="$WS_DRAIN_TIMEOUT" \
+          --from-literal=LITELLM_MODE="PRODUCTION" \
+          --from-literal=LITELLM_LOCAL_MODEL_COST_MAP="True" \
           --dry-run=client -o yaml | kubectl -n production apply -f -
 
     - name: Create/Update proxy config ConfigMap
       run: |
+        # Имя файла в репозитории — proxy-config.yaml: апстримный .gitignore глушит
+        # любой config.yaml, чтобы в историю не попадали локальные конфиги с ключами.
+        # В ConfigMap ключ всё равно называется config.yaml — под этим именем он монтируется.
         kubectl -n production create configmap litellm-config \
-          --from-file=config.yaml=k8s/config.yaml \
+          --from-file=config.yaml=k8s/proxy-config.yaml \
           --dry-run=client -o yaml | kubectl -n production apply -f -
 
     - name: Deploy to k8s
@@ -116,7 +126,9 @@ jobs:
         # (kubectl rollout undo) и сам по себе триггерит выкатку.
         kubectl -n production set image deployment/litellm \
           litellm=git.aitomaton.online/${{ gitea.repository_owner }}/litellm:${{ gitea.sha }}
-        kubectl -n production rollout status deployment/litellm --timeout=10m
+        # Дольше terminationGracePeriodSeconds (480 с): выкатка считается завершённой
+        # только когда старый под дожил свои realtime-сессии и ушёл.
+        kubectl -n production rollout status deployment/litellm --timeout=12m
 
     - name: Show deployment status
       run: |

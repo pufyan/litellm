@@ -27,10 +27,13 @@ spec:
         prometheus.io/path: "/metrics/"
     spec:
       # Через прокси идут realtime WebSocket сессии длиной в телефонный разговор.
-      # При выкатке под должен дожить активные звонки, а не оборвать их: старый под
-      # перестаёт принимать новые соединения (maxUnavailable: 0 поднимает новый заранее)
-      # и получает 5 минут на завершение текущих.
-      terminationGracePeriodSeconds: 300
+      # По SIGTERM форк даёт им дожить в пределах WS_DRAIN_TIMEOUT (у нас 420 с),
+      # после чего закрывает остаток кодом 1012 Service Restart, и клиент
+      # переподключается уже на новый под
+      # (litellm/proxy/shutdown/realtime_session_registry.py:13-20).
+      # Окно работает, только если под живёт дольше этого таймаута, иначе SIGKILL
+      # прилетает посреди дренажа: 420 с на звонки + запас на HTTP-дренаж и teardown.
+      terminationGracePeriodSeconds: 480
       containers:
       - name: litellm
         image: git.aitomaton.online/aitomaton/litellm:latest
@@ -97,7 +100,10 @@ spec:
             port: 4000
           periodSeconds: 15
           timeoutSeconds: 5
-          failureThreshold: 3
+          # После preStop эндпоинт намеренно отдаёт 503 всё время дренажа,
+          # поэтому порог поднят: liveness не должен считать дренаж зависанием.
+          # 12 × 15 с = 3 минуты до рестарта реально залипшего процесса.
+          failureThreshold: 12
         readinessProbe:
           httpGet:
             path: /health/readiness

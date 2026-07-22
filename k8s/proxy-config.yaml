@@ -63,7 +63,17 @@ litellm_settings:
   # эндпоинт недоступен, поэтому авторизацию для него снимаем.
   require_auth_for_metrics_endpoint: false
 
+  # Координация между репликами: общий rate limiter, общий кулдаун деплойментов,
+  # блокировка фоновой чистки spend-логов. Одних REDIS_HOST/REDIS_PORT в окружении
+  # для этого мало — без этого блока прокси остаётся на in-memory кеше.
+  coordination_redis:
+    host: os.environ/REDIS_HOST
+    port: os.environ/REDIS_PORT
+
 router_settings:
   routing_strategy: simple-shuffle
-  allowed_fails: 3
-  cooldown_time: 30
+
+  # Сколько модель считается нерабочей после ошибки провайдера. На одном деплойменте
+  # модели кулдаун означает полный отказ: протухший ключ Gemini превратился бы для
+  # pjcpp из внятного 401 в «No deployments available» на всё это время.
+  cooldown_time: 10
