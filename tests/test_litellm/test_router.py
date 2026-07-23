@@ -1296,6 +1296,71 @@ async def test_ageneric_api_call_deployment_model_overrides_alias():
     ), f"Expected deployment model 'vertex_ai/gemini-2.5-flash', got '{captured['model']}'"
 
 
+@pytest.mark.asyncio
+async def test_ageneric_api_call_resolves_litellm_credential_name():
+    """
+    Regression: a deployment configured via the Admin UI with a credential
+    reference (litellm_credential_name) instead of an inline api_key must
+    still reach the underlying provider call with a resolved api_key. This
+    path (used by e.g. realtime API calls through the router) previously
+    merged deployment litellm_params into response_kwargs without resolving
+    litellm_credential_name, so api_key stayed None.
+    """
+    from unittest.mock import patch
+
+    from litellm.types.utils import CredentialItem
+
+    litellm.credential_list = [
+        CredentialItem(
+            credential_name="test-openai-cred",
+            credential_info={"custom_llm_provider": "openai"},
+            credential_values={"api_key": "sk-from-credential"},
+        )
+    ]
+
+    captured: dict = {}
+
+    async def capture_api_key(**kwargs):
+        captured["api_key"] = kwargs.get("api_key")
+        return {"result": "ok"}
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-realtime",
+                "litellm_params": {
+                    "model": "gpt-4o-realtime-preview",
+                    "litellm_credential_name": "test-openai-cred",
+                },
+            }
+        ],
+    )
+
+    try:
+        with (
+            patch.object(router, "async_get_available_deployment") as mock_dep,
+            patch.object(router, "_update_kwargs_with_deployment"),
+            patch.object(router, "async_routing_strategy_pre_call_checks"),
+            patch.object(router, "_get_client", return_value=None),
+        ):
+            mock_dep.return_value = {
+                "model_name": "gpt-realtime",
+                "litellm_params": {
+                    "model": "gpt-4o-realtime-preview",
+                    "litellm_credential_name": "test-openai-cred",
+                },
+            }
+
+            await router._ageneric_api_call_with_fallbacks_helper(
+                model="gpt-realtime",
+                original_generic_function=capture_api_key,
+            )
+
+        assert captured["api_key"] == "sk-from-credential"
+    finally:
+        litellm.credential_list = []
+
+
 def test_router_get_model_access_groups_team_only_models():
     """
     Test that Router.get_model_access_groups returns the correct response for team-only models

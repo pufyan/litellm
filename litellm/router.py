@@ -218,6 +218,7 @@ from litellm.utils import (
     get_secret,
     get_utc_datetime,
     is_region_allowed,
+    load_credentials_from_list,
 )
 
 from .router_utils.pattern_match_deployments import PatternMatchRouter
@@ -4472,6 +4473,7 @@ class Router:
             self._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs, function_name=function_name)
 
             data = deployment["litellm_params"].copy()
+            load_credentials_from_list(data)
             model_name = data["model"]
             self.total_calls[model_name] += 1
 
