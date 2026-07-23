@@ -45,6 +45,10 @@ litellm_settings:
   # отбрасываем вместо падения запроса.
   drop_params: true
 
+  # Обязательно для Gemini native-audio (realtime): без этого tool calling
+  # не работает, и клиентское аудио может не идти правильно после reconnect.
+  gemini_live_defer_setup: true
+
   num_retries: 2
   request_timeout: 600
 
