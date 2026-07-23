@@ -230,6 +230,66 @@ class TestPassthroughBackendReconnect:
 
         streaming.backend_ws.send.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_second_session_update_reconnects_when_provider_supports_merge(self):
+        """Regression: a provider whose backend rejects a mid-session `setup`
+        (Gemini/Vertex Live) must not silently drop a client's follow-up
+        `session.update` (e.g. an updated system prompt/instructions). If it
+        implements `merge_setup_for_reconnect`, the second update must trigger
+        a backend reconnect carrying the merged setup instead of vanishing."""
+        provider_config = MagicMock()
+        provider_config.transform_realtime_request.return_value = []
+        provider_config.supports_session_resumption.return_value = True
+        provider_config.merge_setup_for_reconnect.return_value = json.dumps(
+            {"setup": {"model": "models/gemini-live", "systemInstruction": {"parts": [{"text": "new prompt"}]}}}
+        )
+
+        streaming = RealTimeStreaming(
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            provider_config,
+            "gemini-live",
+            backend_connector=MagicMock(),
+        )
+        streaming.session_configuration_request = json.dumps(
+            {"setup": {"model": "models/gemini-live", "systemInstruction": {"parts": [{"text": "old prompt"}]}}}
+        )
+
+        with patch.object(streaming, "_reconnect_backend", new=AsyncMock(return_value=True)) as mock_reconnect:
+            second_update = json.dumps({"type": "session.update", "session": {"instructions": "new prompt"}})
+            result = await streaming._send_to_backend(second_update)
+
+        assert result is True
+        mock_reconnect.assert_awaited_once_with(reason="client_session_update")
+        assert "new prompt" in streaming.session_configuration_request
+
+    @pytest.mark.asyncio
+    async def test_second_session_update_still_drops_when_provider_cannot_merge(self):
+        """Providers that don't implement merge_setup_for_reconnect (the
+        BaseRealtimeConfig default returns None) keep the pre-existing drop
+        behavior — no reconnect is attempted."""
+        provider_config = MagicMock()
+        provider_config.transform_realtime_request.return_value = []
+        provider_config.merge_setup_for_reconnect.return_value = None
+
+        streaming = RealTimeStreaming(
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            provider_config,
+            "some-model",
+            backend_connector=MagicMock(),
+        )
+        streaming.session_configuration_request = json.dumps({"setup": {"model": "models/some-model"}})
+
+        with patch.object(streaming, "_reconnect_backend", new=AsyncMock(return_value=True)) as mock_reconnect:
+            second_update = json.dumps({"type": "session.update", "session": {"instructions": "new prompt"}})
+            result = await streaming._send_to_backend(second_update)
+
+        assert result is False
+        mock_reconnect.assert_not_awaited()
+
 
 def test_remap_beta_session_to_ga_normalizes_nested_structures():
     out = RealTimeStreaming._remap_beta_session_to_ga(

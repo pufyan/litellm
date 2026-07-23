@@ -331,6 +331,19 @@ async def _arealtime(
     dynamic_api_base = dynamic_api_base or litellm_params.api_base
     dynamic_api_key = dynamic_api_key or litellm_params.api_key
 
+    # api_base and model are two separate fields in the provider contract (see
+    # get_complete_url(api_base, model, api_key) / _construct_url(api_base, ...)
+    # across every provider implementation). A caller-supplied api_base that
+    # already embeds a query string (e.g. "?model=...") silently corrupts the
+    # backend URL for providers that build it via naive string concatenation
+    # (Gemini) instead of a URL parser (OpenAI/xAI), so reject it up front
+    # instead of letting each provider implementation guess.
+    if dynamic_api_base is not None and "?" in dynamic_api_base:
+        raise ValueError(
+            f"api_base must not contain query parameters (got {dynamic_api_base!r}). "
+            "Pass the model via the `model` field, not embedded in api_base."
+        )
+
     # If the client supplied `model` in the URL, ensure it uses the normalized
     # provider model (no proxy aliases). If they omitted it, preserve that shape
     # for transcription-only sessions like OpenAI's `?intent=transcription`.

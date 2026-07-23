@@ -404,6 +404,18 @@ class RealTimeStreaming:
             transformed = self.provider_config.transform_realtime_request(
                 message, self.model, self.session_configuration_request
             )
+            if (
+                not transformed
+                and self._is_session_update(message)
+                and self.session_configuration_request is not None
+                and self._supports_backend_reconnect()
+            ):
+                merged_setup = self.provider_config.merge_setup_for_reconnect(
+                    self.session_configuration_request, message
+                )
+                if merged_setup is not None:
+                    self.session_configuration_request = merged_setup
+                    return await self._reconnect_backend(reason="client_session_update")
             sent = False
             for msg in transformed:
                 try:
@@ -434,6 +446,13 @@ class RealTimeStreaming:
             return sent
         await self.backend_ws.send(message)  # type: ignore[union-attr, attr-defined]
         return True
+
+    @staticmethod
+    def _is_session_update(message: str) -> bool:
+        try:
+            return json.loads(message).get("type") == "session.update"
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return False
 
     def _enforce_transcription_session_model(self, message: str) -> str:
         """Force client transcription session updates to the authorized model.
