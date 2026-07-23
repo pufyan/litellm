@@ -1878,6 +1878,38 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         setup["sessionResumption"] = {"handle": state.handle}
         return json.dumps(request)
 
+    def merge_setup_for_reconnect(
+        self, original_session_request: Optional[str], rejected_session_update: str
+    ) -> Optional[str]:
+        """Fold a rejected follow-up ``session.update`` into the cached setup so
+        a reconnect can carry the client's latest configuration (e.g. an
+        updated ``instructions``/system prompt) instead of silently keeping the
+        first-connect defaults for the rest of the session. Gemini Live only
+        accepts one ``setup`` per backend connection, so this new setup is sent
+        on the next backend socket, not the current one."""
+        if original_session_request is None:
+            return None
+        try:
+            request = json.loads(original_session_request)
+            update = json.loads(rejected_session_update)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        setup = request.get("setup")
+        if not isinstance(setup, dict) or update.get("type") != "session.update":
+            return None
+        session_payload = self._normalize_session_payload_for_mapping(update.get("session") or {})
+        new_overrides = self.map_openai_params(optional_params={}, non_default_params=session_payload)
+        merged_generation_config = {
+            **setup.get("generationConfig", {}),
+            **new_overrides.pop("generationConfig", {}),
+        }
+        merged_setup = {**setup, **new_overrides}
+        if merged_generation_config:
+            merged_setup["generationConfig"] = merged_generation_config
+        setup_model = str(setup.get("model", "")).removeprefix("models/")
+        request["setup"] = self._finalize_gemini_live_setup(setup_model, merged_setup)
+        return json.dumps(request)
+
     def build_history_replay_messages(self, entries: "tuple[RealtimeTranscriptEntry, ...]") -> "Optional[list[str]]":
         if not entries:
             return None

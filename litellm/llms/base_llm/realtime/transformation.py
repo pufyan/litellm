@@ -126,6 +126,20 @@ class BaseRealtimeConfig(ABC):
         replay history; the reconnect then proceeds with an empty context."""
         return None
 
+    def merge_setup_for_reconnect(
+        self, original_session_request: Optional[str], rejected_session_update: str
+    ) -> Optional[str]:
+        """Fold a ``session.update`` the backend cannot accept mid-session
+        (e.g. Gemini/Vertex Live, which reject any ``setup`` after the first)
+        into a new setup request for a reconnect.
+
+        Return the merged setup to make ``_send_to_backend`` reconnect the
+        backend socket and resume with it instead of silently dropping the
+        update. Return ``None`` (the default) to keep the existing drop
+        behavior for providers that have not opted into this, or don't need it
+        because they accept ``session.update`` at any point in the session."""
+        return None
+
     @abstractmethod
     def transform_realtime_response(
         self,
