@@ -324,6 +324,13 @@ async def _arealtime(
         api_key=api_key,
     )
 
+    # Centralized, provider-agnostic resolution: every branch below (provider_config
+    # path and the elif chain) must see the same fully-resolved api_base/api_key,
+    # regardless of whether the caller passed them as raw arguments or configured
+    # them on the deployment's litellm_params (Admin UI credential/api_base fields).
+    dynamic_api_base = dynamic_api_base or litellm_params.api_base
+    dynamic_api_key = dynamic_api_key or litellm_params.api_key
+
     # If the client supplied `model` in the URL, ensure it uses the normalized
     # provider model (no proxy aliases). If they omitted it, preserve that shape
     # for transcription-only sessions like OpenAI's `?intent=transcription`.
@@ -353,8 +360,8 @@ async def _arealtime(
             websocket=websocket,
             logging_obj=litellm_logging_obj,
             provider_config=provider_config,
-            api_base=api_base,
-            api_key=api_key,
+            api_base=dynamic_api_base,
+            api_key=dynamic_api_key,
             client=client,
             timeout=timeout,
             headers=headers,
@@ -363,7 +370,7 @@ async def _arealtime(
             query_params=query_params,
         )
     elif _custom_llm_provider == "azure":
-        api_base = dynamic_api_base or litellm_params.api_base or litellm.api_base or get_secret_str("AZURE_API_BASE")
+        api_base = dynamic_api_base or litellm.api_base or get_secret_str("AZURE_API_BASE")
         # set API KEY
         api_key = dynamic_api_key or litellm.api_key or litellm.openai_key or get_secret_str("AZURE_API_KEY")
 
@@ -393,7 +400,7 @@ async def _arealtime(
             litellm_metadata=_build_litellm_metadata(kwargs),
         )
     elif _custom_llm_provider == "openai":
-        api_base = dynamic_api_base or litellm_params.api_base or litellm.api_base or "https://api.openai.com/"
+        api_base = dynamic_api_base or litellm.api_base or "https://api.openai.com/"
         # set API KEY
         api_key = dynamic_api_key or litellm.api_key or litellm.openai_key or get_secret_str("OPENAI_API_KEY")
 
@@ -427,8 +434,8 @@ async def _arealtime(
             model=model,
             websocket=websocket,
             logging_obj=litellm_logging_obj,
-            api_base=dynamic_api_base or api_base,
-            api_key=dynamic_api_key or api_key,
+            api_base=dynamic_api_base,
+            api_key=dynamic_api_key,
             timeout=timeout,
             aws_region_name=aws_region_name,
             aws_access_key_id=aws_access_key_id,
@@ -443,9 +450,7 @@ async def _arealtime(
             aws_external_id=aws_external_id,
         )
     elif _custom_llm_provider == "xai":
-        api_base = (
-            dynamic_api_base or litellm_params.api_base or get_secret_str("XAI_API_BASE") or "https://api.x.ai/v1"
-        )
+        api_base = dynamic_api_base or get_secret_str("XAI_API_BASE") or "https://api.x.ai/v1"
         # set API KEY
         api_key = XAIModelInfo.get_api_key(dynamic_api_key, legacy_generic_before_env=True)
 
@@ -462,7 +467,7 @@ async def _arealtime(
             litellm_metadata=_build_litellm_metadata(kwargs),
         )
     elif _custom_llm_provider == "yandex":
-        api_base = dynamic_api_base or litellm_params.api_base or YANDEX_REALTIME_API_BASE
+        api_base = dynamic_api_base or YANDEX_REALTIME_API_BASE
         api_key = dynamic_api_key or get_secret_str("YANDEX_API_KEY")
 
         await yandex_realtime.async_realtime(
