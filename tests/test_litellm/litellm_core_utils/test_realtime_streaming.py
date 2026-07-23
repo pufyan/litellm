@@ -3257,6 +3257,54 @@ async def test_reconnect_gives_up_after_exhausted_attempts():
 
 
 @pytest.mark.asyncio
+async def test_reconnect_loop_gives_up_after_repeated_immediate_backend_rejection():
+    """Regression: if the backend keeps closing the *new* socket immediately
+    (e.g. Gemini rejects the replayed setup for a logical reason, like an
+    invalid `voice`, not a transient network drop), the proxy must not spin
+    forever reconnecting. After enough consecutive closes with no frame ever
+    received, it must give up and surface the failure instead of looping."""
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[
+            [ConnectionClosed(None, None)],
+            [ConnectionClosed(None, None)],
+            [ConnectionClosed(None, None)],
+            [ConnectionClosed(None, None)],
+            [ConnectionClosed(None, None)],
+        ],
+        connector_outcomes=[1, 2, 3, 4],
+    )
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        await streaming.backend_to_client_send_messages()
+
+    # Bounded, not unbounded: gives up instead of reconnecting forever.
+    assert connector.connect.await_count <= len(sockets)
+    assert (
+        streaming._consecutive_immediate_reconnect_closes
+        > streaming._MAX_CONSECUTIVE_IMMEDIATE_RECONNECT_CLOSES
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_counter_resets_once_a_frame_is_received():
+    """A reconnect that DOES receive at least one frame before the next drop
+    must not count toward the immediate-rejection limit — only truly
+    back-to-back empty reconnects should trip it."""
+    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[
+            [ConnectionClosed(None, None)],
+            [b'{"setupComplete": {}}', ConnectionClosed(None, None)],
+        ],
+        connector_outcomes=[1, ConnectionClosed(None, None), ConnectionClosed(None, None)],
+    )
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        await streaming.backend_to_client_send_messages()
+
+    assert streaming._consecutive_immediate_reconnect_closes >= 1
+
+
+@pytest.mark.asyncio
 async def test_client_messages_buffer_while_reconnecting():
     streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
         recv_sequences=[[]],
