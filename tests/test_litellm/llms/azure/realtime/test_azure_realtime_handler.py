@@ -498,7 +498,7 @@ async def test_arealtime_transcription_intent_defaults_to_ga(monkeypatch):
         MagicMock(async_realtime=mock_async_realtime),
     )
 
-    def fake_get_llm_provider(model, api_base=None, api_key=None):
+    def fake_get_llm_provider(model, custom_llm_provider=None, api_base=None, api_key=None):
         return (
             "gpt-realtime-whisper",
             "azure",
