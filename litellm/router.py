@@ -5743,10 +5743,23 @@ class Router:
                     client=client,
                     **kwargs,
                 )
+            elif call_type in ("_arealtime", "_aresponses_websocket"):
+                # These wrap a long-lived client WebSocket, not a single
+                # idempotent request: a "retry" here doesn't redo one call, it
+                # tears down and reopens the backend session (a second
+                # provider `setup`/handshake) behind a client that is still on
+                # its first and only WS connection to the proxy. Configured
+                # `num_retries`/fallbacks are for stateless REST calls and
+                # must never apply to this call_type, regardless of
+                # router_settings or key/team overrides in kwargs.
+                kwargs["num_retries"] = 0
+                kwargs["fallbacks"] = []
+                return await self._ageneric_api_call_with_fallbacks(
+                    original_function=original_function,
+                    **kwargs,
+                )
             elif call_type in (
                 "anthropic_messages",
-                "_arealtime",
-                "_aresponses_websocket",
                 "acreate_fine_tuning_job",
                 "acancel_fine_tuning_job",
                 "alist_fine_tuning_jobs",

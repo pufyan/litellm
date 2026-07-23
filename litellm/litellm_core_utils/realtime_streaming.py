@@ -165,6 +165,12 @@ class RealTimeStreaming:
         self._resumption_state: Optional[RealtimeResumptionState] = None
         self._reconnecting_backend: bool = False
         self._reconnect_resumed_mode: str = "fresh"
+        # Guards against a reconnect loop when the backend keeps closing the
+        # *new* socket for a logical reason (e.g. an invalid `voice` in the
+        # replayed setup) rather than a transient network drop: each
+        # consecutive reconnect that closes again before any backend frame is
+        # received increments this; reset to 0 once a frame arrives.
+        self._consecutive_immediate_reconnect_closes: int = 0
         # Passthrough (OpenAI-compatible) reconnect support: last GA-shaped
         # session.update forwarded upstream, replayed into a fresh backend
         # socket to restore session configuration.
@@ -180,6 +186,7 @@ class RealTimeStreaming:
     _MAX_BUFFERED_BYTES: int = 10 * 1024 * 1024  # 10 MB
 
     _RECONNECT_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+    _MAX_CONSECUTIVE_IMMEDIATE_RECONNECT_CLOSES: int = 3
     _MAX_TRANSCRIPT_ENTRIES: int = 200
     _REPLAY_RESTORED_NOTE = (
         "[note: the connection dropped mid-call; the voice-call transcript so far is restored below]"
@@ -1255,15 +1262,26 @@ class RealTimeStreaming:
 
         try:
             try:
-                return await self.backend_ws.recv(decode=False)  # type: ignore[union-attr]
+                response = await self.backend_ws.recv(decode=False)  # type: ignore[union-attr]
             except TypeError:
-                return await self.backend_ws.recv()  # type: ignore[union-attr]
+                response = await self.backend_ws.recv()  # type: ignore[union-attr]
+            self._consecutive_immediate_reconnect_closes = 0
+            return response
         except websockets.exceptions.ConnectionClosed as e:
             rcvd = getattr(e, "rcvd", None)
             close_code = getattr(rcvd, "code", None) if rcvd is not None else getattr(e, "code", None)
             close_reason = getattr(rcvd, "reason", None) if rcvd is not None else getattr(e, "reason", None)
             verbose_logger.warning("Realtime backend closed by provider: code=%s reason=%r", close_code, close_reason)
             if not self._supports_backend_reconnect():
+                raise
+            self._consecutive_immediate_reconnect_closes += 1
+            if self._consecutive_immediate_reconnect_closes > self._MAX_CONSECUTIVE_IMMEDIATE_RECONNECT_CLOSES:
+                verbose_logger.warning(
+                    "Realtime backend closed %d times in a row with no frame received; "
+                    "giving up on reconnect (likely a persistent rejection of the setup, "
+                    "e.g. an invalid voice/model, not a transient network drop)",
+                    self._consecutive_immediate_reconnect_closes,
+                )
                 raise
             if await self._reconnect_backend(reason="connection_closed"):
                 return None

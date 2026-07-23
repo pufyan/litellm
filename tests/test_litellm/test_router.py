@@ -1297,6 +1297,60 @@ async def test_ageneric_api_call_deployment_model_overrides_alias():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", ["_arealtime", "_aresponses_websocket"])
+async def test_websocket_call_types_never_retry_regardless_of_router_config(call_type):
+    """
+    Regression: router_settings.num_retries (and fallbacks) must never apply to
+    _arealtime / _aresponses_websocket. These wrap one long-lived client
+    WebSocket; a "retry" there doesn't redo an idempotent request, it tears
+    down and reopens the backend session mid-call (a second provider
+    setup/handshake) while the client is still on its first and only
+    connection to the proxy. Before this fix, a configured num_retries (e.g.
+    the router_settings.num_retries: 2 used in production) made the router
+    silently reconnect to the backend on any transient error, corrupting an
+    active realtime session (observed as Gemini Live rejecting a second
+    `setup` and the session looping).
+    """
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "gemini-realtime",
+                "litellm_params": {"model": "gemini/gemini-2.5-flash-live", "api_key": "fake-key"},
+            }
+        ],
+        num_retries=2,
+    )
+
+    async def fake_call(**kwargs):
+        return {"result": "ok"}
+
+    wrapped = router.factory_function(fake_call, call_type=call_type)
+
+    captured_kwargs: dict = {}
+    real_async_function_with_fallbacks = router.async_function_with_fallbacks
+
+    async def capture_and_forward(**kwargs):
+        captured_kwargs.update(kwargs)
+        return await real_async_function_with_fallbacks(**kwargs)
+
+    with (
+        patch.object(router, "async_function_with_fallbacks", side_effect=capture_and_forward),
+        patch.object(router, "async_get_available_deployment") as mock_dep,
+        patch.object(router, "_update_kwargs_with_deployment"),
+        patch.object(router, "async_routing_strategy_pre_call_checks"),
+        patch.object(router, "_get_client", return_value=None),
+    ):
+        mock_dep.return_value = {
+            "model_name": "gemini-realtime",
+            "litellm_params": {"model": "gemini/gemini-2.5-flash-live", "api_key": "fake-key"},
+        }
+        await wrapped(model="gemini-realtime", websocket=object())
+
+    assert captured_kwargs.get("num_retries") == 0
+    assert captured_kwargs.get("fallbacks") == []
+
+
+@pytest.mark.asyncio
 async def test_ageneric_api_call_resolves_litellm_credential_name():
     """
     Regression: a deployment configured via the Admin UI with a credential
