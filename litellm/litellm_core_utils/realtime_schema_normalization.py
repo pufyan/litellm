@@ -38,6 +38,13 @@ _ANY_VAD_KEYS: FrozenSet[str] = _SERVER_VAD_KEYS | _SEMANTIC_VAD_KEYS
 
 _TRANSCRIPTION_KEYS: FrozenSet[str] = frozenset({"language", "model", "prompt"})
 
+# Canonical built-in tool types. Function tools are always available; these are
+# backend-provided capabilities, expressed as typed ``tools[]`` entries rather
+# than boolean session flags so there is exactly one way to declare a tool.
+CANONICAL_BUILTIN_TOOL_TYPES: FrozenSet[str] = frozenset(
+    {"web_search", "code_execution", "file_search", "x_search", "mcp"}
+)
+
 
 def _normalize_schema_type_value(value: object) -> object:
     if isinstance(value, str) and value.lower() in _JSON_SCHEMA_TYPES:
@@ -115,6 +122,71 @@ def normalize_tools_to_canonical(tools: object) -> object:
         return [tool]
 
     return [expanded for tool in tools for expanded in _expand(tool)]
+
+
+def clamp_numeric(
+    value: object,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> Tuple[object, bool]:
+    """Bring a numeric value into a backend's accepted range.
+
+    Returns the value and whether it was changed, so the caller can log the
+    substitution -- a silently altered value is indistinguishable from one the
+    client chose. Non-numeric input (including ``bool``, which is an ``int`` in
+    Python) passes through untouched: guessing at a wrong type would hide a real
+    client error, and the field's own validation should reject it.
+
+    Clamping rather than dropping matters because backends reject the entire
+    ``session.update`` on an out-of-range value, taking the system prompt and
+    tools down with it -- so an unusable number must not cost a whole session.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value, False
+    clamped: float = value
+    if minimum is not None:
+        clamped = max(clamped, minimum)
+    if maximum is not None:
+        clamped = min(clamped, maximum)
+    if clamped == value:
+        return value, False
+    return (int(clamped) if isinstance(value, int) else clamped), True
+
+
+def keep_enum(value: object, allowed: FrozenSet[str]) -> Tuple[Optional[str], bool]:
+    """Keep an enum value the backend defines, or report it for dropping.
+
+    Unlike a number, an out-of-range enum has no nearest valid neighbour to fall
+    back to, so it is dropped and the backend's own default applies.
+    """
+    if isinstance(value, str) and value in allowed:
+        return value, False
+    return None, True
+
+
+def filter_builtin_tools(tools: object, supported: FrozenSet[str]) -> Tuple[object, List[str]]:
+    """Keep only the built-in tools a backend provides; report what was dropped.
+
+    Function tools always pass through. A built-in tool the backend cannot
+    provide is removed rather than forwarded: an unknown tool type is not
+    ignored by backends, it rejects the whole ``session.update`` and takes the
+    system prompt and every other tool down with it.
+
+    Returns the filtered list plus the dropped type names, so the caller can log
+    them -- a dropped tool is otherwise indistinguishable from one that works.
+    """
+    if not isinstance(tools, list):
+        return tools, []
+
+    kept: List[object] = []
+    dropped: List[str] = []
+    for tool in tools:
+        tool_type = tool.get("type") if isinstance(tool, dict) else None
+        if isinstance(tool_type, str) and tool_type in CANONICAL_BUILTIN_TOOL_TYPES and tool_type not in supported:
+            dropped.append(tool_type)
+            continue
+        kept.append(tool)
+    return kept, dropped
 
 
 def normalize_turn_detection_for_ga(turn_detection: object) -> object:

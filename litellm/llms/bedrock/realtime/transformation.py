@@ -7,7 +7,7 @@ Transforms between OpenAI Realtime API format and Bedrock Nova Sonic format.
 import base64
 import json
 import uuid as uuid_lib
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel
 
@@ -19,6 +19,7 @@ from litellm.litellm_core_utils.realtime_correlation.lifecycle import (
     track_output_index,
 )
 from litellm.litellm_core_utils.realtime_correlation.state import RealtimeCorrelationState
+from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
 from litellm.llms.base_llm.realtime.transformation import BaseRealtimeConfig
 from litellm.llms.bedrock.realtime.trigger_audio import ready_trigger_pcm
 from litellm.types.llms.openai import (
@@ -43,6 +44,28 @@ from litellm.types.realtime import (
     RealtimeResponseTypedDict,
 )
 from litellm.utils import get_empty_usage
+
+
+# Sample rates Nova Sonic accepts on either direction.
+# https://docs.aws.amazon.com/nova/latest/userguide/input-events.html
+_BEDROCK_SUPPORTED_SAMPLE_RATES: frozenset = frozenset({8000, 16000, 24000})
+
+# Accepted ranges for inferenceConfiguration, as (min, max). AWS documents the
+# event schema without stating bounds, so these are the widely used ranges;
+# recheck if Nova starts rejecting a value inside them. Out-of-range values are
+# clamped because Nova refuses the session rather than ignoring the field.
+_BEDROCK_INFERENCE_RANGES: Dict[str, tuple] = {
+    "temperature": (0.0, 1.0),
+    "topP": (0.0, 1.0),
+    "maxTokens": (1, float("inf")),
+}
+
+# Canonical turn_detection.end_sensitivity -> Nova 2 endpointingSensitivity.
+_BEDROCK_ENDPOINTING_SENSITIVITY_MAP: Dict[str, str] = {
+    "high": "HIGH",
+    "medium": "MEDIUM",
+    "low": "LOW",
+}
 
 
 class BedrockContentEnd(BaseModel):
@@ -152,6 +175,61 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
         # Return as a marker that we've sent the configuration
         return json.dumps({"session_start": session_start, "prompt_start": prompt_start})
 
+    @staticmethod
+    def _clamp_inference_param(native_key: str, value: object) -> Any:
+        """Clamp an inferenceConfiguration value into Nova's accepted range.
+
+        These fields are required by the Bedrock event schema, so a bad value
+        cannot simply be omitted; it is brought to the nearest bound instead,
+        and the substitution logged.
+        """
+        bounds = _BEDROCK_INFERENCE_RANGES.get(native_key)
+        if bounds is None:
+            return value
+        clamped, changed = clamp_numeric(value, bounds[0], bounds[1])
+        if changed:
+            verbose_logger.warning(
+                "realtime session.update: clamped %s %s -> %s (unsupported_by_provider): accepts %s..%s",
+                native_key,
+                value,
+                clamped,
+                bounds[0],
+                bounds[1],
+            )
+        return clamped
+
+    @staticmethod
+    def _is_nova_2(model: str) -> bool:
+        """Nova 2 Sonic (``amazon.nova-2-sonic-v1:0``) accepts configuration the
+        original ``amazon.nova-sonic-v1:0`` rejects, so capability is gated on
+        the model rather than on the provider."""
+        return "nova-2-sonic" in model.lower()
+
+    @staticmethod
+    def _map_turn_detection_configuration(model: str, turn_detection: object) -> Optional[Dict[str, str]]:
+        """Map canonical ``turn_detection.end_sensitivity`` to Nova 2's
+        ``endpointingSensitivity``.
+
+        Nova 1 has no turn-detection configuration at all, so the field is
+        dropped there rather than sent and rejected.
+        """
+        if not isinstance(turn_detection, dict):
+            return None
+        sensitivity = turn_detection.get("end_sensitivity")
+        if not isinstance(sensitivity, str):
+            return None
+        endpointing = _BEDROCK_ENDPOINTING_SENSITIVITY_MAP.get(sensitivity.lower())
+        if endpointing is None:
+            return None
+        if not BedrockRealtimeConfig._is_nova_2(model):
+            verbose_logger.warning(
+                "realtime session.update: dropped turn_detection.end_sensitivity (unsupported_by_model): "
+                "%s has no turn detection configuration",
+                model or "nova-sonic",
+            )
+            return None
+        return {"endpointingSensitivity": endpointing}
+
     def _transform_tools_to_bedrock_format(self, tools: List[dict]) -> List[dict]:
         """
         Transform canonical tools to Bedrock tool format.
@@ -182,31 +260,57 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
             if isinstance(tool, dict) and tool.get("type") == "function"
         ]
 
-    def _map_audio_format_to_sample_rate(self, audio_format: str, is_output: bool = True) -> int:
+    def _map_audio_format_to_sample_rate(self, audio_format: object, is_output: bool = True) -> int:
         """
-        Map OpenAI audio format to sample rate.
+        Resolve a canonical audio format to a Nova Sonic sample rate.
+
+        The canonical ``input_audio_format`` / ``output_audio_format`` is a
+        string or an object. The string names a codec, from which a rate is
+        implied; the object form carries an explicit ``rate``, which is the only
+        way to ask for a rate the codec name does not imply -- Nova accepts
+        8000, 16000 and 24000, so "pcm16 at 8kHz" is expressible only this way.
+        An unsupported rate falls back to the codec default rather than being
+        forwarded, since Nova rejects anything else.
 
         Args:
-            audio_format: OpenAI audio format (pcm16, g711_ulaw, g711_alaw)
+            audio_format: Canonical format, e.g. ``"pcm16"`` or
+                ``{"type": "audio/pcm", "rate": 8000}``
             is_output: Whether this is for output (True) or input (False)
 
         Returns:
             Sample rate in Hz
         """
+        if isinstance(audio_format, dict):
+            rate = audio_format.get("rate")
+            # Membership in the rate set is the whole check: it rejects wrong
+            # types and wrong numbers alike (``True`` is an int in Python but is
+            # not 8000, 16000 or 24000).
+            if rate in _BEDROCK_SUPPORTED_SAMPLE_RATES:
+                return rate
+            if rate is not None:
+                verbose_logger.warning(
+                    "realtime session.update: ignored audio format rate=%r (unsupported_by_provider): "
+                    "Nova Sonic accepts %s",
+                    rate,
+                    ", ".join(str(supported) for supported in sorted(_BEDROCK_SUPPORTED_SAMPLE_RATES)),
+                )
+            audio_format = audio_format.get("type")
+
         # OpenAI uses 24kHz for output and can vary for input
         # Bedrock Nova Sonic uses 24kHz for output and 16kHz for input by default
-        if audio_format == "pcm16":
+        if audio_format in ("pcm16", "audio/pcm"):
             return 24000 if is_output else 16000
-        elif audio_format in ["g711_ulaw", "g711_alaw"]:
+        elif audio_format in ("g711_ulaw", "g711_alaw", "audio/G711-ulaw", "audio/G711-alaw"):
             return 8000  # G.711 typically uses 8kHz
         return 24000 if is_output else 16000
 
-    def transform_session_update_event(self, json_message: dict) -> List[str]:
+    def transform_session_update_event(self, json_message: dict, model: str = "") -> List[str]:
         """
         Transform session.update event to Bedrock session configuration.
 
         Args:
             json_message: OpenAI session.update message
+            model: Model ID, used to gate Nova-2-only configuration
 
         Returns:
             List of Bedrock format messages (JSON strings)
@@ -218,9 +322,11 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
 
         # Update inference configuration from session if provided
         if "max_response_output_tokens" in session_config:
-            self.max_tokens = session_config["max_response_output_tokens"]
+            self.max_tokens = self._clamp_inference_param("maxTokens", session_config["max_response_output_tokens"])
         if "temperature" in session_config:
-            self.temperature = session_config["temperature"]
+            self.temperature = self._clamp_inference_param("temperature", session_config["temperature"])
+        if "top_p" in session_config:
+            self.top_p = self._clamp_inference_param("topP", session_config["top_p"])
 
         # Update audio output configuration from session if provided
         if "voice" in session_config:
@@ -234,25 +340,18 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
             input_format = session_config["input_audio_format"]
             self.input_sample_rate_hertz = self._map_audio_format_to_sample_rate(input_format, is_output=False)
 
-        # Allow direct override of sample rates if provided (custom extension)
-        if "output_sample_rate_hertz" in session_config:
-            self.output_sample_rate_hertz = session_config["output_sample_rate_hertz"]
-        if "input_sample_rate_hertz" in session_config:
-            self.input_sample_rate_hertz = session_config["input_sample_rate_hertz"]
-
         # Send session start
-        session_start = {
-            "event": {
-                "sessionStart": {
-                    "inferenceConfiguration": {
-                        "maxTokens": self.max_tokens,
-                        "topP": self.top_p,
-                        "temperature": self.temperature,
-                    }
-                }
+        session_start_config: Dict[str, Any] = {
+            "inferenceConfiguration": {
+                "maxTokens": self.max_tokens,
+                "topP": self.top_p,
+                "temperature": self.temperature,
             }
         }
-        messages.append(json.dumps(session_start))
+        turn_detection_config = self._map_turn_detection_configuration(model, session_config.get("turn_detection"))
+        if turn_detection_config is not None:
+            session_start_config["turnDetectionConfiguration"] = turn_detection_config
+        messages.append(json.dumps({"event": {"sessionStart": session_start_config}}))
 
         # Send prompt start
         prompt_start_config = {
@@ -621,7 +720,7 @@ class BedrockRealtimeConfig(BaseRealtimeConfig):
 
         # Route to appropriate transformation method
         if message_type == "session.update":
-            return self.transform_session_update_event(json_message)
+            return self.transform_session_update_event(json_message, model=model)
         elif message_type == "input_audio_buffer.append":
             return self.transform_input_audio_buffer_append_event(json_message)
         elif message_type == "input_audio_buffer.commit":

@@ -7,6 +7,9 @@ from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
 from litellm.litellm_core_utils.realtime_schema_normalization import (
+    clamp_numeric,
+    filter_builtin_tools,
+    keep_enum,
     normalize_input_audio_transcription_for_ga,
     normalize_tools_to_canonical,
     normalize_turn_detection_for_ga,
@@ -60,6 +63,26 @@ def _derive_ga_session_allowed_keys() -> FrozenSet[str]:
 
 GA_SESSION_ALLOWED_KEYS: FrozenSet[str] = _derive_ga_session_allowed_keys()
 
+# Built-in tool types the OpenAI GA session schema accepts. Its tools union is
+# function + mcp; every other canonical built-in belongs to another backend and
+# would be rejected outright, so it is dropped before the request is sent.
+GA_SUPPORTED_BUILTIN_TOOL_TYPES: FrozenSet[str] = frozenset({"mcp"})
+
+# GA accepts an integer in this range, or "inf". Out-of-range values reject the
+# entire session.update, so the remap clamps rather than forwards.
+# https://developers.openai.com/api/reference/resources/realtime/client-events
+GA_MAX_OUTPUT_TOKENS_MIN = 1
+GA_MAX_OUTPUT_TOKENS_MAX = 4096
+
+# Documented GA ranges. Out-of-range values reject the whole session.update, so
+# these are clamped rather than forwarded.
+# https://developers.openai.com/api/reference/resources/realtime/client-events
+GA_OUTPUT_SPEED_MIN = 0.25
+GA_OUTPUT_SPEED_MAX = 1.5
+GA_VAD_THRESHOLD_MIN = 0.0
+GA_VAD_THRESHOLD_MAX = 1.0
+GA_EAGERNESS_VALUES: FrozenSet[str] = frozenset({"low", "medium", "high", "auto"})
+
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
@@ -71,7 +94,7 @@ else:
 class RealtimeEventNormalizer(Protocol):
     def should_drop(self, event: object) -> bool: ...
     def normalize(self, event: dict) -> dict: ...
-    def patch_outgoing_session(self, session: dict) -> dict: ...
+    def patch_outgoing_session(self, session: dict, canonical_session: Optional[dict] = None) -> dict: ...
 
 
 DefaultLoggedRealTimeEventTypes = [
@@ -1434,9 +1457,15 @@ class RealTimeStreaming:
             elif "text" in mods_set:
                 session["output_modalities"] = ["text"]
 
-        # 3. Rename max_response_output_tokens → max_output_tokens
+        # 3. Rename max_response_output_tokens → max_output_tokens, clamped to
+        # the range GA accepts. Renaming without clamping is what makes a value
+        # from a client's own configuration reject the entire session.update --
+        # taking instructions, tools and voice down with it, so the model
+        # answers with its default persona and no tools at all.
         if "max_response_output_tokens" in session:
-            session["max_output_tokens"] = session.pop("max_response_output_tokens")
+            session["max_output_tokens"] = RealTimeStreaming._clamp_ga_max_output_tokens(
+                session.pop("max_response_output_tokens")
+            )
 
         # 4-8. Lift flat audio fields into the nested audio object
         audio: Dict[str, Any] = {}
@@ -1459,11 +1488,60 @@ class RealTimeStreaming:
 
         # turn_detection → audio.input.turn_detection
         if "turn_detection" in session:
-            inp["turn_detection"] = session.pop("turn_detection")
+            inp["turn_detection"] = RealTimeStreaming._clamp_ga_turn_detection(session.pop("turn_detection"))
 
         # input_audio_transcription → audio.input.transcription
         if "input_audio_transcription" in session:
             inp["transcription"] = session.pop("input_audio_transcription")
+
+        # input_audio_noise_reduction → audio.input.noise_reduction.
+        # ``None`` is meaningful here (it turns noise reduction off), so it is
+        # forwarded rather than treated as an omitted field.
+        if "input_audio_noise_reduction" in session:
+            inp["noise_reduction"] = session.pop("input_audio_noise_reduction")
+
+        # output_audio_speed → audio.output.speed
+        if "output_audio_speed" in session:
+            speed = session.pop("output_audio_speed")
+            if isinstance(speed, (int, float)) and not isinstance(speed, bool):
+                out["speed"] = RealTimeStreaming._clamp_logged(
+                    speed, GA_OUTPUT_SPEED_MIN, GA_OUTPUT_SPEED_MAX, "output_audio_speed"
+                )
+
+        # language → audio.input.transcription.language. GA has no session-level
+        # language: it is a property of the transcription config, and OpenAI
+        # only transcribes when a model is named. So a language sent without a
+        # transcription config has nothing to apply to and is dropped rather
+        # than given an invented model.
+        if "language" in session:
+            language = session.pop("language")
+            transcription = inp.get("transcription")
+            if isinstance(language, str) and language and isinstance(transcription, dict):
+                inp["transcription"] = {**transcription, "language": language}
+            elif language:
+                # Debug, not a warning: a provider normalizer downstream may
+                # still restore this from the pre-remap payload in its own
+                # spelling (xAI's ``language_hint`` takes no transcription
+                # model), so a drop here is not yet an outcome.
+                verbose_logger.debug(
+                    "realtime session.update: language=%r not placed in the GA transcription config "
+                    "(no transcription model configured)",
+                    language,
+                )
+
+        # transcription_keyterms → audio.input.transcription.prompt. GA steers
+        # recognition through a prompt that, for keyword-list models, is exactly
+        # a list of domain terms; it joins the canonical list into that field.
+        # Like ``language`` it belongs to the transcription config, so it is
+        # skipped when no transcription was configured.
+        if "transcription_keyterms" in session:
+            keyterms = session.pop("transcription_keyterms")
+            transcription = inp.get("transcription")
+            terms = (
+                [term for term in keyterms if isinstance(term, str) and term] if isinstance(keyterms, list) else []
+            )
+            if terms and isinstance(transcription, dict):
+                inp["transcription"] = {**transcription, "prompt": ", ".join(terms)}
 
         if inp:
             audio["input"] = inp
@@ -1477,6 +1555,80 @@ class RealTimeStreaming:
         return {k: v for k, v in session.items() if k in GA_SESSION_ALLOWED_KEYS}
 
     @staticmethod
+    def _clamp_logged(value: object, minimum: float, maximum: float, field: str) -> object:
+        """Clamp a value into a backend range, naming the substitution in logs.
+
+        An altered value the client cannot see is indistinguishable from one it
+        chose, which is how a wrong setting survives unnoticed in production.
+        """
+        clamped, changed = clamp_numeric(value, minimum, maximum)
+        if changed:
+            verbose_logger.warning(
+                "realtime session.update: clamped %s %s -> %s (unsupported_by_provider): accepts %s..%s",
+                field,
+                value,
+                clamped,
+                minimum,
+                maximum,
+            )
+        return clamped
+
+    @staticmethod
+    def _clamp_ga_max_output_tokens(value: object) -> object:
+        """Bring ``max_output_tokens`` into the range GA accepts.
+
+        GA takes an integer in 1..4096 or the string ``"inf"``; anything else
+        rejects the whole ``session.update``. The canonical contract makes the
+        proxy responsible for rescaling a value into its backend's range, and a
+        client configured for a backend with a wider ceiling must not have its
+        entire session configuration refused over one field. ``"inf"`` is
+        GA-valid and passes through untouched.
+        """
+        return RealTimeStreaming._clamp_logged(
+            value, GA_MAX_OUTPUT_TOKENS_MIN, GA_MAX_OUTPUT_TOKENS_MAX, "max_response_output_tokens"
+        )
+
+    @staticmethod
+    def _clamp_ga_turn_detection(turn_detection: object) -> object:
+        """Bring VAD tuning into GA's accepted ranges.
+
+        ``threshold`` is an acoustic probability and ``eagerness`` a fixed enum;
+        both reject the session outright when out of range. The enum is dropped
+        rather than clamped -- an unrecognized label has no nearest valid
+        neighbour, so the backend's own default is the honest fallback.
+        """
+        if not isinstance(turn_detection, dict):
+            return turn_detection
+        normalized = dict(turn_detection)
+
+        if "threshold" in normalized:
+            normalized["threshold"] = RealTimeStreaming._clamp_logged(
+                normalized["threshold"],
+                GA_VAD_THRESHOLD_MIN,
+                GA_VAD_THRESHOLD_MAX,
+                "turn_detection.threshold",
+            )
+        for field in ("prefix_padding_ms", "silence_duration_ms", "idle_timeout_ms"):
+            if field in normalized:
+                # Durations are non-negative; no documented ceiling.
+                normalized[field] = RealTimeStreaming._clamp_logged(
+                    normalized[field], 0, float("inf"), f"turn_detection.{field}"
+                )
+        if "eagerness" in normalized:
+            kept, dropped = keep_enum(normalized["eagerness"], GA_EAGERNESS_VALUES)
+            if dropped:
+                verbose_logger.warning(
+                    "realtime session.update: dropped turn_detection.eagerness=%r "
+                    "(unsupported_by_provider): GA accepts %s",
+                    normalized["eagerness"],
+                    ", ".join(sorted(GA_EAGERNESS_VALUES)),
+                )
+                normalized.pop("eagerness")
+            else:
+                normalized["eagerness"] = kept
+        return normalized
+
+    @staticmethod
     def _normalize_nested_session_structures(session: dict) -> dict:
         """Normalize nested payloads the top-level allowlist cannot protect.
 
@@ -1488,7 +1640,17 @@ class RealTimeStreaming:
         """
         session = dict(session)
         if "tools" in session:
-            session["tools"] = normalize_tools_to_canonical(session["tools"])
+            tools = normalize_tools_to_canonical(session["tools"])
+            # The GA schema's tool union is function + mcp only (derived from
+            # the openai SDK). Any other built-in tool is a different backend's
+            # capability and would reject the whole session.update.
+            tools, dropped_builtin_tools = filter_builtin_tools(tools, GA_SUPPORTED_BUILTIN_TOOL_TYPES)
+            if dropped_builtin_tools:
+                verbose_logger.warning(
+                    "realtime session.update: dropped built-in tool(s) %s (unsupported_by_provider)",
+                    ", ".join(sorted(set(dropped_builtin_tools))),
+                )
+            session["tools"] = tools
 
         audio = session.get("audio")
         if not isinstance(audio, dict):
@@ -1731,6 +1893,10 @@ class RealTimeStreaming:
                     # transform_session_update_event) can actually honor — those
                     # providers have their own flat-canonical-shape normalization
                     # and must see the client's session.update unfiltered.
+                    # Kept so a provider normalizer can still see canonical
+                    # fields the GA allowlist strips (a backend may honor
+                    # something OpenAI GA has no field for).
+                    canonical_session: Optional[dict] = None
                     if (
                         msg_type == "session.update"
                         and not self._backend_uses_beta_protocol
@@ -1738,6 +1904,7 @@ class RealTimeStreaming:
                     ):
                         session = msg_obj.get("session", {})
                         if isinstance(session, dict):
+                            canonical_session = dict(session)
                             session = self._remap_beta_session_to_ga(session)
                             msg_obj["session"] = session
                             message = json.dumps(msg_obj)
@@ -1745,7 +1912,9 @@ class RealTimeStreaming:
                     if msg_type == "session.update" and self._event_normalizer:
                         session = msg_obj.get("session")
                         if isinstance(session, dict):
-                            msg_obj["session"] = self._event_normalizer.patch_outgoing_session(session)
+                            msg_obj["session"] = self._event_normalizer.patch_outgoing_session(
+                                session, canonical_session
+                            )
                             message = json.dumps(msg_obj)
 
                     if msg_type == "session.update" and self.provider_config is None and isinstance(message, str):

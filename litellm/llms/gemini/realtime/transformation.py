@@ -4,7 +4,7 @@ This file contains the transformation logic for the Gemini realtime API.
 
 import json
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Mapping, Optional, Union, cast
 
 import litellm
 from litellm import verbose_logger
@@ -26,6 +26,7 @@ from litellm.types.llms.gemini import (
     BidiGenerateContentSetup,
     EndOfSpeechSensitivityEnum,
     StartOfSpeechSensitivityEnum,
+    TurnCoverageEnum,
 )
 from litellm.types.llms.openai import (
     OpenAIRealtimeAudioConfig,
@@ -53,9 +54,12 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.llms.vertex_ai import (
     GeminiResponseModalities,
+    GeminiThinkingConfig,
     HttpxBlobType,
     HttpxContentType,
+    VertexToolName,
 )
+from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
 from litellm.litellm_core_utils.realtime_correlation import (
     RealtimeCorrelationState,
     ToolCallRequest,
@@ -95,10 +99,42 @@ _SPEECH_END_SENSITIVITY_MAP: dict[str, EndOfSpeechSensitivityEnum] = {
     "high": "END_SENSITIVITY_HIGH",
     "low": "END_SENSITIVITY_LOW",
 }
+_TURN_COVERAGE_MAP: dict[str, TurnCoverageEnum] = {
+    "activity_only": "TURN_INCLUDES_ONLY_ACTIVITY",
+    "all_input": "TURN_INCLUDES_ALL_INPUT",
+    # Mixed coverage: audio limited to detected activity, video kept whole.
+    # This is the default on newer models, so it must be expressible.
+    "audio_activity_and_all_video": "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
+}
+
+# Accepted ranges for generationConfig values, as (min, max). Google documents
+# these only by example rather than as stated bounds, so they are the widely
+# used ranges; recheck against the API reference if Gemini starts rejecting a
+# value inside them. Out-of-range values are clamped rather than forwarded
+# because the backend refuses the whole setup, losing instructions and tools
+# with it.
+_GEMINI_PARAM_RANGES: dict[str, tuple[float, float]] = {
+    "temperature": (0.0, 2.0),
+    "topP": (0.0, 1.0),
+    "topK": (1, float("inf")),
+    "presencePenalty": (-2.0, 2.0),
+    "frequencyPenalty": (-2.0, 2.0),
+    "candidateCount": (1, 8),
+    "maxOutputTokens": (1, float("inf")),
+}
 # OpenAI-realtime sampling params -> Gemini Live generationConfig (camelCase).
 _GEMINI_SAMPLING_PARAM_MAP: dict[str, str] = {
     "top_p": "topP",
     "top_k": "topK",
+    "presence_penalty": "presencePenalty",
+    "frequency_penalty": "frequencyPenalty",
+    "candidate_count": "candidateCount",
+}
+# Canonical media_resolution -> Gemini's MEDIA_RESOLUTION_* enum.
+_MEDIA_RESOLUTION_MAP: dict[str, str] = {
+    "low": "MEDIA_RESOLUTION_LOW",
+    "medium": "MEDIA_RESOLUTION_MEDIUM",
+    "high": "MEDIA_RESOLUTION_HIGH",
 }
 
 
@@ -362,32 +398,153 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "context_window_compression",
             "top_p",
             "top_k",
+            "thinking_budget",
+            "thinking_level",
+            "include_thoughts",
+            "presence_penalty",
+            "frequency_penalty",
+            "stop_sequences",
+            "candidate_count",
+            "media_resolution",
+            "output_audio_transcription",
+            "session_resumption",
         ]
 
-    def _apply_turn_detection(self, optional_params: dict, value: OpenAIRealtimeTurnDetection) -> None:
-        if isinstance(value, dict) and value.get("type") == "semantic_vad" and "create_response" not in value:
-            # Pipecat/OpenAI GA semantic VAD — skip; Gemini uses its own VAD.
-            # Only skip when there is no create_response override so that
-            # a guardrail-injected create_response:false is not dropped.
-            return
-        transformed_audio_activity_config = self.map_automatic_turn_detection(value)
-        if transformed_audio_activity_config:
-            optional_params["realtimeInputConfig"] = BidiGenerateContentRealtimeInputConfig(
-                automaticActivityDetection=transformed_audio_activity_config
-            )
+    @staticmethod
+    def _clamp_generation_param(native_key: str, value: object) -> object:
+        """Clamp a generationConfig value into Gemini's accepted range.
 
-    def map_openai_params(self, optional_params: dict, non_default_params: dict) -> dict:
+        Gemini rejects the whole ``setup`` on an out-of-range value, which would
+        cost the session its system prompt and tools, so an unusable number is
+        brought to the nearest bound and the substitution is logged.
+        """
+        bounds = _GEMINI_PARAM_RANGES.get(native_key)
+        if bounds is None:
+            return value
+        clamped, changed = clamp_numeric(value, bounds[0], bounds[1])
+        if changed:
+            verbose_logger.warning(
+                "realtime session.update: clamped %s %s -> %s (unsupported_by_provider): accepts %s..%s",
+                native_key,
+                value,
+                clamped,
+                bounds[0],
+                bounds[1],
+            )
+        return clamped
+
+    @staticmethod
+    def _map_builtin_tools(model: str, tools: List[Any]) -> List[Any]:
+        """Translate canonical built-in tools into their Gemini Live spellings.
+
+        ``code_execution`` reaches ``_map_function`` as a bare ``{"type": ...}``
+        entry, which strips to ``{}`` and is rejected as an invalid tool, so the
+        native key is written here instead. It is also 2.5-only: Gemini 3.x
+        dropped code execution, so the tool is removed rather than sent to a
+        model that would reject it. ``web_search`` already has a translation to
+        ``googleSearch`` downstream and passes through untouched.
+        """
+        supports_code_execution = not VertexGeminiConfig._is_gemini_3_or_newer(model)
+        mapped: List[Any] = []
+        for tool in tools:
+            if not isinstance(tool, dict) or tool.get("type") != "code_execution":
+                mapped.append(tool)
+                continue
+            if supports_code_execution:
+                mapped.append({VertexToolName.CODE_EXECUTION.value: {}})
+            else:
+                verbose_logger.warning(
+                    "realtime session.update: dropped built-in tool code_execution "
+                    "(unsupported_by_model): %s does not support code execution",
+                    model,
+                )
+        return mapped
+
+    @staticmethod
+    def _build_thinking_config(model: str, non_default_params: Mapping[str, Any]) -> Optional[GeminiThinkingConfig]:
+        """Resolve the canonical reasoning fields into Gemini's ``thinkingConfig``.
+
+        Gemini 3.x expresses reasoning effort as ``thinkingLevel`` and rejects
+        ``thinkingBudget``; 2.5 is the reverse. The canonical contract keeps the
+        two as separate fields because a token count and an effort level are
+        different concepts, so the field the active model cannot express is
+        dropped here rather than translated into the other.
+        """
+        uses_level = VertexGeminiConfig._is_gemini_3_or_newer(model)
+        thinking_config: GeminiThinkingConfig = {}
+
+        if uses_level:
+            level = non_default_params.get("thinking_level")
+            if level in ("minimal", "low", "medium", "high"):
+                thinking_config["thinkingLevel"] = level
+        else:
+            budget = non_default_params.get("thinking_budget")
+            if isinstance(budget, int) and not isinstance(budget, bool):
+                # 0 disables thinking; a negative budget is meaningless and
+                # would be rejected, so it is raised to that floor.
+                clamped_budget, changed = clamp_numeric(budget, 0, None)
+                if changed:
+                    verbose_logger.warning(
+                        "realtime session.update: clamped thinking_budget %s -> %s "
+                        "(unsupported_by_provider): must be >= 0",
+                        budget,
+                        clamped_budget,
+                    )
+                thinking_config["thinkingBudget"] = cast(int, clamped_budget)
+
+        include_thoughts = non_default_params.get("include_thoughts")
+        if isinstance(include_thoughts, bool):
+            thinking_config["includeThoughts"] = include_thoughts
+
+        return thinking_config or None
+
+    def _apply_turn_detection(self, optional_params: dict, value: OpenAIRealtimeTurnDetection) -> None:
+        realtime_input_config = BidiGenerateContentRealtimeInputConfig()
+
+        skip_activity_detection = (
+            isinstance(value, dict) and value.get("type") == "semantic_vad" and "create_response" not in value
+        )
+        if not skip_activity_detection:
+            # Pipecat/OpenAI GA semantic VAD is skipped above — Gemini uses its
+            # own VAD. The skip is conditional on there being no create_response
+            # override so a guardrail-injected create_response:false survives.
+            transformed_audio_activity_config = self.map_automatic_turn_detection(value)
+            if transformed_audio_activity_config:
+                realtime_input_config["automaticActivityDetection"] = transformed_audio_activity_config
+
+        if isinstance(value, dict):
+            # Barge-in. Unlike the fields above this applies to semantic_vad
+            # too: it governs what happens when speech is detected, not how it
+            # is detected, so it must not be lost with the skip above.
+            interrupt_response = value.get("interrupt_response")
+            if isinstance(interrupt_response, bool):
+                realtime_input_config["activityHandling"] = (
+                    "START_OF_ACTIVITY_INTERRUPTS" if interrupt_response else "NO_INTERRUPTION"
+                )
+            turn_coverage = _TURN_COVERAGE_MAP.get(str(value.get("turn_coverage", "")).lower())
+            if turn_coverage is not None:
+                realtime_input_config["turnCoverage"] = turn_coverage
+
+        if realtime_input_config:
+            optional_params["realtimeInputConfig"] = realtime_input_config
+
+    def map_openai_params(self, optional_params: dict, non_default_params: dict, model: str = "") -> dict:
         if "generationConfig" not in optional_params:
             optional_params["generationConfig"] = {}
         for key, value in non_default_params.items():
             if key == "instructions":
                 optional_params["systemInstruction"] = HttpxContentType(role="user", parts=[{"text": value}])
             elif key == "temperature":
-                optional_params["generationConfig"]["temperature"] = value
+                optional_params["generationConfig"]["temperature"] = self._clamp_generation_param(
+                    "temperature", value
+                )
             elif key in _GEMINI_SAMPLING_PARAM_MAP and isinstance(value, (int, float)) and not isinstance(value, bool):
-                optional_params["generationConfig"][_GEMINI_SAMPLING_PARAM_MAP[key]] = value
+                native_key = _GEMINI_SAMPLING_PARAM_MAP[key]
+                optional_params["generationConfig"][native_key] = self._clamp_generation_param(native_key, value)
             elif key == "max_response_output_tokens":
-                optional_params["generationConfig"]["maxOutputTokens"] = value
+                optional_params["generationConfig"]["maxOutputTokens"] = self._clamp_generation_param(
+                    "maxOutputTokens", value
+                )
             elif key == "modalities":
                 optional_params["generationConfig"]["responseModalities"] = [
                     modality.upper() for modality in cast(List[str], value)
@@ -400,7 +557,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 vertex_gemini_config = VertexGeminiConfig()
                 # Tools should be at the top level of setup, not inside generationConfig
                 optional_params["tools"] = vertex_gemini_config._map_function(
-                    value=value, optional_params=optional_params
+                    value=self._map_builtin_tools(model, cast(List[Any], value)),
+                    optional_params=optional_params,
                 )
             elif key == "input_audio_transcription" and value is not None:
                 optional_params["inputAudioTranscription"] = {}
@@ -417,6 +575,33 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                     optional_params["generationConfig"]["speechConfig"] = speech_config
             elif key == "context_window_compression" and isinstance(value, dict):
                 optional_params["contextWindowCompression"] = _snake_to_camel_keys(value)
+            elif key == "session_resumption" and isinstance(value, dict) and value.get("enabled") is False:
+                # Resumption is always requested on this backend: the proxy's
+                # reconnect path restores sessions from the handle Gemini only
+                # issues when asked. Honoring "off" would break reconnection,
+                # so the request is refused loudly rather than silently ignored.
+                verbose_logger.warning(
+                    "realtime session.update: ignored session_resumption.enabled=false "
+                    "(unsupported_by_provider): Gemini reconnection depends on resumption handles"
+                )
+            elif key == "stop_sequences" and isinstance(value, list):
+                stop_sequences = [item for item in cast(List[Any], value) if isinstance(item, str)]
+                if stop_sequences:
+                    optional_params["generationConfig"]["stopSequences"] = stop_sequences
+            elif key == "media_resolution":
+                media_resolution = _MEDIA_RESOLUTION_MAP.get(str(value).lower())
+                if media_resolution is not None:
+                    optional_params["generationConfig"]["mediaResolution"] = media_resolution
+            elif key == "output_audio_transcription" and value is not None:
+                # Like inputAudioTranscription, Gemini reads an empty object as
+                # "enable with backend defaults"; it has no sub-options here.
+                # Note the initial setup enables this unconditionally (clients
+                # rely on transcripts arriving), so sending it only re-states
+                # that default; it cannot currently be turned off.
+                optional_params["outputAudioTranscription"] = {}
+        thinking_config = self._build_thinking_config(model, non_default_params)
+        if thinking_config is not None:
+            optional_params["generationConfig"]["thinkingConfig"] = thinking_config
         if len(optional_params["generationConfig"]) == 0:
             optional_params.pop("generationConfig")
         return optional_params
@@ -548,13 +733,25 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         # would be silently dropped because ``map_openai_params`` only
         # recognises the flat OpenAI-beta key names.
         session_payload = self._normalize_session_payload_for_mapping(session_payload)
-        new_overrides = self.map_openai_params(optional_params={}, non_default_params=session_payload)
+        new_overrides = self.map_openai_params(
+            optional_params={}, non_default_params=session_payload, model=model
+        )
 
         if session_configuration_request is None:
             generation_config = new_overrides.setdefault("generationConfig", {})
+            # Required by the Gemini Live protocol rather than a litellm opinion.
             generation_config.setdefault("responseModalities", ["AUDIO"])
+            # Always on, both directions. Gemini transcribes natively: there is
+            # no separate ASR to pay for or configure, and it emits no
+            # transcript frames unless asked in setup, so requesting them is
+            # what makes the canonical transcript events the outbound contract
+            # promises actually arrive.
             new_overrides.setdefault("inputAudioTranscription", {})
             new_overrides.setdefault("outputAudioTranscription", {})
+            # The proxy's reconnect logic resumes Gemini sessions from a handle
+            # the backend only issues when this is requested, so it is always
+            # sent; ``session_resumption`` is therefore not a client-facing knob
+            # on this backend.
             new_overrides.setdefault("sessionResumption", {})
             new_overrides["model"] = f"models/{model}"
             verbose_logger.debug("Gemini Realtime: Sending initial setup with tools to backend")
@@ -1897,8 +2094,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         setup = request.get("setup")
         if not isinstance(setup, dict) or update.get("type") != "session.update":
             return None
+        setup_model = str(setup.get("model", "")).removeprefix("models/")
         session_payload = self._normalize_session_payload_for_mapping(update.get("session") or {})
-        new_overrides = self.map_openai_params(optional_params={}, non_default_params=session_payload)
+        new_overrides = self.map_openai_params(
+            optional_params={}, non_default_params=session_payload, model=setup_model
+        )
         merged_generation_config = {
             **setup.get("generationConfig", {}),
             **new_overrides.pop("generationConfig", {}),
@@ -1906,7 +2106,6 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         merged_setup = {**setup, **new_overrides}
         if merged_generation_config:
             merged_setup["generationConfig"] = merged_generation_config
-        setup_model = str(setup.get("model", "")).removeprefix("models/")
         request["setup"] = self._finalize_gemini_live_setup(setup_model, merged_setup)
         return json.dumps(request)
 

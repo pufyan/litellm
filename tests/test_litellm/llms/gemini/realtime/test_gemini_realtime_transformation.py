@@ -2495,3 +2495,546 @@ def test_gemini_multi_item_message_path_allocates_real_incrementing_indices():
     )
     assert done_event["output_index"] == 0
     assert done_event["content_index"] == 0
+
+
+class TestThinkingConfigMapping:
+    """Canonical reasoning fields -> Gemini ``generationConfig.thinkingConfig``.
+
+    Gemini 3.x expresses reasoning effort as ``thinkingLevel`` and does not
+    accept ``thinkingBudget``; 2.5 is the reverse. Before this mapping existed
+    every reasoning field was dropped without reaching ``generationConfig``, so
+    a client disabling thinking for latency kept paying for thinking tokens.
+    """
+
+    GEMINI_3 = "gemini-3.1-flash-live-preview"
+    GEMINI_25 = "gemini-live-2.5-flash-preview-native-audio-09-2025"
+
+    def _generation_config(self, model: str, session: dict) -> dict:
+        config = GeminiRealtimeConfig()
+        mapped = config.map_openai_params(optional_params={}, non_default_params=session, model=model)
+        return mapped.get("generationConfig", {})
+
+    def test_gemini_3_maps_thinking_level(self):
+        generation_config = self._generation_config(self.GEMINI_3, {"thinking_level": "high"})
+
+        assert generation_config["thinkingConfig"] == {"thinkingLevel": "high"}
+
+    def test_gemini_25_maps_thinking_budget(self):
+        generation_config = self._generation_config(self.GEMINI_25, {"thinking_budget": 2048})
+
+        assert generation_config["thinkingConfig"] == {"thinkingBudget": 2048}
+
+    def test_zero_budget_reaches_backend_as_zero(self):
+        """``thinking_budget: 0`` disables thinking; treating 0 as "unset" would
+        silently keep thinking enabled, which is the exact production symptom
+        this mapping exists to fix."""
+        generation_config = self._generation_config(self.GEMINI_25, {"thinking_budget": 0})
+
+        assert generation_config["thinkingConfig"] == {"thinkingBudget": 0}
+
+    def test_budget_is_dropped_on_a_level_based_model(self):
+        """Forwarding ``thinkingBudget`` to Gemini 3.x would be rejected by the
+        backend, so the field the model cannot express is dropped rather than
+        translated into the other one."""
+        generation_config = self._generation_config(self.GEMINI_3, {"thinking_budget": 2048})
+
+        assert "thinkingConfig" not in generation_config
+
+    def test_level_is_dropped_on_a_budget_based_model(self):
+        generation_config = self._generation_config(self.GEMINI_25, {"thinking_level": "high"})
+
+        assert "thinkingConfig" not in generation_config
+
+    def test_sending_both_is_resolved_by_the_proxy_not_rejected(self):
+        """A client may hold both in configuration and forward both; knowing
+        which one a given model wants is backend knowledge it is not supposed to
+        have. The proxy keeps the one the model expresses reasoning in."""
+        generation_config = self._generation_config(
+            self.GEMINI_3, {"thinking_level": "low", "thinking_budget": 2048}
+        )
+
+        assert generation_config["thinkingConfig"] == {"thinkingLevel": "low"}
+
+    def test_include_thoughts_applies_to_both_families(self):
+        for model, field, value in (
+            (self.GEMINI_3, "thinking_level", "low"),
+            (self.GEMINI_25, "thinking_budget", 1024),
+        ):
+            generation_config = self._generation_config(model, {field: value, "include_thoughts": True})
+
+            assert generation_config["thinkingConfig"]["includeThoughts"] is True
+
+    def test_include_thoughts_alone_still_reaches_backend(self):
+        generation_config = self._generation_config(self.GEMINI_3, {"include_thoughts": True})
+
+        assert generation_config["thinkingConfig"] == {"includeThoughts": True}
+
+    def test_absent_reasoning_fields_produce_no_thinking_config(self):
+        """Writing a default would override Gemini's own, which the contract
+        forbids for optional fields."""
+        generation_config = self._generation_config(self.GEMINI_3, {"temperature": 0.8})
+
+        assert "thinkingConfig" not in generation_config
+
+    def test_invalid_level_is_not_forwarded(self):
+        generation_config = self._generation_config(self.GEMINI_3, {"thinking_level": "extreme"})
+
+        assert "thinkingConfig" not in generation_config
+
+    def test_boolean_is_not_accepted_as_a_budget(self):
+        """``True`` is an int in Python; forwarding it would send
+        ``thinkingBudget: true`` and break the setup."""
+        generation_config = self._generation_config(self.GEMINI_25, {"thinking_budget": True})
+
+        assert "thinkingConfig" not in generation_config
+
+    def test_thinking_reaches_the_backend_setup_message(self):
+        """End-to-end through ``transform_realtime_request``: the mapping is
+        worthless if it does not survive into the actual ``setup`` frame."""
+        config = GeminiRealtimeConfig()
+        messages = config.transform_realtime_request(
+            message=json.dumps(
+                {"type": "session.update", "session": {"thinking_level": "medium", "include_thoughts": True}}
+            ),
+            model=self.GEMINI_3,
+            session_configuration_request=None,
+        )
+
+        setup = json.loads(messages[0])["setup"]
+        assert setup["generationConfig"]["thinkingConfig"] == {
+            "thinkingLevel": "medium",
+            "includeThoughts": True,
+        }
+
+
+class TestBargeInMapping:
+    """``turn_detection.interrupt_response`` -> Gemini ``activityHandling``.
+
+    Without this mapping ``NO_INTERRUPTION`` is unreachable, so a session that
+    must not be interrupted mid-utterance cannot be configured at all.
+    """
+
+    MODEL = "gemini-3.1-flash-live-preview"
+
+    def _realtime_input_config(self, turn_detection: dict) -> dict:
+        config = GeminiRealtimeConfig()
+        mapped = config.map_openai_params(
+            optional_params={},
+            non_default_params={"turn_detection": turn_detection},
+            model=self.MODEL,
+        )
+        return mapped.get("realtimeInputConfig", {})
+
+    def test_disabling_interruption_reaches_backend(self):
+        realtime_input_config = self._realtime_input_config(
+            {"type": "server_vad", "interrupt_response": False}
+        )
+
+        assert realtime_input_config["activityHandling"] == "NO_INTERRUPTION"
+
+    def test_enabling_interruption_is_explicit_not_omitted(self):
+        """``true`` is sent rather than left to the backend default so a client
+        re-enabling barge-in mid-configuration is not silently ignored."""
+        realtime_input_config = self._realtime_input_config(
+            {"type": "server_vad", "interrupt_response": True}
+        )
+
+        assert realtime_input_config["activityHandling"] == "START_OF_ACTIVITY_INTERRUPTS"
+
+    def test_omitted_interrupt_response_leaves_backend_default(self):
+        realtime_input_config = self._realtime_input_config({"type": "server_vad"})
+
+        assert "activityHandling" not in realtime_input_config
+
+    def test_barge_in_survives_the_semantic_vad_skip(self):
+        """semantic_vad has no Gemini activity-detection equivalent and is
+        skipped, but barge-in governs what happens *after* speech is detected,
+        so skipping it too would silently drop the client's setting."""
+        realtime_input_config = self._realtime_input_config(
+            {"type": "semantic_vad", "interrupt_response": False}
+        )
+
+        assert realtime_input_config["activityHandling"] == "NO_INTERRUPTION"
+        assert "automaticActivityDetection" not in realtime_input_config
+
+    def test_turn_coverage_is_mapped(self):
+        realtime_input_config = self._realtime_input_config(
+            {"type": "server_vad", "turn_coverage": "all_input"}
+        )
+
+        assert realtime_input_config["turnCoverage"] == "TURN_INCLUDES_ALL_INPUT"
+
+    def test_unknown_turn_coverage_is_not_forwarded(self):
+        realtime_input_config = self._realtime_input_config(
+            {"type": "server_vad", "turn_coverage": "everything"}
+        )
+
+        assert "turnCoverage" not in realtime_input_config
+
+    def test_activity_detection_still_maps_alongside_barge_in(self):
+        """The pre-existing VAD mapping must keep working; barge-in is additive."""
+        realtime_input_config = self._realtime_input_config(
+            {
+                "type": "server_vad",
+                "silence_duration_ms": 700,
+                "start_sensitivity": "low",
+                "interrupt_response": False,
+            }
+        )
+
+        assert realtime_input_config["automaticActivityDetection"] == {
+            "disabled": False,
+            "silenceDurationMs": 700,
+            "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+        }
+        assert realtime_input_config["activityHandling"] == "NO_INTERRUPTION"
+
+    def test_guardrail_create_response_override_is_preserved(self):
+        """Guardrails force ``create_response: False`` to stop the model
+        answering before a transcript is checked; barge-in mapping must not
+        disturb that path."""
+        realtime_input_config = self._realtime_input_config(
+            {"type": "server_vad", "create_response": False}
+        )
+
+        assert realtime_input_config["automaticActivityDetection"]["disabled"] is True
+
+    def test_barge_in_reaches_the_backend_setup_message(self):
+        config = GeminiRealtimeConfig()
+        messages = config.transform_realtime_request(
+            message=json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {"turn_detection": {"type": "server_vad", "interrupt_response": False}},
+                }
+            ),
+            model=self.MODEL,
+            session_configuration_request=None,
+        )
+
+        setup = json.loads(messages[0])["setup"]
+        assert setup["realtimeInputConfig"]["activityHandling"] == "NO_INTERRUPTION"
+
+
+class TestGenerationConfigMapping:
+    """Remaining canonical sampling/generation fields -> ``generationConfig``.
+
+    Each of these was silently dropped before: ``map_openai_params`` is an
+    if/elif chain with no else, so a key missing from the allowlist never
+    reached the backend and the client got no signal.
+    """
+
+    MODEL = "gemini-3.1-flash-live-preview"
+
+    def _generation_config(self, session: dict) -> dict:
+        config = GeminiRealtimeConfig()
+        mapped = config.map_openai_params(optional_params={}, non_default_params=session, model=self.MODEL)
+        return mapped.get("generationConfig", {})
+
+    def test_penalties_are_camel_cased(self):
+        generation_config = self._generation_config({"presence_penalty": 0.4, "frequency_penalty": -0.2})
+
+        assert generation_config["presencePenalty"] == 0.4
+        assert generation_config["frequencyPenalty"] == -0.2
+
+    def test_zero_penalty_is_forwarded(self):
+        """0.0 is a meaningful value, not "unset"; a truthiness check here would
+        silently discard it."""
+        generation_config = self._generation_config({"presence_penalty": 0.0})
+
+        assert generation_config["presencePenalty"] == 0.0
+
+    def test_candidate_count_is_mapped(self):
+        generation_config = self._generation_config({"candidate_count": 2})
+
+        assert generation_config["candidateCount"] == 2
+
+    def test_stop_sequences_are_mapped(self):
+        generation_config = self._generation_config({"stop_sequences": ["STOP", "END"]})
+
+        assert generation_config["stopSequences"] == ["STOP", "END"]
+
+    def test_empty_stop_sequences_are_not_sent(self):
+        """An empty list expresses no constraint; forwarding it would override
+        Gemini's own default with a meaningless value."""
+        generation_config = self._generation_config({"stop_sequences": []})
+
+        assert "stopSequences" not in generation_config
+
+    def test_non_string_stop_sequences_are_filtered_out(self):
+        generation_config = self._generation_config({"stop_sequences": ["STOP", 42, None]})
+
+        assert generation_config["stopSequences"] == ["STOP"]
+
+    def test_media_resolution_maps_to_enum(self):
+        generation_config = self._generation_config({"media_resolution": "low"})
+
+        assert generation_config["mediaResolution"] == "MEDIA_RESOLUTION_LOW"
+
+    def test_unknown_media_resolution_is_not_forwarded(self):
+        generation_config = self._generation_config({"media_resolution": "ultra"})
+
+        assert "mediaResolution" not in generation_config
+
+    def test_booleans_are_not_accepted_as_numeric_params(self):
+        """``True`` is an int in Python; forwarding it would send
+        ``candidateCount: true`` and break the setup."""
+        generation_config = self._generation_config({"candidate_count": True, "presence_penalty": False})
+
+        assert "candidateCount" not in generation_config
+        assert "presencePenalty" not in generation_config
+
+    def test_generation_fields_reach_the_backend_setup_message(self):
+        config = GeminiRealtimeConfig()
+        messages = config.transform_realtime_request(
+            message=json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "presence_penalty": 0.5,
+                        "stop_sequences": ["HALT"],
+                        "media_resolution": "medium",
+                    },
+                }
+            ),
+            model=self.MODEL,
+            session_configuration_request=None,
+        )
+
+        generation_config = json.loads(messages[0])["setup"]["generationConfig"]
+        assert generation_config["presencePenalty"] == 0.5
+        assert generation_config["stopSequences"] == ["HALT"]
+        assert generation_config["mediaResolution"] == "MEDIA_RESOLUTION_MEDIUM"
+
+
+class TestBuiltinToolMapping:
+    """Canonical built-in tools -> Gemini Live native tool entries.
+
+    ``{"type": "code_execution"}`` previously reached ``_map_function`` as a
+    bare type entry, which strips to ``{}`` and is logged as an invalid tool, so
+    code execution was unreachable. It is also 2.5-only.
+    """
+
+    GEMINI_3 = "gemini-3.1-flash-live-preview"
+    GEMINI_25 = "gemini-live-2.5-flash-preview-native-audio-09-2025"
+    FUNCTION = {"type": "function", "name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}
+
+    def _tools(self, model: str, tools: list) -> list:
+        config = GeminiRealtimeConfig()
+        mapped = config.map_openai_params(
+            optional_params={}, non_default_params={"tools": tools}, model=model
+        )
+        return mapped.get("tools", [])
+
+    def test_code_execution_becomes_a_native_tool_on_2_5(self):
+        tools = self._tools(self.GEMINI_25, [self.FUNCTION, {"type": "code_execution"}])
+
+        assert {"code_execution": {}} in tools
+
+    def test_code_execution_is_dropped_on_gemini_3(self):
+        """Gemini 3.x dropped code execution; sending it would be rejected."""
+        tools = self._tools(self.GEMINI_3, [self.FUNCTION, {"type": "code_execution"}])
+
+        assert all("code_execution" not in tool for tool in tools)
+
+    def test_dropping_code_execution_keeps_function_tools(self):
+        tools = self._tools(self.GEMINI_3, [self.FUNCTION, {"type": "code_execution"}])
+
+        declarations = [tool for tool in tools if "function_declarations" in tool]
+        assert declarations[0]["function_declarations"][0]["name"] == "f"
+
+    def test_gemini_3_drop_is_logged(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            self._tools(self.GEMINI_3, [{"type": "code_execution"}])
+
+        assert any("code_execution" in record.message for record in caplog.records)
+
+    def test_function_only_sessions_are_unaffected(self):
+        tools = self._tools(self.GEMINI_25, [self.FUNCTION])
+
+        assert tools == [
+            {"function_declarations": [{"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}]}
+        ]
+
+
+class TestSetupTranscriptionAndResumption:
+    """Gemini transcribes natively in both directions, so both are always
+    requested in ``setup``.
+
+    This is not a litellm opinion about what the client wants: Gemini emits no
+    transcript frames unless asked, and the outbound contract promises
+    canonical transcript events. Because the transcription is native there is
+    no separate ASR model to choose and no extra cost to opt into, so there is
+    nothing for a client to turn off -- unlike backends where input
+    transcription is a separate process that must be configured explicitly.
+    """
+
+    MODEL = "gemini-2.5-flash"
+
+    def _setup(self, session: dict) -> dict:
+        config = GeminiRealtimeConfig()
+        messages = config.transform_realtime_request(
+            json.dumps({"type": "session.update", "session": session}),
+            self.MODEL,
+            session_configuration_request=None,
+        )
+        return json.loads(messages[0])["setup"]
+
+    def test_both_transcriptions_are_on_by_default(self):
+        setup = self._setup({})
+
+        assert setup["inputAudioTranscription"] == {}
+        assert setup["outputAudioTranscription"] == {}
+
+    def test_native_transcription_stays_on_even_if_the_client_sends_null(self):
+        """Turning native transcription off would break the outbound contract's
+        transcript events while saving the client nothing: there is no separate
+        ASR being paid for here."""
+        setup = self._setup(
+            {"input_audio_transcription": None, "output_audio_transcription": None}
+        )
+
+        assert setup["inputAudioTranscription"] == {}
+        assert setup["outputAudioTranscription"] == {}
+
+    def test_explicitly_enabling_still_works(self):
+        setup = self._setup({"input_audio_transcription": {}})
+
+        assert setup["inputAudioTranscription"] == {}
+
+    def test_response_modalities_default_is_kept(self):
+        """Required by the Gemini Live protocol, so this default is sanctioned
+        and must survive alongside the overridable ones."""
+        setup = self._setup({"input_audio_transcription": None})
+
+        assert setup["generationConfig"]["responseModalities"] == ["AUDIO"]
+
+    def test_session_resumption_is_always_requested(self):
+        """The proxy's reconnect path restores Gemini sessions from a handle the
+        backend only issues when resumption is requested."""
+        setup = self._setup({})
+
+        assert setup["sessionResumption"] == {}
+
+    def test_disabling_resumption_is_refused_loudly(self, caplog):
+        """Honoring "off" would break reconnection, so the request is ignored --
+        but ignoring it silently would leave the client believing it took."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            setup = self._setup({"session_resumption": {"enabled": False}})
+
+        assert setup["sessionResumption"] == {}
+        assert any("session_resumption" in record.message for record in caplog.records)
+
+    def test_requesting_resumption_explicitly_is_not_warned_about(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            setup = self._setup({"session_resumption": {"enabled": True}})
+
+        assert setup["sessionResumption"] == {}
+        assert caplog.text == ""
+
+
+class TestGenerationConfigRangeClamping:
+    """Gemini rejects the whole ``setup`` on an out-of-range generationConfig
+    value, so unusable numbers are clamped rather than forwarded."""
+
+    MODEL = "gemini-live-2.5-flash-preview-native-audio-09-2025"
+
+    def _generation_config(self, session: dict) -> dict:
+        config = GeminiRealtimeConfig()
+        mapped = config.map_openai_params(optional_params={}, non_default_params=session, model=self.MODEL)
+        return mapped.get("generationConfig", {})
+
+    @pytest.mark.parametrize(
+        "field, value, native_key, expected",
+        [
+            ("temperature", 99, "temperature", 2.0),
+            ("temperature", -1, "temperature", 0.0),
+            ("top_p", 5.0, "topP", 1.0),
+            ("top_k", -3, "topK", 1),
+            ("presence_penalty", 99, "presencePenalty", 2.0),
+            ("frequency_penalty", -99, "frequencyPenalty", -2.0),
+            ("candidate_count", 999, "candidateCount", 8),
+            ("max_response_output_tokens", -10, "maxOutputTokens", 1),
+        ],
+    )
+    def test_out_of_range_values_are_clamped(self, field, value, native_key, expected):
+        assert self._generation_config({field: value})[native_key] == expected
+
+    def test_in_range_values_are_untouched(self):
+        generation_config = self._generation_config({"temperature": 0.8, "top_p": 0.95, "top_k": 40})
+
+        assert generation_config["temperature"] == 0.8
+        assert generation_config["topP"] == 0.95
+        assert generation_config["topK"] == 40
+
+    def test_negative_thinking_budget_is_raised_to_zero(self):
+        """0 disables thinking; a negative budget has no meaning and would be
+        rejected."""
+        generation_config = self._generation_config({"thinking_budget": -500})
+
+        assert generation_config["thinkingConfig"]["thinkingBudget"] == 0
+
+    def test_zero_thinking_budget_is_still_zero(self):
+        """Guard against a clamp that treats the disabling value as invalid."""
+        generation_config = self._generation_config({"thinking_budget": 0})
+
+        assert generation_config["thinkingConfig"]["thinkingBudget"] == 0
+
+    def test_setup_survives_out_of_range_values(self):
+        config = GeminiRealtimeConfig()
+        messages = config.transform_realtime_request(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {"temperature": 99, "instructions": "Geely assistant"},
+                }
+            ),
+            self.MODEL,
+            session_configuration_request=None,
+        )
+
+        setup = json.loads(messages[0])["setup"]
+        assert setup["generationConfig"]["temperature"] == 2.0
+        assert setup["systemInstruction"]["parts"][0]["text"] == "Geely assistant"
+
+
+class TestTurnCoverageValues:
+    """Every documented turnCoverage value must be reachable.
+
+    Only two of the three usable values were mapped, and the missing one is the
+    default on newer models -- so a client could not restore it after switching
+    away, nor set it explicitly.
+    """
+
+    MODEL = "gemini-3.1-flash-live-preview"
+
+    def _realtime_input_config(self, turn_coverage: str) -> dict:
+        config = GeminiRealtimeConfig()
+        mapped = config.map_openai_params(
+            optional_params={},
+            non_default_params={"turn_detection": {"type": "server_vad", "turn_coverage": turn_coverage}},
+            model=self.MODEL,
+        )
+        return mapped.get("realtimeInputConfig", {})
+
+    @pytest.mark.parametrize(
+        "canonical, native",
+        [
+            ("activity_only", "TURN_INCLUDES_ONLY_ACTIVITY"),
+            ("all_input", "TURN_INCLUDES_ALL_INPUT"),
+            ("audio_activity_and_all_video", "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"),
+        ],
+    )
+    def test_every_canonical_value_maps(self, canonical, native):
+        assert self._realtime_input_config(canonical)["turnCoverage"] == native
+
+    def test_unknown_value_is_dropped(self):
+        """An unrecognized enum has no nearest valid neighbour, so the backend's
+        own per-model default applies instead."""
+        assert "turnCoverage" not in self._realtime_input_config("everything")

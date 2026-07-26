@@ -3454,3 +3454,462 @@ async def test_shutdown_close_swallows_close_errors():
     await streaming.shutdown_close()
 
     assert streaming._shutting_down is True
+
+
+class TestGaAudioFieldRemap:
+    """Canonical audio fields the GA remap previously failed to build.
+
+    ``input_audio_noise_reduction``, ``output_audio_speed`` and ``language`` are
+    all valid GA session inputs, but the remap never lifted them into the nested
+    ``audio`` block, so they were stripped by the allowlist and never reached
+    OpenAI.
+    """
+
+    @staticmethod
+    def _audio(session: dict) -> dict:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        return RealTimeStreaming._remap_beta_session_to_ga(dict(session)).get("audio", {})
+
+    def test_noise_reduction_is_lifted_into_audio_input(self):
+        audio = self._audio({"input_audio_noise_reduction": {"type": "far_field"}})
+
+        assert audio["input"]["noise_reduction"] == {"type": "far_field"}
+
+    def test_explicit_null_noise_reduction_is_forwarded(self):
+        """``None`` turns noise reduction off; dropping it as "empty" would
+        leave the backend default on and silently ignore the client."""
+        audio = self._audio({"input_audio_noise_reduction": None})
+
+        assert audio["input"]["noise_reduction"] is None
+
+    def test_output_speed_is_lifted_into_audio_output(self):
+        audio = self._audio({"output_audio_speed": 1.25})
+
+        assert audio["output"]["speed"] == 1.25
+
+    def test_non_numeric_speed_is_not_forwarded(self):
+        audio = self._audio({"output_audio_speed": "fast"})
+
+        assert audio == {}
+
+    def test_boolean_speed_is_not_forwarded(self):
+        """``True`` is an int in Python; ``speed: true`` would be rejected."""
+        audio = self._audio({"output_audio_speed": True})
+
+        assert audio == {}
+
+    def test_language_is_folded_into_an_existing_transcription_config(self):
+        audio = self._audio(
+            {"language": "ru-RU", "input_audio_transcription": {"model": "whisper-1"}}
+        )
+
+        assert audio["input"]["transcription"] == {"model": "whisper-1", "language": "ru-RU"}
+
+    def test_language_without_transcription_is_dropped_not_invented(self):
+        """GA only transcribes when a model is named, so a bare language has
+        nothing to apply to. Synthesising a transcription model here would be a
+        litellm default overriding the vendor's."""
+        audio = self._audio({"language": "ru-RU"})
+
+        assert audio == {}
+
+    def test_language_without_transcription_is_not_warned_about(self, caplog):
+        """Not a warning: a provider normalizer downstream may still restore the
+        language in its own spelling (xAI's ``language_hint`` needs no
+        transcription model), so warning here would cry wolf on a working
+        session. It is logged at debug instead."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            self._audio({"language": "ru-RU"})
+
+        assert caplog.text == ""
+
+        with caplog.at_level(logging.DEBUG, logger="LiteLLM"):
+            self._audio({"language": "ru-RU"})
+
+        assert any("language" in record.message for record in caplog.records)
+
+    def test_language_does_not_overwrite_the_transcription_model(self):
+        audio = self._audio(
+            {"language": "ru-RU", "input_audio_transcription": {"model": "gpt-4o-transcribe"}}
+        )
+
+        assert audio["input"]["transcription"]["model"] == "gpt-4o-transcribe"
+
+    def test_no_empty_audio_block_when_every_field_was_dropped(self):
+        """An ``audio: {"input": {}}`` shell is not valid GA input."""
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        remapped = RealTimeStreaming._remap_beta_session_to_ga({"language": "ru-RU"})
+
+        assert "audio" not in remapped
+
+    def test_new_fields_coexist_with_the_existing_audio_remap(self):
+        audio = self._audio(
+            {
+                "voice": "marin",
+                "input_audio_transcription": {"model": "whisper-1"},
+                "language": "ru-RU",
+                "input_audio_noise_reduction": {"type": "near_field"},
+                "output_audio_speed": 0.9,
+            }
+        )
+
+        assert audio["output"] == {"voice": "marin", "speed": 0.9}
+        assert audio["input"]["noise_reduction"] == {"type": "near_field"}
+        assert audio["input"]["transcription"] == {"model": "whisper-1", "language": "ru-RU"}
+
+
+@pytest.mark.asyncio
+async def test_canonical_session_reaches_the_provider_normalizer():
+    """The GA allowlist strips fields a non-OpenAI backend can still honor, so
+    the pre-remap payload must be handed to the provider normalizer.
+
+    This exercises the wiring rather than the normalizer: calling
+    ``patch_outgoing_session`` directly would still pass if production code
+    stopped forwarding the canonical session, leaving every xAI-only field
+    silently unreachable again.
+    """
+    from litellm.llms.xai.realtime.transformation import XAIRealtimeNormalizer
+
+    client_ws = MagicMock()
+    client_ws.receive_text = AsyncMock(
+        side_effect=[
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {"instructions": "hi", "thinking_level": "high"},
+                }
+            ),
+            ConnectionClosed(None, None),
+        ]
+    )
+    backend_ws = MagicMock()
+    backend_ws.send = AsyncMock()
+
+    logging_obj = MagicMock()
+    logging_obj.litellm_trace_id = "trace_canonical"
+    logging_obj.async_success_handler = AsyncMock()
+    logging_obj.success_handler = MagicMock()
+
+    streaming = RealTimeStreaming(
+        websocket=client_ws,
+        backend_ws=backend_ws,
+        logging_obj=logging_obj,
+        provider_config=None,
+        model="grok-4-1-fast-non-reasoning",
+        event_normalizer=XAIRealtimeNormalizer(),
+    )
+
+    await streaming.client_ack_messages()
+
+    sent = json.loads(backend_ws.send.call_args_list[0].args[0])
+    assert sent["session"]["reasoning"] == {"effort": "high"}
+    # thinking_level itself is not GA-valid and must not reach the backend
+    assert "thinking_level" not in sent["session"]
+
+
+class TestGaBuiltinToolFiltering:
+    """The GA tools union is function + mcp. Any other canonical built-in is a
+    different backend's capability and previously passed straight through to
+    OpenAI, which rejects the whole session.update on an unknown tool type.
+    """
+
+    @staticmethod
+    def _tools(tools: list) -> object:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        return RealTimeStreaming._remap_beta_session_to_ga({"tools": tools})["tools"]
+
+    def test_foreign_builtin_never_reaches_openai(self):
+        """code_execution is Gemini-only; forwarding it would take down the
+        session, system prompt and every other tool with it."""
+        assert self._tools([{"type": "code_execution"}]) == []
+
+    def test_web_search_is_dropped(self):
+        assert self._tools([{"type": "web_search"}]) == []
+
+    def test_mcp_is_kept(self):
+        mcp = {"type": "mcp", "server_label": "x", "server_url": "https://y"}
+
+        assert self._tools([mcp]) == [mcp]
+
+    def test_function_tools_survive_alongside_a_dropped_builtin(self):
+        """The point of dropping rather than erroring: the rest of the session
+        must still work."""
+        tools = self._tools(
+            [{"type": "function", "name": "f", "parameters": {"type": "OBJECT"}}, {"type": "x_search"}]
+        )
+
+        assert len(tools) == 1
+        assert tools[0]["name"] == "f"
+        # schema normalization still applies to what survives
+        assert tools[0]["parameters"]["type"] == "object"
+
+    def test_drop_is_logged(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            self._tools([{"type": "web_search"}])
+
+        assert any("built-in tool" in record.message for record in caplog.records)
+
+
+class TestGaTranscriptionDefaults:
+    """Input transcription is a separate ASR process on OpenAI, output is not.
+
+    The contract promises canonical transcript events, but how they are obtained
+    differs: the assistant's own transcript arrives automatically (the GA
+    ``audio.output`` object has no transcription field at all), while the user's
+    speech needs an explicitly configured model, costs extra and adds latency.
+    So output stays on by construction and input stays off unless asked -- the
+    opposite of a backend that transcribes natively in both directions.
+    """
+
+    @staticmethod
+    def _remap(session: dict) -> dict:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        return RealTimeStreaming._remap_beta_session_to_ga(dict(session))
+
+    def test_input_transcription_is_not_enabled_by_default(self):
+        """Enabling it would silently start a billable ASR the client never
+        asked for."""
+        remapped = self._remap({"instructions": "hi"})
+
+        assert "transcription" not in remapped.get("audio", {}).get("input", {})
+
+    def test_input_transcription_is_forwarded_when_a_model_is_given(self):
+        remapped = self._remap({"input_audio_transcription": {"model": "whisper-1"}})
+
+        assert remapped["audio"]["input"]["transcription"] == {"model": "whisper-1"}
+
+    def test_output_transcription_is_dropped_because_it_needs_no_config(self):
+        """GA has no audio.output.transcription field: the assistant transcript
+        arrives automatically, so the canonical field has nothing to map to."""
+        remapped = self._remap({"output_audio_transcription": {}})
+
+        assert "output_modalities" not in remapped
+        assert "transcription" not in remapped.get("audio", {}).get("output", {})
+
+    def test_output_transcription_does_not_create_an_empty_audio_block(self):
+        remapped = self._remap({"output_audio_transcription": {}})
+
+        assert "audio" not in remapped
+
+
+class TestTranscriptionKeyterms:
+    """Domain terms biasing recognition, mapped onto the GA transcription prompt.
+
+    GA steers recognition through ``transcription.prompt``, which for
+    keyword-list models is exactly a list of domain terms, so the canonical list
+    joins into it.
+    """
+
+    @staticmethod
+    def _transcription(session: dict) -> object:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        remapped = RealTimeStreaming._remap_beta_session_to_ga(dict(session))
+        return remapped.get("audio", {}).get("input", {}).get("transcription")
+
+    def test_keyterms_join_into_the_prompt(self):
+        transcription = self._transcription(
+            {"transcription_keyterms": ["xAI", "Grok"], "input_audio_transcription": {"model": "whisper-1"}}
+        )
+
+        assert transcription == {"model": "whisper-1", "prompt": "xAI, Grok"}
+
+    def test_keyterms_without_transcription_are_not_applied(self):
+        """Like language, keyterms belong to the transcription config; with no
+        transcription configured there is nothing to steer."""
+        assert self._transcription({"transcription_keyterms": ["xAI"]}) is None
+
+    def test_empty_list_leaves_the_prompt_alone(self):
+        transcription = self._transcription(
+            {"transcription_keyterms": [], "input_audio_transcription": {"model": "whisper-1"}}
+        )
+
+        assert transcription == {"model": "whisper-1"}
+
+    def test_non_string_terms_are_filtered_out(self):
+        transcription = self._transcription(
+            {
+                "transcription_keyterms": ["xAI", 42, None, ""],
+                "input_audio_transcription": {"model": "whisper-1"},
+            }
+        )
+
+        assert transcription["prompt"] == "xAI"
+
+    def test_canonical_key_does_not_leak_to_the_backend(self):
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        remapped = RealTimeStreaming._remap_beta_session_to_ga(
+            {"transcription_keyterms": ["xAI"], "input_audio_transcription": {"model": "whisper-1"}}
+        )
+
+        assert "transcription_keyterms" not in remapped
+
+    def test_keyterms_coexist_with_language(self):
+        transcription = self._transcription(
+            {
+                "transcription_keyterms": ["Grok"],
+                "language": "ja",
+                "input_audio_transcription": {"model": "whisper-1"},
+            }
+        )
+
+        assert transcription == {"model": "whisper-1", "language": "ja", "prompt": "Grok"}
+
+
+class TestGaMaxOutputTokensClamping:
+    """GA takes 1..4096 or "inf"; an out-of-range value rejects the entire
+    session.update.
+
+    Regression: the remap renamed the field without bringing it into range, so
+    a client configured for a backend with a wider ceiling had its whole session
+    configuration refused -- instructions, tools and voice included -- and the
+    model answered with its default persona and no tools.
+    """
+
+    @staticmethod
+    def _remap(session: dict) -> dict:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        return RealTimeStreaming._remap_beta_session_to_ga(dict(session))
+
+    def test_value_above_the_ceiling_is_clamped(self):
+        assert self._remap({"max_response_output_tokens": 8192})["max_output_tokens"] == 4096
+
+    def test_the_rest_of_the_session_survives_an_out_of_range_value(self):
+        """The point of clamping over forwarding: one bad field must not cost
+        the client its system prompt and tools."""
+        remapped = self._remap(
+            {
+                "max_response_output_tokens": 8192,
+                "instructions": "You are a dealership assistant",
+                "tools": [{"type": "function", "name": "attended_transfer"}],
+                "voice": "marin",
+            }
+        )
+
+        assert remapped["instructions"] == "You are a dealership assistant"
+        assert remapped["tools"][0]["name"] == "attended_transfer"
+        assert remapped["audio"]["output"]["voice"] == "marin"
+
+    def test_in_range_values_are_untouched(self):
+        assert self._remap({"max_response_output_tokens": 2048})["max_output_tokens"] == 2048
+
+    def test_the_ceiling_itself_is_not_clamped(self):
+        assert self._remap({"max_response_output_tokens": 4096})["max_output_tokens"] == 4096
+
+    def test_zero_and_negative_are_raised_to_the_floor(self):
+        """GA's minimum is 1; 0 is as invalid as 8192 and rejects the update."""
+        assert self._remap({"max_response_output_tokens": 0})["max_output_tokens"] == 1
+        assert self._remap({"max_response_output_tokens": -5})["max_output_tokens"] == 1
+
+    def test_inf_passes_through(self):
+        """"inf" is GA-valid and means "the model's own maximum"; clamping it to
+        a number would silently cap a client asking for no cap."""
+        assert self._remap({"max_response_output_tokens": "inf"})["max_output_tokens"] == "inf"
+
+    def test_clamping_is_logged(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            self._remap({"max_response_output_tokens": 8192})
+
+        assert any("8192" in record.message and "4096" in record.message for record in caplog.records)
+
+    def test_in_range_value_is_not_logged(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            self._remap({"max_response_output_tokens": 2048})
+
+        assert caplog.text == ""
+
+    def test_boolean_is_not_treated_as_a_token_count(self):
+        """``True`` is an int in Python; clamping it to 1 would invent a limit
+        the client never asked for."""
+        assert self._remap({"max_response_output_tokens": True})["max_output_tokens"] is True
+
+
+class TestGaRangeClamping:
+    """Every GA field with a documented range, not just max_output_tokens.
+
+    The production incident came from one unclamped field; these are the rest of
+    the same class, each of which rejects the whole session.update -- and with
+    it the system prompt, tools and voice.
+    """
+
+    @staticmethod
+    def _audio(session: dict) -> dict:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        return RealTimeStreaming._remap_beta_session_to_ga(dict(session)).get("audio", {})
+
+    def test_speed_above_range_is_clamped(self):
+        assert self._audio({"output_audio_speed": 5.0})["output"]["speed"] == 1.5
+
+    def test_speed_below_range_is_clamped(self):
+        assert self._audio({"output_audio_speed": 0.1})["output"]["speed"] == 0.25
+
+    def test_speed_in_range_is_untouched(self):
+        assert self._audio({"output_audio_speed": 1.2})["output"]["speed"] == 1.2
+
+    def test_vad_threshold_is_clamped_to_a_probability(self):
+        turn_detection = self._audio({"turn_detection": {"type": "server_vad", "threshold": 9.9}})["input"][
+            "turn_detection"
+        ]
+
+        assert turn_detection["threshold"] == 1.0
+
+    def test_negative_durations_are_raised_to_zero(self):
+        turn_detection = self._audio(
+            {"turn_detection": {"type": "server_vad", "prefix_padding_ms": -100, "silence_duration_ms": -1}}
+        )["input"]["turn_detection"]
+
+        assert turn_detection["prefix_padding_ms"] == 0
+        assert turn_detection["silence_duration_ms"] == 0
+
+    def test_unknown_eagerness_is_dropped_not_clamped(self):
+        """An enum has no nearest valid value; dropping lets the backend apply
+        its own default instead of guessing one."""
+        turn_detection = self._audio({"turn_detection": {"type": "semantic_vad", "eagerness": "insane"}})["input"][
+            "turn_detection"
+        ]
+
+        assert "eagerness" not in turn_detection
+        assert turn_detection["type"] == "semantic_vad"
+
+    def test_known_eagerness_survives(self):
+        turn_detection = self._audio({"turn_detection": {"type": "semantic_vad", "eagerness": "low"}})["input"][
+            "turn_detection"
+        ]
+
+        assert turn_detection["eagerness"] == "low"
+
+    def test_the_session_survives_every_out_of_range_field_at_once(self):
+        """The whole point: a client with several bad numbers still gets its
+        prompt and tools applied."""
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        remapped = RealTimeStreaming._remap_beta_session_to_ga(
+            {
+                "max_response_output_tokens": 8192,
+                "output_audio_speed": 9.0,
+                "turn_detection": {"type": "server_vad", "threshold": 5.0},
+                "instructions": "Geely dealership assistant",
+                "tools": [{"type": "function", "name": "attended_transfer"}],
+            }
+        )
+
+        assert remapped["max_output_tokens"] == 4096
+        assert remapped["audio"]["output"]["speed"] == 1.5
+        assert remapped["audio"]["input"]["turn_detection"]["threshold"] == 1.0
+        assert remapped["instructions"] == "Geely dealership assistant"
+        assert remapped["tools"][0]["name"] == "attended_transfer"

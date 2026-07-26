@@ -1,5 +1,7 @@
 from typing import List
 
+import pytest
+
 from litellm.llms.xai.realtime.transformation import XAIRealtimeNormalizer
 
 
@@ -199,3 +201,209 @@ def test_usage_normalization_still_works():
     normalizer = XAIRealtimeNormalizer()
     event = normalizer.normalize({"type": "response.done", "response": {"usage": {}}})
     assert event["response"]["usage"]["total_tokens"] == 0
+
+
+class TestXaiOnlyFieldRestoration:
+    """Canonical fields xAI honors that the OpenAI GA allowlist strips.
+
+    xAI rides the OpenAI-compatible passthrough path, so a client's
+    ``session.update`` is filtered against the GA schema before it reaches the
+    backend. Anything GA has no field for -- reasoning effort, resumption --
+    was therefore unreachable on xAI even though xAI documents both.
+    """
+
+    @staticmethod
+    def _patched(canonical: dict) -> dict:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        normalizer = XAIRealtimeNormalizer()
+        ga_session = RealTimeStreaming._remap_beta_session_to_ga(dict(canonical))
+        return normalizer.patch_outgoing_session(ga_session, dict(canonical))
+
+    def test_thinking_level_becomes_reasoning_effort(self):
+        assert self._patched({"thinking_level": "high"})["reasoning"] == {"effort": "high"}
+
+    @pytest.mark.parametrize(
+        "level, effort",
+        [("minimal", "none"), ("low", "none"), ("medium", "high"), ("high", "high")],
+    )
+    def test_all_canonical_levels_collapse_onto_xai_rungs(self, level, effort):
+        """xAI documents two rungs where the contract offers four; every
+        canonical level must still land on one of them rather than being
+        dropped for lack of an exact match."""
+        assert self._patched({"thinking_level": level})["reasoning"] == {"effort": effort}
+
+    def test_unknown_level_is_not_forwarded(self):
+        assert "reasoning" not in self._patched({"thinking_level": "extreme"})
+
+    def test_session_resumption_becomes_resumption(self):
+        patched = self._patched({"session_resumption": {"enabled": True}})
+
+        assert patched["resumption"] == {"enabled": True}
+
+    def test_resumption_disabled_is_forwarded_explicitly(self):
+        """``False`` is a request to turn xAI's default off, not an omission."""
+        patched = self._patched({"session_resumption": {"enabled": False}})
+
+        assert patched["resumption"] == {"enabled": False}
+
+    def test_resumption_without_enabled_is_not_forwarded(self):
+        assert "resumption" not in self._patched({"session_resumption": {}})
+
+    def test_absent_fields_add_nothing(self):
+        patched = self._patched({"instructions": "hi"})
+
+        assert "reasoning" not in patched
+        assert "resumption" not in patched
+
+    def test_ga_fields_still_survive_alongside_the_restored_ones(self):
+        """The restoration must not clobber what the GA remap produced."""
+        patched = self._patched(
+            {"instructions": "be brief", "voice": "eve", "thinking_level": "low"}
+        )
+
+        assert patched["instructions"] == "be brief"
+        assert patched["audio"]["output"]["voice"] == "eve"
+        assert patched["reasoning"] == {"effort": "none"}
+
+    def test_create_response_default_still_applies(self):
+        """Pre-existing behavior: xAI does not default create_response for
+        server_vad, so the normalizer fills it."""
+        patched = self._patched({"turn_detection": {"type": "server_vad"}})
+
+        assert patched["audio"]["input"]["turn_detection"]["create_response"] is True
+
+    def test_without_canonical_session_only_the_ga_patch_runs(self):
+        """Backends on the beta path pass no canonical session; the hook must
+        stay a no-op for the restoration half rather than raising."""
+        normalizer = XAIRealtimeNormalizer()
+
+        patched = normalizer.patch_outgoing_session({"turn_detection": {"type": "server_vad"}})
+
+        assert patched["turn_detection"]["create_response"] is True
+        assert "reasoning" not in patched
+
+
+class TestXaiTranscriptionLanguage:
+    """xAI biases recognition with ``language_hint`` and takes no transcription
+    ``model``, while the GA normalizer drops any transcription config that has
+    no model -- so a canonical ``language`` was unreachable on xAI entirely.
+    """
+
+    @staticmethod
+    def _audio(canonical: dict) -> dict:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        normalizer = XAIRealtimeNormalizer()
+        ga_session = RealTimeStreaming._remap_beta_session_to_ga(dict(canonical))
+        return normalizer.patch_outgoing_session(ga_session, dict(canonical)).get("audio", {})
+
+    def test_language_alone_reaches_xai_as_language_hint(self):
+        """The GA path drops a bare language for lack of a transcription model;
+        xAI needs no model, so it must be rebuilt from the canonical payload."""
+        audio = self._audio({"language": "ja"})
+
+        assert audio["input"]["transcription"] == {"language_hint": "ja"}
+
+    def test_transcription_model_is_stripped(self):
+        """xAI does not accept a transcription model; forwarding OpenAI's would
+        be an unknown field."""
+        audio = self._audio(
+            {"language": "es-MX", "input_audio_transcription": {"model": "whisper-1"}}
+        )
+
+        assert audio["input"]["transcription"] == {"language_hint": "es-MX"}
+
+    def test_canonical_language_key_does_not_leak(self):
+        audio = self._audio({"language": "ru-RU"})
+
+        assert "language" not in audio["input"]["transcription"]
+
+    def test_without_language_the_transcription_block_is_untouched(self):
+        audio = self._audio({"input_audio_transcription": {"model": "whisper-1"}})
+
+        assert audio["input"]["transcription"] == {"model": "whisper-1"}
+
+    def test_language_coexists_with_other_audio_settings(self):
+        audio = self._audio(
+            {
+                "language": "ru-RU",
+                "output_audio_speed": 1.2,
+                "turn_detection": {"type": "server_vad", "idle_timeout_ms": 5000},
+            }
+        )
+
+        assert audio["input"]["transcription"] == {"language_hint": "ru-RU"}
+        assert audio["output"]["speed"] == 1.2
+        assert audio["input"]["turn_detection"]["idle_timeout_ms"] == 5000
+
+    def test_empty_language_is_ignored(self):
+        audio = self._audio({"language": ""})
+
+        assert audio == {}
+
+
+class TestXaiKeyterms:
+    """xAI takes domain terms as a ``keyterms`` array, not a prompt string.
+
+    The GA remap folds the canonical list into ``transcription.prompt`` and
+    drops the whole block when no transcription model is named -- neither of
+    which suits xAI, so the block is rebuilt from the canonical payload.
+    """
+
+    @staticmethod
+    def _transcription(canonical: dict) -> dict:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        normalizer = XAIRealtimeNormalizer()
+        ga_session = RealTimeStreaming._remap_beta_session_to_ga(dict(canonical))
+        patched = normalizer.patch_outgoing_session(ga_session, dict(canonical))
+        return patched.get("audio", {}).get("input", {}).get("transcription", {})
+
+    def test_keyterms_stay_a_list(self):
+        transcription = self._transcription({"transcription_keyterms": ["xAI", "Grok"]})
+
+        assert transcription["keyterms"] == ["xAI", "Grok"]
+
+    def test_keyterms_work_without_a_transcription_model(self):
+        """xAI needs no ASR model, so the GA drop must not take keyterms with
+        it."""
+        transcription = self._transcription({"transcription_keyterms": ["Grok"]})
+
+        assert transcription == {"keyterms": ["Grok"]}
+
+    def test_ga_prompt_form_does_not_leak(self):
+        """Sending both the joined prompt and the list would state the same
+        intent twice, in a field xAI does not define."""
+        transcription = self._transcription(
+            {"transcription_keyterms": ["xAI", "Grok"], "input_audio_transcription": {"model": "whisper-1"}}
+        )
+
+        assert "prompt" not in transcription
+        assert transcription["keyterms"] == ["xAI", "Grok"]
+
+    def test_keyterms_and_language_hint_coexist(self):
+        transcription = self._transcription({"transcription_keyterms": ["Grok"], "language": "ja"})
+
+        assert transcription == {"language_hint": "ja", "keyterms": ["Grok"]}
+
+    def test_non_string_terms_are_filtered_out(self):
+        transcription = self._transcription({"transcription_keyterms": ["Grok", 42, ""]})
+
+        assert transcription["keyterms"] == ["Grok"]
+
+    def test_empty_keyterms_add_nothing(self):
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        normalizer = XAIRealtimeNormalizer()
+        canonical = {"transcription_keyterms": []}
+        ga_session = RealTimeStreaming._remap_beta_session_to_ga(dict(canonical))
+
+        assert "audio" not in normalizer.patch_outgoing_session(ga_session, canonical)
+
+    def test_language_alone_still_works(self):
+        """Guard for the shared code path: adding keyterms must not disturb the
+        language-only case."""
+        transcription = self._transcription({"language": "es-MX"})
+
+        assert transcription == {"language_hint": "es-MX"}

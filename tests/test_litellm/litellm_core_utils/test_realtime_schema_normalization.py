@@ -144,3 +144,136 @@ class TestNormalizeTranscriptionAndVoice:
 
     def test_voice_string_passthrough(self):
         assert normalize_voice_for_ga("marin") == "marin"
+
+
+class TestFilterBuiltinTools:
+    """Built-in tools are typed ``tools[]`` entries, so a backend that cannot
+    provide one must have it removed: an unknown tool type is not ignored, it
+    rejects the whole session.update along with the system prompt.
+    """
+
+    def test_unsupported_builtin_is_dropped_and_reported(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import filter_builtin_tools
+
+        tools, dropped = filter_builtin_tools([{"type": "web_search"}], frozenset({"mcp"}))
+
+        assert tools == []
+        assert dropped == ["web_search"]
+
+    def test_supported_builtin_passes_through(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import filter_builtin_tools
+
+        mcp = {"type": "mcp", "server_label": "x", "server_url": "https://y"}
+        tools, dropped = filter_builtin_tools([mcp], frozenset({"mcp"}))
+
+        assert tools == [mcp]
+        assert dropped == []
+
+    def test_function_tools_are_never_filtered(self):
+        """Function tools are the one capability every backend has; gating them
+        on a support set would break every session."""
+        from litellm.litellm_core_utils.realtime_schema_normalization import filter_builtin_tools
+
+        fn = {"type": "function", "name": "f", "parameters": {"type": "object"}}
+        tools, dropped = filter_builtin_tools([fn], frozenset())
+
+        assert tools == [fn]
+        assert dropped == []
+
+    def test_unknown_tool_types_are_left_alone(self):
+        """Only canonical built-ins are gated; anything else is a provider's own
+        shape whose handling belongs to that provider."""
+        from litellm.litellm_core_utils.realtime_schema_normalization import filter_builtin_tools
+
+        tools, dropped = filter_builtin_tools([{"type": "computer_use"}], frozenset({"mcp"}))
+
+        assert tools == [{"type": "computer_use"}]
+        assert dropped == []
+
+    def test_mixed_list_keeps_order_of_survivors(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import filter_builtin_tools
+
+        fn = {"type": "function", "name": "f"}
+        tools, dropped = filter_builtin_tools(
+            [fn, {"type": "web_search"}, {"type": "mcp"}, {"type": "code_execution"}],
+            frozenset({"mcp"}),
+        )
+
+        assert tools == [fn, {"type": "mcp"}]
+        assert sorted(dropped) == ["code_execution", "web_search"]
+
+    def test_non_list_input_passes_through(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import filter_builtin_tools
+
+        tools, dropped = filter_builtin_tools(None, frozenset({"mcp"}))
+
+        assert tools is None
+        assert dropped == []
+
+
+class TestClampNumeric:
+    """Out-of-range values reject a backend's whole session.update, so numbers
+    are brought to the nearest bound instead of forwarded."""
+
+    def test_above_maximum_is_clamped(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
+
+        assert clamp_numeric(9.9, 0.0, 1.0) == (1.0, True)
+
+    def test_below_minimum_is_clamped(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
+
+        assert clamp_numeric(-5, 1, 4096) == (1, True)
+
+    def test_in_range_reports_no_change(self):
+        """The changed flag drives the log line; reporting a change that did not
+        happen would cry wolf on every valid session."""
+        from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
+
+        assert clamp_numeric(0.5, 0.0, 1.0) == (0.5, False)
+
+    def test_int_stays_int(self):
+        """Sending a float where the backend expects a token count would be a
+        different kind of invalid."""
+        from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
+
+        clamped, _ = clamp_numeric(9999, 1, 4096)
+        assert clamped == 4096 and isinstance(clamped, int)
+
+    def test_open_ended_range_only_clamps_the_given_side(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
+
+        assert clamp_numeric(10_000_000, 1, None) == (10_000_000, False)
+        assert clamp_numeric(-1, 0, None) == (0, True)
+
+    def test_strings_pass_through(self):
+        """GA's "inf" is a valid value, not a number to be clamped."""
+        from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
+
+        assert clamp_numeric("inf", 1, 4096) == ("inf", False)
+
+    def test_bool_is_not_treated_as_a_number(self):
+        """``True`` is an int in Python; clamping it would invent a setting."""
+        from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
+
+        assert clamp_numeric(True, 1, 4096) == (True, False)
+
+
+class TestKeepEnum:
+    """An out-of-range enum has no nearest valid neighbour, so it is dropped and
+    the backend's own default applies."""
+
+    def test_known_value_is_kept(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import keep_enum
+
+        assert keep_enum("high", frozenset({"low", "high"})) == ("high", False)
+
+    def test_unknown_value_is_reported_for_dropping(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import keep_enum
+
+        assert keep_enum("insane", frozenset({"low", "high"})) == (None, True)
+
+    def test_non_string_is_reported_for_dropping(self):
+        from litellm.litellm_core_utils.realtime_schema_normalization import keep_enum
+
+        assert keep_enum(42, frozenset({"low", "high"})) == (None, True)

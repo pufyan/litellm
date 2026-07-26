@@ -19,11 +19,32 @@ and ``RealTimeStreaming`` stays provider-agnostic.
 from typing import Any, FrozenSet, Optional
 
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
 from litellm.litellm_core_utils.realtime_correlation import (
     RealtimeCorrelationState,
     track_content_index,
     track_output_index,
 )
+
+
+# Canonical thinking_level -> xAI reasoning.effort. xAI documents two rungs
+# ("high", the default, and "none"), so the four canonical levels collapse onto
+# them: the two lower levels ask for as little reasoning as possible.
+_XAI_REASONING_EFFORT_MAP: "dict[str, str]" = {
+    "minimal": "none",
+    "low": "none",
+    "medium": "high",
+    "high": "high",
+}
+
+
+# Documented xAI ranges, narrower than GA's. The shared remap has already
+# clamped these to GA bounds, so they are re-clamped here to xAI's own.
+# https://docs.x.ai/developers/model-capabilities/audio/voice-agent
+_XAI_OUTPUT_SPEED_MIN = 0.7
+_XAI_OUTPUT_SPEED_MAX = 1.5
+_XAI_VAD_THRESHOLD_MIN = 0.1
+_XAI_VAD_THRESHOLD_MAX = 0.9
 
 
 def _derive_ga_server_event_types() -> Optional[FrozenSet[str]]:
@@ -135,17 +156,134 @@ class XAIRealtimeNormalizer:
         event = self._normalize_response_usage_event(event, event_type)
         return event
 
-    def patch_outgoing_session(self, session: dict) -> dict:
+    def patch_outgoing_session(self, session: dict, canonical_session: Optional[dict] = None) -> dict:
         """Patch a client ``session.update`` payload before forwarding to xAI.
 
-        Unlike OpenAI, xAI does not default ``turn_detection.create_response``
-        to ``True`` for ``server_vad``. Clients such as Pipecat omit the field,
-        which leaves VAD detecting speech but never auto-creating a response.
-        Only fill the default when the client did not set ``create_response``.
+        Two jobs. First, xAI does not default ``turn_detection.create_response``
+        to ``True`` for ``server_vad`` the way OpenAI does; clients such as
+        Pipecat omit the field, which leaves VAD detecting speech but never
+        auto-creating a response, so the default is filled in when the client
+        did not set it.
+
+        Second, xAI accepts configuration OpenAI GA has no field for, which the
+        GA allowlist therefore strips before this point. ``canonical_session``
+        is the client's payload as it arrived, so those fields can be restored
+        in xAI's own spelling.
         """
         session = dict(session)
         self._default_server_vad_create_response(session)
+        if canonical_session:
+            self._apply_xai_only_fields(session, canonical_session)
         return session
+
+    @staticmethod
+    def _apply_xai_only_fields(session: dict, canonical: dict) -> None:
+        """Restore canonical fields xAI honors but the GA allowlist dropped."""
+        reasoning_effort = _XAI_REASONING_EFFORT_MAP.get(str(canonical.get("thinking_level", "")).lower())
+        if reasoning_effort is not None:
+            # xAI offers two rungs where the contract offers four, so the four
+            # canonical levels collapse onto them. Documented here rather than
+            # in the contract, which owns meaning, not per-backend degradation.
+            session["reasoning"] = {"effort": reasoning_effort}
+
+        session_resumption = canonical.get("session_resumption")
+        if isinstance(session_resumption, dict) and isinstance(session_resumption.get("enabled"), bool):
+            session["resumption"] = {"enabled": session_resumption["enabled"]}
+
+        XAIRealtimeNormalizer._apply_transcription_fields(session, canonical)
+        XAIRealtimeNormalizer._clamp_xai_audio_ranges(session)
+
+    @staticmethod
+    def _clamp_xai_audio_ranges(session: dict) -> None:
+        """Re-clamp audio tuning to xAI's ranges, which are narrower than GA's.
+
+        A value the shared remap left alone because GA accepts it can still be
+        out of range here, and xAI rejects the whole session.update on one.
+        """
+        audio = session.get("audio")
+        if not isinstance(audio, dict):
+            return
+        audio = dict(audio)
+
+        audio_output = audio.get("output")
+        if isinstance(audio_output, dict) and "speed" in audio_output:
+            audio_output = dict(audio_output)
+            audio_output["speed"] = XAIRealtimeNormalizer._clamp_logged(
+                audio_output["speed"], _XAI_OUTPUT_SPEED_MIN, _XAI_OUTPUT_SPEED_MAX, "output_audio_speed"
+            )
+            audio["output"] = audio_output
+
+        audio_input = audio.get("input")
+        if isinstance(audio_input, dict):
+            turn_detection = audio_input.get("turn_detection")
+            if isinstance(turn_detection, dict) and "threshold" in turn_detection:
+                audio_input = dict(audio_input)
+                turn_detection = dict(turn_detection)
+                turn_detection["threshold"] = XAIRealtimeNormalizer._clamp_logged(
+                    turn_detection["threshold"],
+                    _XAI_VAD_THRESHOLD_MIN,
+                    _XAI_VAD_THRESHOLD_MAX,
+                    "turn_detection.threshold",
+                )
+                audio_input["turn_detection"] = turn_detection
+                audio["input"] = audio_input
+
+        session["audio"] = audio
+
+    @staticmethod
+    def _clamp_logged(value: object, minimum: float, maximum: float, field: str) -> object:
+        clamped, changed = clamp_numeric(value, minimum, maximum)
+        if changed:
+            verbose_logger.warning(
+                "realtime session.update: clamped %s %s -> %s (unsupported_by_provider): xAI accepts %s..%s",
+                field,
+                value,
+                clamped,
+                minimum,
+                maximum,
+            )
+        return clamped
+
+    @staticmethod
+    def _apply_transcription_fields(session: dict, canonical: dict) -> None:
+        """Rewrite the transcription block into xAI's spelling.
+
+        xAI biases recognition with ``language_hint`` and a ``keyterms`` array
+        and, unlike OpenAI, takes no transcription ``model``. The GA normalizer
+        drops any transcription config without a model and folds keyterms into a
+        prompt string, so both canonical fields would otherwise be unreachable
+        here; they are rebuilt from the pre-remap payload instead.
+        """
+        language = canonical.get("language")
+        language = language if isinstance(language, str) and language else None
+        raw_keyterms = canonical.get("transcription_keyterms")
+        keyterms = (
+            [term for term in raw_keyterms if isinstance(term, str) and term]
+            if isinstance(raw_keyterms, list)
+            else []
+        )
+        if language is None and not keyterms:
+            return
+
+        audio = session.get("audio")
+        audio = dict(audio) if isinstance(audio, dict) else {}
+        audio_input = audio.get("input")
+        audio_input = dict(audio_input) if isinstance(audio_input, dict) else {}
+
+        transcription = audio_input.get("transcription")
+        transcription = dict(transcription) if isinstance(transcription, dict) else {}
+        transcription.pop("model", None)
+        transcription.pop("language", None)
+        # The GA remap folds keyterms into a prompt string; xAI takes the list.
+        transcription.pop("prompt", None)
+        if language is not None:
+            transcription["language_hint"] = language
+        if keyterms:
+            transcription["keyterms"] = keyterms
+
+        audio_input["transcription"] = transcription
+        audio["input"] = audio_input
+        session["audio"] = audio
 
     @staticmethod
     def _default_server_vad_create_response(session: dict) -> None:
