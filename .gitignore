@@ -145,3 +145,4 @@ ui/litellm-dashboard/out/
 *.log
 litellm_migration_analysis.md
 UPDATE_FROM_UPSTREAM.md
+litellm.log
