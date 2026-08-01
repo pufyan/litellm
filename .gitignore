@@ -143,3 +143,5 @@ crash.*.log
 ui/litellm-dashboard/out/
 .mcp.json
 *.log
+litellm.log
+
