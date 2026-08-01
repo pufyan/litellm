@@ -1310,24 +1310,28 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         transformed_message: Union[OpenAIRealtimeEvents, List[OpenAIRealtimeEvents]],
         current_item_chunks: Optional[List[OpenAIRealtimeOutputItemDone]],
     ) -> Optional[List[OpenAIRealtimeOutputItemDone]]:
+        """Accumulate ``response.output_item.done`` events for the turn in progress.
+
+        Purely additive: a frame that carries no ``output_item.done`` leaves
+        ``current_item_chunks`` untouched. Turn boundaries are the caller's
+        responsibility (``handle_openai_realtime_response`` clears the
+        accumulator once ``response.done`` has consumed it) — this method must
+        never itself wipe items closed by an earlier frame just because the
+        current one, e.g. a standalone usageMetadata frame, happens not to
+        carry another ``output_item.done``. Doing so previously caused
+        ``response.done.response.output`` to go out empty despite the item
+        having already closed.
+        """
         try:
-            if isinstance(transformed_message, list):
-                current_item_chunks = []
-                any_item_chunk = False
-                for event in transformed_message:
-                    if event["type"] == "response.output_item.done":
-                        current_item_chunks.append(cast(OpenAIRealtimeOutputItemDone, event))
-                        any_item_chunk = True
-                if not any_item_chunk:
-                    current_item_chunks = None
-            else:
-                if transformed_message["type"] == "response.output_item.done":
-                    if current_item_chunks is None:
-                        current_item_chunks = []
-                    current_item_chunks.append(cast(OpenAIRealtimeOutputItemDone, transformed_message))
-                else:
-                    current_item_chunks = None
-            return current_item_chunks
+            events = transformed_message if isinstance(transformed_message, list) else [transformed_message]
+            new_chunks = [
+                cast(OpenAIRealtimeOutputItemDone, event)
+                for event in events
+                if event["type"] == "response.output_item.done"
+            ]
+            if not new_chunks:
+                return current_item_chunks
+            return (current_item_chunks or []) + new_chunks
         except Exception as e:
             raise ValueError(f"Error updating current item chunks: {e}, got transformed_message: {transformed_message}")
 
@@ -1979,6 +1983,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 returned_message.append(transformed_response_done_event)
                 current_output_item_id = None
                 current_response_id = None
+                # The turn is over and its items are already consumed into
+                # transformed_response_done_event above; explicitly clear the
+                # accumulator so the next turn starts from empty (update_current_item_chunks
+                # itself only ever appends, it never wipes on the caller's behalf).
+                current_item_chunks = None
             elif (
                 openai_event == OpenAIRealtimeEventTypes.RESPONSE_TEXT_DELTA
                 or openai_event == OpenAIRealtimeEventTypes.RESPONSE_TEXT_DONE
