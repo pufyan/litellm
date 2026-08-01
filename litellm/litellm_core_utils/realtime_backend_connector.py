@@ -1,5 +1,5 @@
 import ssl
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Mapping, Optional
 
 from litellm.constants import REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
@@ -22,6 +22,15 @@ class RealtimeBackendConnector:
     ssl_context: "ssl.SSLContext | bool | None" = None
     open_timeout: Optional[float] = None
     max_attempts: int = 1
+
+    def with_url(self, url: str) -> "RealtimeBackendConnector":
+        """Return a copy of this connector dialing ``url`` instead.
+
+        Used by native session resumption schemes that deliver their
+        resumption token via a reconnect URL query parameter (e.g. xAI's
+        ``?conversation_id=``) rather than a first-message payload.
+        """
+        return replace(self, url=url)
 
     async def connect(self) -> "ClientConnection":
         """Open the backend realtime websocket, retrying a hung open handshake.

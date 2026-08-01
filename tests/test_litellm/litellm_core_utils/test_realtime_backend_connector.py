@@ -75,3 +75,24 @@ async def test_connect_omits_open_timeout_when_not_configured():
         await connector.connect()
 
     assert "open_timeout" not in mock_connect.call_args.kwargs
+
+
+def test_with_url_returns_new_instance_with_only_url_changed():
+    connector = RealtimeBackendConnector(
+        url="wss://example.com/ws?model=grok",
+        headers={"Authorization": "Bearer sk-test"},
+        ssl_context=None,
+        open_timeout=8.0,
+        max_attempts=3,
+    )
+
+    resumed = connector.with_url("wss://example.com/ws?model=grok&conversation_id=abc123")
+
+    assert resumed.url == "wss://example.com/ws?model=grok&conversation_id=abc123"
+    assert resumed.headers == connector.headers
+    assert resumed.ssl_context == connector.ssl_context
+    assert resumed.open_timeout == connector.open_timeout
+    assert resumed.max_attempts == connector.max_attempts
+    # The original instance is untouched (frozen dataclass, no mutation).
+    assert connector.url == "wss://example.com/ws?model=grok"
+    assert resumed is not connector

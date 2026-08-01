@@ -12,6 +12,7 @@ import litellm
 sys.path.insert(0, os.path.abspath("../../.."))  # Adds the parent directory to the system path
 
 from litellm.integrations.custom_guardrail import CustomGuardrail
+from litellm.litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
 from litellm.litellm_core_utils.realtime_streaming import (
     RealTimeStreaming,
     client_sent_openai_beta_realtime_header,
@@ -95,9 +96,7 @@ def test_remap_beta_session_to_ga_renames_max_response_output_tokens():
 def test_remap_beta_session_to_ga_canonical_name_wins_over_ga_alias():
     """One field, one address: the client-sent GA alias is dropped and the
     canonical name is authoritative."""
-    out = RealTimeStreaming._remap_beta_session_to_ga(
-        {"max_response_output_tokens": 4096, "max_output_tokens": "inf"}
-    )
+    out = RealTimeStreaming._remap_beta_session_to_ga({"max_response_output_tokens": 4096, "max_output_tokens": "inf"})
     assert "max_response_output_tokens" not in out
     assert out["max_output_tokens"] == 4096
 
@@ -292,6 +291,105 @@ class TestPassthroughBackendReconnect:
         mock_reconnect.assert_not_awaited()
 
 
+class TestXaiNativeResumptionReconnect:
+    """xAI's own conversation_id-based resumption
+    (https://docs.x.ai/build/features/sessions), wired entirely inside the
+    ``provider_config is None`` passthrough path via ``self._event_normalizer``
+    — must not touch Gemini/Bedrock's ``provider_config is not None`` branch
+    at all."""
+
+    def _make_streaming(self, backend_connector=None, normalizer=None):
+        client_ws = MagicMock()
+        client_ws.send_text = AsyncMock()
+        streaming = RealTimeStreaming(
+            client_ws,
+            MagicMock(),
+            MagicMock(),
+            backend_connector=backend_connector,
+            event_normalizer=normalizer if normalizer is not None else XAIRealtimeNormalizer(),
+        )
+        streaming._last_ga_session_update = json.dumps(
+            {"type": "session.update", "session": {"resumption": {"enabled": True}}}
+        )
+        return streaming
+
+    @pytest.mark.asyncio
+    async def test_reconnect_uses_conversation_id_url_when_captured(self):
+        normalizer = XAIRealtimeNormalizer()
+        normalizer.observe_backend_event({"type": "conversation.created", "conversation": {"id": "conv_abc123"}})
+        connector = RealtimeBackendConnector(url="wss://api.x.ai/v1/realtime?model=grok-4-1-fast-non-reasoning")
+        streaming = self._make_streaming(backend_connector=connector, normalizer=normalizer)
+        streaming.backend_ws = AsyncMock()
+        new_ws = AsyncMock()
+
+        with patch("websockets.connect", new=AsyncMock(return_value=new_ws)):
+            result = await streaming._reconnect_backend(reason="connection_closed")
+
+        assert result is True
+        assert streaming._reconnect_resumed_mode == "native"
+        assert "conversation_id=conv_abc123" in streaming.backend_connector.url
+        assert "model=grok-4-1-fast-non-reasoning" in streaming.backend_connector.url
+        # The cached session.update (carrying resumption.enabled) is resent as
+        # the first message on the new socket.
+        sent = new_ws.send.call_args_list[0].args[0]
+        assert json.loads(sent)["session"]["resumption"] == {"enabled": True}
+
+    @pytest.mark.asyncio
+    async def test_reconnect_falls_back_to_fresh_without_captured_conversation_id(self):
+        """Client never opted into session_resumption (or the backend never
+        got far enough to assign a conversation id): same fresh/replayed
+        fallback as today, no conversation_id on the reconnect URL."""
+        connector = RealtimeBackendConnector(url="wss://api.x.ai/v1/realtime?model=grok-4-1-fast-non-reasoning")
+        streaming = self._make_streaming(backend_connector=connector)
+        streaming.backend_ws = AsyncMock()
+        new_ws = AsyncMock()
+
+        with patch("websockets.connect", new=AsyncMock(return_value=new_ws)):
+            result = await streaming._reconnect_backend(reason="connection_closed")
+
+        assert result is True
+        assert streaming._reconnect_resumed_mode == "fresh"
+        assert streaming.backend_connector.url == "wss://api.x.ai/v1/realtime?model=grok-4-1-fast-non-reasoning"
+
+    @pytest.mark.asyncio
+    async def test_openai_passthrough_reconnect_unaffected_no_event_normalizer(self):
+        """OpenAI/Azure (no event_normalizer at all) must see zero behavior
+        change: still falls to the pre-existing fresh path, exactly as before
+        this feature existed."""
+        connector = RealtimeBackendConnector(url="wss://api.openai.com/v1/realtime?model=gpt-realtime")
+        streaming = self._make_streaming(backend_connector=connector, normalizer=None)
+        streaming._event_normalizer = None
+        streaming.backend_ws = AsyncMock()
+        new_ws = AsyncMock()
+
+        with patch("websockets.connect", new=AsyncMock(return_value=new_ws)):
+            result = await streaming._reconnect_backend(reason="connection_closed")
+
+        assert result is True
+        assert streaming._reconnect_resumed_mode == "fresh"
+        assert streaming.backend_connector.url == "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+
+    @pytest.mark.asyncio
+    async def test_observe_backend_event_helper_forwards_to_normalizer(self):
+        """conversation.created must keep reaching the client unmodified while
+        also being observed for resumption bookkeeping — regression test for
+        the swallow-vs-forward distinction from Gemini's service frames."""
+        normalizer = MagicMock()
+        streaming = self._make_streaming(normalizer=normalizer)
+        event = {"type": "conversation.created", "conversation": {"id": "conv_abc123"}}
+
+        streaming._observe_backend_event_for_native_resumption(event)
+
+        normalizer.observe_backend_event.assert_called_once_with(event)
+
+    def test_observe_backend_event_helper_noop_without_normalizer(self):
+        streaming = self._make_streaming(normalizer=None)
+        streaming._event_normalizer = None
+
+        # Must not raise.
+        streaming._observe_backend_event_for_native_resumption({"type": "conversation.created"})
+
+
 def test_remap_beta_session_to_ga_normalizes_nested_structures():
     out = RealTimeStreaming._remap_beta_session_to_ga(
         {
@@ -323,9 +421,7 @@ def test_remap_beta_session_to_ga_drops_client_provided_nested_audio_block():
 
 
 def test_remap_beta_session_to_ga_without_flat_audio_fields_has_no_audio_block():
-    out = RealTimeStreaming._remap_beta_session_to_ga(
-        {"instructions": "hi", "audio": {"output": {"voice": "cedar"}}}
-    )
+    out = RealTimeStreaming._remap_beta_session_to_ga({"instructions": "hi", "audio": {"output": {"voice": "cedar"}}})
     assert "audio" not in out
     assert out["instructions"] == "hi"
 
@@ -3156,7 +3252,9 @@ async def test_log_messages_routes_async_logging_through_bounded_worker():
 
         mock_worker.ensure_initialized_and_enqueue.assert_called_once()
         enqueued = mock_worker.ensure_initialized_and_enqueue.call_args
-        assert (enqueued.args or tuple(enqueued.kwargs.values()))[0] is logging_obj.dispatch_success_handlers.return_value
+        assert (enqueued.args or tuple(enqueued.kwargs.values()))[
+            0
+        ] is logging_obj.dispatch_success_handlers.return_value
         logging_obj.dispatch_success_handlers.assert_called_once_with(streaming.messages, prefer_async_handlers=True)
         logging_obj.success_handler.assert_not_called()
         # the bare create_task path must no longer be used for success logging
@@ -3314,10 +3412,7 @@ async def test_reconnect_loop_gives_up_after_repeated_immediate_backend_rejectio
 
     # Bounded, not unbounded: gives up instead of reconnecting forever.
     assert connector.connect.await_count <= len(sockets)
-    assert (
-        streaming._consecutive_immediate_reconnect_closes
-        > streaming._MAX_CONSECUTIVE_IMMEDIATE_RECONNECT_CLOSES
-    )
+    assert streaming._consecutive_immediate_reconnect_closes > streaming._MAX_CONSECUTIVE_IMMEDIATE_RECONNECT_CLOSES
 
 
 @pytest.mark.asyncio
@@ -3535,9 +3630,7 @@ class TestGaAudioFieldRemap:
         assert audio == {}
 
     def test_language_is_folded_into_an_existing_transcription_config(self):
-        audio = self._audio(
-            {"language": "ru-RU", "input_audio_transcription": {"model": "whisper-1"}}
-        )
+        audio = self._audio({"language": "ru-RU", "input_audio_transcription": {"model": "whisper-1"}})
 
         assert audio["input"]["transcription"] == {"model": "whisper-1", "language": "ru-RU"}
 
@@ -3567,9 +3660,7 @@ class TestGaAudioFieldRemap:
         assert any("language" in record.message for record in caplog.records)
 
     def test_language_does_not_overwrite_the_transcription_model(self):
-        audio = self._audio(
-            {"language": "ru-RU", "input_audio_transcription": {"model": "gpt-4o-transcribe"}}
-        )
+        audio = self._audio({"language": "ru-RU", "input_audio_transcription": {"model": "gpt-4o-transcribe"}})
 
         assert audio["input"]["transcription"]["model"] == "gpt-4o-transcribe"
 
@@ -3680,9 +3771,7 @@ class TestGaBuiltinToolFiltering:
     def test_function_tools_survive_alongside_a_dropped_builtin(self):
         """The point of dropping rather than erroring: the rest of the session
         must still work."""
-        tools = self._tools(
-            [{"type": "function", "name": "f", "parameters": {"type": "OBJECT"}}, {"type": "x_search"}]
-        )
+        tools = self._tools([{"type": "function", "name": "f", "parameters": {"type": "OBJECT"}}, {"type": "x_search"}])
 
         assert len(tools) == 1
         assert tools[0]["name"] == "f"
@@ -3853,7 +3942,7 @@ class TestGaMaxOutputTokensClamping:
         assert self._remap({"max_response_output_tokens": -5})["max_output_tokens"] == 1
 
     def test_inf_passes_through(self):
-        """"inf" is GA-valid and means "the model's own maximum"; clamping it to
+        """ "inf" is GA-valid and means "the model's own maximum"; clamping it to
         a number would silently cap a client asking for no cap."""
         assert self._remap({"max_response_output_tokens": "inf"})["max_output_tokens"] == "inf"
 

@@ -315,7 +315,13 @@ def track_content_index(
     for index, part in enumerate(item.content_parts):
         if part.delta_type == content_part_key:
             return state, index
-    new_state, _ = open_content_part(state, item_id, cast(ContentDeltaType, content_part_key))
+    new_state, _ = open_content_part(
+        state,
+        item_id,
+        cast(
+            ContentDeltaType, content_part_key
+        ),  # cast-ok: callers key by modality strings including "content" (xAI), wider than the text/audio literal; tracked as a pre-existing gap, not introduced here
+    )
     assert new_state.response is not None
     updated_item = _find_open_item(new_state.response, item_id)
     assert updated_item is not None

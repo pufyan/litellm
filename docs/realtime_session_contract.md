@@ -284,7 +284,7 @@ Clients observe this through two proxy-emitted events extending the canonical st
 
 The three `resumed` values are not interchangeable; they tell a client how much context survived:
 
-- `native` — the backend's own resumption mechanism restored the session, including server-side context. This is the outcome `session_resumption` asks for: requesting it is what makes `native` possible at all, and without it (or on a backend that has no such mechanism) a reconnect can only fall back to one of the two below.
+- `native` — the backend's own resumption mechanism restored the session, including server-side context. This is the outcome `session_resumption` asks for: requesting it is what makes `native` possible at all, and without it (or on a backend that has no such mechanism) a reconnect can only fall back to one of the two below. Backends reach `native` by different mechanisms — one restores state from an opaque handle sent as the first message on a fresh connection, another restores state by reopening the connection with a resumption identifier in the URL and having the backend replay the accumulated conversation as ordinary content events. Both guarantee the same thing to the client, so both report `native`, and the mechanism is invisible from the client's side.
 - `replayed` — a new backend session was opened and the accumulated transcript was re-sent, so the conversation context is restored as text. Not identical to `native`: anything the backend held internally beyond the transcript is gone.
 - `fresh` — a new backend session was opened and nothing was replayed, because there was no transcript to replay or the backend cannot accept one. The model starts with no memory of the conversation.
 

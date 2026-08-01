@@ -1,4 +1,5 @@
 from typing import List
+from unittest.mock import patch
 
 import pytest
 
@@ -87,11 +88,15 @@ def test_multi_part_single_item_content_index_increments():
 
 def test_idempotency_output_item_done_gets_same_index_as_earlier_added():
     normalizer = XAIRealtimeNormalizer()
-    added = normalizer.normalize({"type": "response.output_item.added", "response_id": "resp_1", "item": {"id": "item_A"}})
+    added = normalizer.normalize(
+        {"type": "response.output_item.added", "response_id": "resp_1", "item": {"id": "item_A"}}
+    )
     # Open a second item so a naive re-allocation would visibly diverge (index 1)
     # instead of staying pinned at the first item's index (0).
     normalizer.normalize({"type": "response.output_item.added", "response_id": "resp_1", "item": {"id": "item_B"}})
-    done = normalizer.normalize({"type": "response.output_item.done", "response_id": "resp_1", "item": {"id": "item_A"}})
+    done = normalizer.normalize(
+        {"type": "response.output_item.done", "response_id": "resp_1", "item": {"id": "item_A"}}
+    )
 
     assert added["output_index"] == done["output_index"] == 0
 
@@ -133,7 +138,9 @@ def test_nested_item_id_output_item_added_and_done_resolve_correct_index():
     added_b = normalizer.normalize(
         {"type": "response.output_item.added", "response_id": "resp_1", "item": {"id": "item_B"}}
     )
-    done_b = normalizer.normalize({"type": "response.output_item.done", "response_id": "resp_1", "item": {"id": "item_B"}})
+    done_b = normalizer.normalize(
+        {"type": "response.output_item.done", "response_id": "resp_1", "item": {"id": "item_B"}}
+    )
 
     assert added_b["output_index"] == 1
     assert done_b["output_index"] == 1
@@ -254,9 +261,7 @@ class TestXaiOnlyFieldRestoration:
 
     def test_ga_fields_still_survive_alongside_the_restored_ones(self):
         """The restoration must not clobber what the GA remap produced."""
-        patched = self._patched(
-            {"instructions": "be brief", "voice": "eve", "thinking_level": "low"}
-        )
+        patched = self._patched({"instructions": "be brief", "voice": "eve", "thinking_level": "low"})
 
         assert patched["instructions"] == "be brief"
         assert patched["audio"]["output"]["voice"] == "eve"
@@ -304,9 +309,7 @@ class TestXaiTranscriptionLanguage:
     def test_transcription_model_is_stripped(self):
         """xAI does not accept a transcription model; forwarding OpenAI's would
         be an unknown field."""
-        audio = self._audio(
-            {"language": "es-MX", "input_audio_transcription": {"model": "whisper-1"}}
-        )
+        audio = self._audio({"language": "es-MX", "input_audio_transcription": {"model": "whisper-1"}})
 
         assert audio["input"]["transcription"] == {"language_hint": "es-MX"}
 
@@ -403,3 +406,63 @@ class TestXaiKeyterms:
         transcription = self._transcription({"language": "es-MX"})
 
         assert transcription == {"language_hint": "es-MX"}
+
+
+class TestXaiNativeResumption:
+    """xAI's own conversation_id-based session resumption
+    (https://docs.x.ai/build/features/sessions): opt in via
+    session.update -> resumption.enabled, capture the conversation id from
+    conversation.created, resume by reconnecting with ?conversation_id=."""
+
+    def test_native_resume_query_params_none_before_any_conversation_created(self):
+        normalizer = XAIRealtimeNormalizer()
+
+        assert normalizer.native_resume_query_params() is None
+
+    def test_observe_backend_event_captures_nested_conversation_id(self):
+        normalizer = XAIRealtimeNormalizer()
+
+        normalizer.observe_backend_event({"type": "conversation.created", "conversation": {"id": "conv_abc123"}})
+
+        assert normalizer.native_resume_query_params() == {"conversation_id": "conv_abc123"}
+
+    def test_observe_backend_event_captures_flat_id_fallback(self):
+        normalizer = XAIRealtimeNormalizer()
+
+        normalizer.observe_backend_event({"type": "conversation.created", "id": "conv_flat456"})
+
+        assert normalizer.native_resume_query_params() == {"conversation_id": "conv_flat456"}
+
+    def test_observe_backend_event_ignores_other_event_types(self):
+        normalizer = XAIRealtimeNormalizer()
+
+        normalizer.observe_backend_event({"type": "response.done", "conversation": {"id": "conv_should_not_capture"}})
+
+        assert normalizer.native_resume_query_params() is None
+
+    def test_observe_backend_event_does_not_mutate_the_event(self):
+        """The event must keep reaching the client unchanged — this is an
+        observation-only side effect, not an intercept/swallow."""
+        normalizer = XAIRealtimeNormalizer()
+        event = {"type": "conversation.created", "conversation": {"id": "conv_abc123"}}
+        original = dict(event)
+
+        normalizer.observe_backend_event(event)
+
+        assert event == original
+
+    def test_native_resume_query_params_expires_after_ttl(self):
+        normalizer = XAIRealtimeNormalizer()
+        with patch("litellm.llms.xai.realtime.transformation.time.monotonic", return_value=1000.0):
+            normalizer.observe_backend_event({"type": "conversation.created", "conversation": {"id": "conv_abc123"}})
+
+        with patch("litellm.llms.xai.realtime.transformation.time.monotonic", return_value=1000.0 + 30 * 60):
+            assert normalizer.native_resume_query_params() is None
+
+    def test_native_resume_query_params_valid_just_under_ttl(self):
+        normalizer = XAIRealtimeNormalizer()
+        with patch("litellm.llms.xai.realtime.transformation.time.monotonic", return_value=1000.0):
+            normalizer.observe_backend_event({"type": "conversation.created", "conversation": {"id": "conv_abc123"}})
+
+        with patch("litellm.llms.xai.realtime.transformation.time.monotonic", return_value=1000.0 + 30 * 60 - 1):
+            assert normalizer.native_resume_query_params() == {"conversation_id": "conv_abc123"}

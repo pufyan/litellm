@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional, Protocol, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Literal, Mapping, Optional, Protocol, Union, cast
 
 import litellm
 from litellm._logging import verbose_logger
@@ -95,6 +95,8 @@ class RealtimeEventNormalizer(Protocol):
     def should_drop(self, event: object) -> bool: ...
     def normalize(self, event: dict) -> dict: ...
     def patch_outgoing_session(self, session: dict, canonical_session: Optional[dict] = None) -> dict: ...
+    def observe_backend_event(self, event: Mapping[str, object]) -> None: ...
+    def native_resume_query_params(self) -> Optional[Mapping[str, str]]: ...
 
 
 DefaultLoggedRealTimeEventTypes = [
@@ -711,6 +713,7 @@ class RealTimeStreaming:
         buffered and flushed once the new backend acknowledges setup. Returns
         False when every attempt failed (caller should tear the session down).
         """
+        from httpx import URL
         import websockets.exceptions
 
         if self.backend_connector is None:
@@ -718,6 +721,7 @@ class RealTimeStreaming:
         self._reconnecting_backend = True
         await self._send_litellm_session_event({"type": "litellm.session.reconnecting", "reason": reason})
         state = self._resumption_state
+        native_resume_connector: Optional[RealtimeBackendConnector] = None
         if self.provider_config is not None:
             resume_request = (
                 self.provider_config.build_resume_session_request(state, self.session_configuration_request)
@@ -726,10 +730,18 @@ class RealTimeStreaming:
             )
         else:
             resume_request = self._last_ga_session_update
+            resume_params = (
+                self._event_normalizer.native_resume_query_params() if self._event_normalizer is not None else None
+            )
+            if resume_params is not None:
+                native_resume_connector = self.backend_connector.with_url(
+                    str(URL(self.backend_connector.url).copy_merge_params(dict(resume_params)))
+                )
         old_ws = self.backend_ws
         for attempt, delay in enumerate(self._RECONNECT_BACKOFF_SECONDS, start=1):
             try:
-                new_ws = await self.backend_connector.connect()
+                connector = native_resume_connector or self.backend_connector
+                new_ws = await connector.connect()
                 if resume_request is not None:
                     verbose_logger.debug(
                         "Realtime: sending resume/setup request on reconnected backend socket "
@@ -740,7 +752,11 @@ class RealTimeStreaming:
                     )
                     await new_ws.send(resume_request)
                 self.backend_ws = new_ws
-                self._reconnect_resumed_mode = "native" if (state is not None and state.resumable) else "fresh"
+                if native_resume_connector is not None:
+                    self.backend_connector = native_resume_connector
+                    self._reconnect_resumed_mode = "native"
+                else:
+                    self._reconnect_resumed_mode = "native" if (state is not None and state.resumable) else "fresh"
                 try:
                     await old_ws.close()
                 except (OSError, RuntimeError, websockets.exceptions.WebSocketException):
@@ -760,10 +776,10 @@ class RealTimeStreaming:
         self._reconnecting_backend = False
         return False
 
-    def _append_transcript_entry(self, role: str, text: str) -> None:
+    def _append_transcript_entry(self, role: Literal["user", "assistant", "note"], text: str) -> None:
         if not text or len(self._transcript_entries) >= self._MAX_TRANSCRIPT_ENTRIES:
             return
-        self._transcript_entries.append(RealtimeTranscriptEntry(role=cast(Any, role), text=text))
+        self._transcript_entries.append(RealtimeTranscriptEntry(role=role, text=text))
 
     def _flush_assistant_transcript(self, interrupted: bool = False) -> None:
         if self._assistant_transcript_chunks:
@@ -777,7 +793,8 @@ class RealTimeStreaming:
             return
         event_type = event.get("type")
         if event_type == "conversation.item.input_audio_transcription.completed":
-            self._append_transcript_entry("user", cast(str, event.get("transcript") or ""))
+            transcript = event.get("transcript")
+            self._append_transcript_entry("user", transcript if isinstance(transcript, str) else "")
         elif event_type in ("response.output_audio_transcript.delta", "response.audio_transcript.delta"):
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
@@ -888,6 +905,14 @@ class RealTimeStreaming:
         if self._event_normalizer is not None:
             return self._event_normalizer.should_drop(event)
         return False
+
+    def _observe_backend_event_for_native_resumption(self, event: Mapping[str, object]) -> None:
+        """Let the event normalizer capture native resumption state (e.g. xAI's
+        conversation_id) from an ordinary backend event, without swallowing or
+        modifying it. No-op for backends whose normalizer doesn't track this
+        (Gemini/Bedrock never set ``self._event_normalizer`` at all)."""
+        if self._event_normalizer is not None:
+            self._event_normalizer.observe_backend_event(event)
 
     def _normalize_event_for_ga_client(self, event: dict) -> dict:
         """Apply per-provider GA normalization before forwarding to clients."""
@@ -1390,6 +1415,8 @@ class RealTimeStreaming:
                         await self.websocket.send_text(raw_response)
                         continue
 
+                    self._observe_backend_event_for_native_resumption(event)
+
                     if self._should_drop_event_from_client(event):
                         continue
 
@@ -1573,9 +1600,7 @@ class RealTimeStreaming:
         if "transcription_keyterms" in session:
             keyterms = session.pop("transcription_keyterms")
             transcription = inp.get("transcription")
-            terms = (
-                [term for term in keyterms if isinstance(term, str) and term] if isinstance(keyterms, list) else []
-            )
+            terms = [term for term in keyterms if isinstance(term, str) and term] if isinstance(keyterms, list) else []
             if terms and isinstance(transcription, dict):
                 inp["transcription"] = {**transcription, "prompt": ", ".join(terms)}
 
