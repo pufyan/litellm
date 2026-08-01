@@ -2056,6 +2056,43 @@ def test_gemini_standalone_usage_metadata_does_not_crash_websocket():
     assert result["current_conversation_id"] == "conv_existing"
 
 
+def test_gemini_trailing_output_transcription_does_not_wipe_closed_items():
+    """Regression: a frame that produces events but none of them
+    ``response.output_item.done`` (e.g. a trailing ``outputTranscription``
+    delta arriving after the item already closed but before
+    ``turnComplete``) must not erase items closed by an earlier frame.
+    Doing so left the eventual ``response.done``'s ``output`` empty despite
+    a real spoken/transcribed turn having completed."""
+    config = GeminiRealtimeConfig()
+    logging_obj = MagicMock()
+    logging_obj.litellm_trace_id = "trace_trailing_transcription_after_item_close"
+
+    already_closed_item = {
+        "type": "response.output_item.done",
+        "event_id": "event_1",
+        "response_id": "resp_existing",
+        "output_index": 0,
+        "item": {"id": "item_existing", "type": "message", "status": "completed", "role": "assistant", "content": []},
+    }
+
+    result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"outputTranscription": {"text": "trailing transcript"}}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": "item_existing",
+            "current_response_id": "resp_existing",
+            "current_conversation_id": "conv_existing",
+            "current_delta_chunks": [],
+            "current_item_chunks": [already_closed_item],
+            "current_delta_type": None,
+        },
+    )
+
+    assert result["current_item_chunks"] == [already_closed_item]
+
+
 def test_gemini_standalone_usage_metadata_is_attributed_to_next_tool_call_response_done():
     """A standalone ``usageMetadata`` frame emitted between turns must not
     silently drop the consumed tokens. The next tool-call ``response.done``
