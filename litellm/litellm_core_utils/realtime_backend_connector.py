@@ -1,5 +1,5 @@
 import ssl
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Mapping, Optional
 
 from litellm.constants import REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
@@ -22,6 +22,15 @@ class RealtimeBackendConnector:
     ssl_context: "ssl.SSLContext | bool | None" = None
     open_timeout: Optional[float] = None
     max_attempts: int = 1
+
+    def with_url(self, url: str) -> "RealtimeBackendConnector":
+        """Return a copy of this connector dialing ``url`` instead.
+
+        Used by native session resumption schemes that deliver their
+        resumption token via a reconnect URL query parameter (e.g. xAI's
+        ``?conversation_id=``) rather than a first-message payload.
+        """
+        return replace(self, url=url)
 
     async def connect(self) -> "ClientConnection":
         """Open the backend realtime websocket, retrying a hung open handshake.
@@ -52,6 +61,12 @@ class RealtimeBackendConnector:
             "additional_headers": dict(self.headers),
             "max_size": REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES,
             "ssl": self.ssl_context,
+            # Match native Live API clients (e.g. websocketpp-based ones), which
+            # don't negotiate permessage-deflate: the library defaults to
+            # offering it, so unlike a native client this socket would run
+            # compressed if the backend accepts. Disable it so the wire
+            # protocol matches a native connection exactly.
+            "compression": None,
         }
         if self.open_timeout is not None:
             connect_kwargs["open_timeout"] = self.open_timeout

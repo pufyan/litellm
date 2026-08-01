@@ -114,8 +114,19 @@ class AutomaticActivityDetection(TypedDict, total=False):
     silenceDurationMs: int
 
 
+ActivityHandlingEnum = Literal["ACTIVITY_HANDLING_UNSPECIFIED", "START_OF_ACTIVITY_INTERRUPTS", "NO_INTERRUPTION"]
+TurnCoverageEnum = Literal[
+    "TURN_COVERAGE_UNSPECIFIED",
+    "TURN_INCLUDES_ONLY_ACTIVITY",
+    "TURN_INCLUDES_ALL_INPUT",
+    "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
+]
+
+
 class BidiGenerateContentRealtimeInputConfig(TypedDict, total=False):
     automaticActivityDetection: AutomaticActivityDetection
+    activityHandling: ActivityHandlingEnum
+    turnCoverage: TurnCoverageEnum
 
 
 class BidiGenerateContentSetup(TypedDict, total=False):

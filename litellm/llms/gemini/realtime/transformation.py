@@ -4,7 +4,7 @@ This file contains the transformation logic for the Gemini realtime API.
 
 import json
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Mapping, Optional, Union, cast
 
 import litellm
 from litellm import verbose_logger
@@ -26,6 +26,7 @@ from litellm.types.llms.gemini import (
     BidiGenerateContentSetup,
     EndOfSpeechSensitivityEnum,
     StartOfSpeechSensitivityEnum,
+    TurnCoverageEnum,
 )
 from litellm.types.llms.openai import (
     OpenAIRealtimeAudioConfig,
@@ -53,9 +54,12 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.llms.vertex_ai import (
     GeminiResponseModalities,
+    GeminiThinkingConfig,
     HttpxBlobType,
     HttpxContentType,
+    VertexToolName,
 )
+from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
 from litellm.litellm_core_utils.realtime_correlation import (
     RealtimeCorrelationState,
     ToolCallRequest,
@@ -95,10 +99,42 @@ _SPEECH_END_SENSITIVITY_MAP: dict[str, EndOfSpeechSensitivityEnum] = {
     "high": "END_SENSITIVITY_HIGH",
     "low": "END_SENSITIVITY_LOW",
 }
+_TURN_COVERAGE_MAP: dict[str, TurnCoverageEnum] = {
+    "activity_only": "TURN_INCLUDES_ONLY_ACTIVITY",
+    "all_input": "TURN_INCLUDES_ALL_INPUT",
+    # Mixed coverage: audio limited to detected activity, video kept whole.
+    # This is the default on newer models, so it must be expressible.
+    "audio_activity_and_all_video": "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
+}
+
+# Accepted ranges for generationConfig values, as (min, max). Google documents
+# these only by example rather than as stated bounds, so they are the widely
+# used ranges; recheck against the API reference if Gemini starts rejecting a
+# value inside them. Out-of-range values are clamped rather than forwarded
+# because the backend refuses the whole setup, losing instructions and tools
+# with it.
+_GEMINI_PARAM_RANGES: dict[str, tuple[float, float]] = {
+    "temperature": (0.0, 2.0),
+    "topP": (0.0, 1.0),
+    "topK": (1, float("inf")),
+    "presencePenalty": (-2.0, 2.0),
+    "frequencyPenalty": (-2.0, 2.0),
+    "candidateCount": (1, 8),
+    "maxOutputTokens": (1, float("inf")),
+}
 # OpenAI-realtime sampling params -> Gemini Live generationConfig (camelCase).
 _GEMINI_SAMPLING_PARAM_MAP: dict[str, str] = {
     "top_p": "topP",
     "top_k": "topK",
+    "presence_penalty": "presencePenalty",
+    "frequency_penalty": "frequencyPenalty",
+    "candidate_count": "candidateCount",
+}
+# Canonical media_resolution -> Gemini's MEDIA_RESOLUTION_* enum.
+_MEDIA_RESOLUTION_MAP: dict[str, str] = {
+    "low": "MEDIA_RESOLUTION_LOW",
+    "medium": "MEDIA_RESOLUTION_MEDIUM",
+    "high": "MEDIA_RESOLUTION_HIGH",
 }
 
 
@@ -289,8 +325,12 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
     def get_session_audio_config(self, model: str) -> OpenAIRealtimeAudioConfig:
         return OpenAIRealtimeAudioConfig(
+            # Input is always advertised (and actually sent, in get_audio_mime_type)
+            # at the fixed native Gemini Live rate; unlike output there is no
+            # per-model override, so what the client is told here always matches
+            # the mimeType on the wire.
             input=OpenAIRealtimeAudioDirectionConfig(
-                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self._audio_sample_rate(model, is_output=False))
+                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self.DEFAULT_INPUT_AUDIO_SAMPLE_RATE_HZ)
             ),
             output=OpenAIRealtimeAudioDirectionConfig(
                 format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self._audio_sample_rate(model, is_output=True))
@@ -362,35 +402,141 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "context_window_compression",
             "top_p",
             "top_k",
+            # thinking_budget / thinking_level / include_thoughts are
+            # intentionally absent: realtime sessions always force thinking off
+            # (see _build_thinking_config), so client-supplied values for these
+            # are never honored.
+            "presence_penalty",
+            "frequency_penalty",
+            "stop_sequences",
+            "candidate_count",
+            "media_resolution",
+            "output_audio_transcription",
+            "session_resumption",
         ]
 
-    def _apply_turn_detection(self, optional_params: dict, value: OpenAIRealtimeTurnDetection) -> None:
-        if isinstance(value, dict) and value.get("type") == "semantic_vad" and "create_response" not in value:
-            # Pipecat/OpenAI GA semantic VAD — skip; Gemini uses its own VAD.
-            # Only skip when there is no create_response override so that
-            # a guardrail-injected create_response:false is not dropped.
-            return
-        transformed_audio_activity_config = self.map_automatic_turn_detection(value)
-        if transformed_audio_activity_config:
-            optional_params["realtimeInputConfig"] = BidiGenerateContentRealtimeInputConfig(
-                automaticActivityDetection=transformed_audio_activity_config
-            )
+    @staticmethod
+    def _clamp_generation_param(native_key: str, value: object) -> object:
+        """Clamp a generationConfig value into Gemini's accepted range.
 
-    def map_openai_params(self, optional_params: dict, non_default_params: dict) -> dict:
+        Gemini rejects the whole ``setup`` on an out-of-range value, which would
+        cost the session its system prompt and tools, so an unusable number is
+        brought to the nearest bound and the substitution is logged.
+        """
+        bounds = _GEMINI_PARAM_RANGES.get(native_key)
+        if bounds is None:
+            return value
+        clamped, changed = clamp_numeric(value, bounds[0], bounds[1])
+        if changed:
+            verbose_logger.warning(
+                "realtime session.update: clamped %s %s -> %s (unsupported_by_provider): accepts %s..%s",
+                native_key,
+                value,
+                clamped,
+                bounds[0],
+                bounds[1],
+            )
+        return clamped
+
+    @staticmethod
+    def _map_builtin_tools(model: str, tools: List[Any]) -> List[Any]:
+        """Translate canonical built-in tools into their Gemini Live spellings.
+
+        ``code_execution`` reaches ``_map_function`` as a bare ``{"type": ...}``
+        entry, which strips to ``{}`` and is rejected as an invalid tool, so the
+        native key is written here instead. It is also 2.5-only: Gemini 3.x
+        dropped code execution, so the tool is removed rather than sent to a
+        model that would reject it. ``web_search`` already has a translation to
+        ``googleSearch`` downstream and passes through untouched.
+        """
+        supports_code_execution = not VertexGeminiConfig._is_gemini_3_or_newer(model)
+        mapped: List[Any] = []
+        for tool in tools:
+            if not isinstance(tool, dict) or tool.get("type") != "code_execution":
+                mapped.append(tool)
+                continue
+            if supports_code_execution:
+                mapped.append({VertexToolName.CODE_EXECUTION.value: {}})
+            else:
+                verbose_logger.warning(
+                    "realtime session.update: dropped built-in tool code_execution "
+                    "(unsupported_by_model): %s does not support code execution",
+                    model,
+                )
+        return mapped
+
+    @staticmethod
+    def _build_thinking_config(model: str) -> GeminiThinkingConfig:
+        """Force thinking off for this realtime session, ignoring any client input.
+
+        Realtime voice sessions need the model answering immediately, not
+        deliberating; thinking is therefore always disabled here rather than
+        left to whatever (or nothing) the client's session.update requests.
+
+        Gemini 2.5 Live models: leaving ``thinkingConfig``/``thinkingBudget`` off
+        the setup entirely (not just setting a value) has been observed to break
+        the session, so ``thinkingBudget: 0`` is sent unconditionally.
+
+        Gemini 3.x Live models: thinking cannot be disabled at all on this
+        family, and they reject ``thinkingBudget`` outright; ``thinkingLevel``
+        is set to its lowest rung, ``"minimal"``, as the closest available
+        approximation.
+        """
+        if VertexGeminiConfig._is_gemini_3_or_newer(model):
+            return {"thinkingLevel": "minimal"}
+        return {"thinkingBudget": 0}
+
+    def _apply_turn_detection(self, optional_params: dict, value: OpenAIRealtimeTurnDetection) -> None:
+        realtime_input_config = BidiGenerateContentRealtimeInputConfig()
+
+        skip_activity_detection = (
+            isinstance(value, dict) and value.get("type") == "semantic_vad" and "create_response" not in value
+        )
+        if not skip_activity_detection:
+            # Pipecat/OpenAI GA semantic VAD is skipped above — Gemini uses its
+            # own VAD. The skip is conditional on there being no create_response
+            # override so a guardrail-injected create_response:false survives.
+            transformed_audio_activity_config = self.map_automatic_turn_detection(value)
+            if transformed_audio_activity_config:
+                realtime_input_config["automaticActivityDetection"] = transformed_audio_activity_config
+
+        if isinstance(value, dict):
+            # Barge-in. Unlike the fields above this applies to semantic_vad
+            # too: it governs what happens when speech is detected, not how it
+            # is detected, so it must not be lost with the skip above.
+            interrupt_response = value.get("interrupt_response")
+            if isinstance(interrupt_response, bool):
+                realtime_input_config["activityHandling"] = (
+                    "START_OF_ACTIVITY_INTERRUPTS" if interrupt_response else "NO_INTERRUPTION"
+                )
+            turn_coverage = _TURN_COVERAGE_MAP.get(str(value.get("turn_coverage", "")).lower())
+            if turn_coverage is not None:
+                realtime_input_config["turnCoverage"] = turn_coverage
+
+        if realtime_input_config:
+            optional_params["realtimeInputConfig"] = realtime_input_config
+
+    def map_openai_params(self, optional_params: dict, non_default_params: dict, model: str = "") -> dict:
         if "generationConfig" not in optional_params:
             optional_params["generationConfig"] = {}
         for key, value in non_default_params.items():
             if key == "instructions":
                 optional_params["systemInstruction"] = HttpxContentType(role="user", parts=[{"text": value}])
             elif key == "temperature":
-                optional_params["generationConfig"]["temperature"] = value
+                optional_params["generationConfig"]["temperature"] = self._clamp_generation_param("temperature", value)
             elif key in _GEMINI_SAMPLING_PARAM_MAP and isinstance(value, (int, float)) and not isinstance(value, bool):
-                optional_params["generationConfig"][_GEMINI_SAMPLING_PARAM_MAP[key]] = value
+                native_key = _GEMINI_SAMPLING_PARAM_MAP[key]
+                optional_params["generationConfig"][native_key] = self._clamp_generation_param(native_key, value)
             elif key == "max_response_output_tokens":
-                optional_params["generationConfig"]["maxOutputTokens"] = value
+                optional_params["generationConfig"]["maxOutputTokens"] = self._clamp_generation_param(
+                    "maxOutputTokens", value
+                )
             elif key == "modalities":
                 optional_params["generationConfig"]["responseModalities"] = [
-                    modality.upper() for modality in cast(List[str], value)
+                    modality.upper()
+                    for modality in cast(  # cast-ok: narrowed only by the key=="modalities" discriminant
+                        List[str], value
+                    )
                 ]
             elif key == "tools":
                 from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
@@ -400,12 +546,21 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 vertex_gemini_config = VertexGeminiConfig()
                 # Tools should be at the top level of setup, not inside generationConfig
                 optional_params["tools"] = vertex_gemini_config._map_function(
-                    value=value, optional_params=optional_params
+                    value=self._map_builtin_tools(
+                        model,
+                        cast(List[Any], value),  # cast-ok: narrowed only by the key=="tools" discriminant
+                    ),
+                    optional_params=optional_params,
                 )
             elif key == "input_audio_transcription" and value is not None:
                 optional_params["inputAudioTranscription"] = {}
             elif key == "turn_detection":
-                self._apply_turn_detection(optional_params, cast(OpenAIRealtimeTurnDetection, value))
+                self._apply_turn_detection(
+                    optional_params,
+                    cast(
+                        OpenAIRealtimeTurnDetection, value
+                    ),  # cast-ok: narrowed only by the key=="turn_detection" discriminant
+                )
             elif key == "voice":
                 from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
                     VertexGeminiConfig,
@@ -417,6 +572,35 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                     optional_params["generationConfig"]["speechConfig"] = speech_config
             elif key == "context_window_compression" and isinstance(value, dict):
                 optional_params["contextWindowCompression"] = _snake_to_camel_keys(value)
+            elif key == "session_resumption" and isinstance(value, dict) and value.get("enabled") is False:
+                # Resumption is always requested on this backend: the proxy's
+                # reconnect path restores sessions from the handle Gemini only
+                # issues when asked. Honoring "off" would break reconnection,
+                # so the request is refused loudly rather than silently ignored.
+                verbose_logger.warning(
+                    "realtime session.update: ignored session_resumption.enabled=false "
+                    "(unsupported_by_provider): Gemini reconnection depends on resumption handles"
+                )
+            elif key == "stop_sequences" and isinstance(value, list):
+                stop_sequences = [
+                    item
+                    for item in cast(List[Any], value)
+                    if isinstance(item, str)  # cast-ok: isinstance(value, list) narrows the container, not its elements
+                ]
+                if stop_sequences:
+                    optional_params["generationConfig"]["stopSequences"] = stop_sequences
+            elif key == "media_resolution":
+                media_resolution = _MEDIA_RESOLUTION_MAP.get(str(value).lower())
+                if media_resolution is not None:
+                    optional_params["generationConfig"]["mediaResolution"] = media_resolution
+            elif key == "output_audio_transcription" and value is not None:
+                # Like inputAudioTranscription, Gemini reads an empty object as
+                # "enable with backend defaults"; it has no sub-options here.
+                # Note the initial setup enables this unconditionally (clients
+                # rely on transcripts arriving), so sending it only re-states
+                # that default; it cannot currently be turned off.
+                optional_params["outputAudioTranscription"] = {}
+        optional_params["generationConfig"]["thinkingConfig"] = self._build_thinking_config(model)
         if len(optional_params["generationConfig"]) == 0:
             optional_params.pop("generationConfig")
         return optional_params
@@ -493,10 +677,6 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         return bool(entry.get("gemini_native_audio") or entry.get("gemini_audio_only_live"))
 
     @staticmethod
-    def _is_native_audio_model(model: str) -> bool:
-        return bool(GeminiRealtimeConfig._model_cost_entry(model).get("gemini_native_audio"))
-
-    @staticmethod
     def _coerce_response_modalities(model: str, modalities: list[Any]) -> list[str]:
         """Map unsupported TEXT responseModalities to AUDIO for audio-only Live models."""
         normalized = [
@@ -511,7 +691,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
     @staticmethod
     def _finalize_gemini_live_setup(model: str, setup: Dict[str, Any]) -> Dict[str, Any]:
-        """Drop fields Gemini Live native-audio rejects on ``setup``."""
+        """Coerce fields on ``setup`` that Gemini Live can't take as-is for this model."""
         generation_config = setup.get("generationConfig")
         if isinstance(generation_config, dict):
             modalities = generation_config.get("responseModalities")
@@ -519,8 +699,6 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 generation_config["responseModalities"] = GeminiRealtimeConfig._coerce_response_modalities(
                     model, modalities
                 )
-            if GeminiRealtimeConfig._is_native_audio_model(model):
-                generation_config.pop("speechConfig", None)
         return setup
 
     def _handle_session_update(
@@ -548,17 +726,28 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         # would be silently dropped because ``map_openai_params`` only
         # recognises the flat OpenAI-beta key names.
         session_payload = self._normalize_session_payload_for_mapping(session_payload)
-        new_overrides = self.map_openai_params(optional_params={}, non_default_params=session_payload)
+        new_overrides = self.map_openai_params(optional_params={}, non_default_params=session_payload, model=model)
 
         if session_configuration_request is None:
             generation_config = new_overrides.setdefault("generationConfig", {})
+            # Required by the Gemini Live protocol rather than a litellm opinion.
             generation_config.setdefault("responseModalities", ["AUDIO"])
+            # Always on, both directions. Gemini transcribes natively: there is
+            # no separate ASR to pay for or configure, and it emits no
+            # transcript frames unless asked in setup, so requesting them is
+            # what makes the canonical transcript events the outbound contract
+            # promises actually arrive.
             new_overrides.setdefault("inputAudioTranscription", {})
             new_overrides.setdefault("outputAudioTranscription", {})
+            # The proxy's reconnect logic resumes Gemini sessions from a handle
+            # the backend only issues when this is requested, so it is always
+            # sent; ``session_resumption`` is therefore not a client-facing knob
+            # on this backend.
             new_overrides.setdefault("sessionResumption", {})
             new_overrides["model"] = f"models/{model}"
-            verbose_logger.debug("Gemini Realtime: Sending initial setup with tools to backend")
-            return [json.dumps({"setup": self._finalize_gemini_live_setup(model, new_overrides)})]
+            setup_frame = json.dumps({"setup": self._finalize_gemini_live_setup(model, new_overrides)})
+            verbose_logger.debug("Gemini Realtime: Sending initial setup with tools to backend: %s", setup_frame)
+            return [setup_frame]
 
         # Gemini Live accepts exactly one ``setup`` message: the first and only
         # client message. A second ``setup`` closes the socket with
@@ -686,7 +875,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             )
 
             gemini_msg = json.dumps({"realtimeInput": realtime_input_dict})
-            verbose_logger.debug("Gemini Realtime: Sending audio realtimeInput to backend")
+            verbose_logger.debug(
+                "Gemini Realtime: Sending audio realtimeInput to backend (mimeType=%s, bytes=%s)",
+                self.get_audio_mime_type(),
+                len(json_message.get("audio") or ""),
+            )
             messages.append(gemini_msg)
             return messages
 
@@ -1223,6 +1416,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 # A real new turn is starting; the barge-in trailing-frame guard
                 # only applies to the one bare RESPONSE_DONE right after an
                 # interrupt, never to a turn that goes on to produce content.
+                if self._turn_closed_by_interrupt:
+                    verbose_logger.debug(
+                        "RT_PROBE _turn_closed_by_interrupt RESET False via new content delta (id=%s)",
+                        id(self),
+                    )
                 self._turn_closed_by_interrupt = False
                 # send the list of standard 'new' content.delta events
                 current_output_item_id = "item_{}".format(uuid.uuid4())
@@ -1392,8 +1590,14 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             # that flush playback / cancel on speech-start actually interrupt.
             if server_content.get("interrupted"):
                 self._turn_closed_by_interrupt = True
+                verbose_logger.debug(
+                    "RT_PROBE _turn_closed_by_interrupt SET True (id=%s) response_id=%s output_item_id=%s",
+                    id(self),
+                    current_response_id,
+                    current_output_item_id,
+                )
                 returned_message.append(
-                    cast(
+                    cast(  # cast-ok: hand-built dict matches the event's TypedDict shape by construction
                         OpenAIRealtimeEvents,
                         {
                             "type": "input_audio_buffer.speech_started",
@@ -1428,7 +1632,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                         current_output_item_id=current_output_item_id,
                         current_response_id=current_response_id,
                     )
-                    returned_message.append(cast(OpenAIRealtimeEvents, incomplete_done_event))
+                    returned_message.append(
+                        cast(
+                            OpenAIRealtimeEvents, incomplete_done_event
+                        )  # cast-ok: built by _return_incomplete_output_item_done to match this TypedDict
+                    )
             input_tx = server_content.get("inputTranscription")
             if isinstance(input_tx, dict) and input_tx.get("text"):
                 returned_message.append(
@@ -1449,6 +1657,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 if current_response_id is None:
                     current_response_id = "resp_{}".format(uuid.uuid4())
                 if current_output_item_id is None:
+                    if self._turn_closed_by_interrupt:
+                        verbose_logger.debug(
+                            "RT_PROBE _turn_closed_by_interrupt RESET False via outputTranscription (id=%s)",
+                            id(self),
+                        )
                     self._turn_closed_by_interrupt = False
                     current_output_item_id = "item_{}".format(uuid.uuid4())
                     current_conversation_id = current_conversation_id or "conv_{}".format(uuid.uuid4())
@@ -1582,23 +1795,31 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
                 for tool_event in tool_events:
                     if tool_event["type"] == "response.created":
-                        response_created_event = cast(OpenAIRealtimeStreamResponseBaseObject, tool_event)
+                        response_created_event = cast(  # cast-ok: narrowed by tool_event["type"] above
+                            OpenAIRealtimeStreamResponseBaseObject, tool_event
+                        )
                         response_created_event["response"]["modalities"] = tool_call_modalities
                         tool_call_created_temperature = tool_call_generation_config.get("temperature")
                         if tool_call_created_temperature is not None:
                             response_created_event["response"]["temperature"] = tool_call_created_temperature
                         tool_call_created_max_output_tokens = tool_call_generation_config.get("maxOutputTokens")
                         if tool_call_created_max_output_tokens is not None:
-                            response_created_event["response"]["max_output_tokens"] = cast(
-                                int, tool_call_created_max_output_tokens
+                            response_created_event["response"]["max_output_tokens"] = (
+                                cast(  # cast-ok: provider-native config dict, no static type
+                                    int, tool_call_created_max_output_tokens
+                                )
                             )
                         returned_message.append(response_created_event)
                     elif tool_event["type"] == "response.output_item.added":
-                        output_item_added_event = cast(OpenAIRealtimeStreamResponseOutputItemAdded, tool_event)
+                        output_item_added_event = cast(  # cast-ok: narrowed by tool_event["type"] above
+                            OpenAIRealtimeStreamResponseOutputItemAdded, tool_event
+                        )
                         _patch_function_call_item(output_item_added_event["item"])
                         returned_message.append(output_item_added_event)
                     elif tool_event["type"] == "response.output_item.done":
-                        output_item_done_event = cast(OpenAIRealtimeOutputItemDone, tool_event)
+                        output_item_done_event = cast(  # cast-ok: narrowed by tool_event["type"] above
+                            OpenAIRealtimeOutputItemDone, tool_event
+                        )
                         _patch_function_call_item(output_item_done_event["item"])
                         returned_message.append(output_item_done_event)
                     elif tool_event["type"] == "conversation.item.added":
@@ -1606,17 +1827,21 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                         # register the call_id into _pending_function_calls before
                         # response.function_call_arguments.done fires — already
                         # emitted by open_item() for every item, just needs patching.
-                        conversation_item_added_event = cast(OpenAIRealtimeConversationItemAdded, tool_event)
+                        conversation_item_added_event = cast(  # cast-ok: narrowed by tool_event["type"] above
+                            OpenAIRealtimeConversationItemAdded, tool_event
+                        )
                         conversation_added_item = conversation_item_added_event.get("item")
                         assert conversation_added_item is not None
                         _patch_function_call_item(conversation_added_item)
                         returned_message.append(conversation_item_added_event)
                     elif tool_event["type"] == "response.function_call_arguments.done":
-                        function_call_done_event = cast(OpenAIRealtimeFunctionCallArgumentsDone, tool_event)
+                        function_call_done_event = cast(  # cast-ok: narrowed by tool_event["type"] above
+                            OpenAIRealtimeFunctionCallArgumentsDone, tool_event
+                        )
                         # Gemini delivers args in one shot; emit a single delta before
                         # .done so clients that accumulate deltas get the full payload.
                         returned_message.append(
-                            cast(
+                            cast(  # cast-ok: hand-built dict matches the delta event's TypedDict shape
                                 OpenAIRealtimeEvents,
                                 {
                                     "type": "response.function_call_arguments.delta",
@@ -1636,15 +1861,15 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                         # defensively rather than forward an unexpected event type.
                         continue
                     elif tool_event["type"] == "response.done":
-                        response_done_event = cast(OpenAIRealtimeDoneEvent, tool_event)
+                        response_done_event = cast(  # cast-ok: narrowed by tool_event["type"] above
+                            OpenAIRealtimeDoneEvent, tool_event
+                        )
                         for output_item in response_done_event["response"].get("output", []):
                             _patch_function_call_item(output_item)
-                        resolved_tool_call_usage_metadata = self._consume_usage_metadata_for_response_done(
-                            json_message
-                        )
+                        resolved_tool_call_usage_metadata = self._consume_usage_metadata_for_response_done(json_message)
                         if resolved_tool_call_usage_metadata is not None:
                             _tool_call_chat_completion_usage = VertexGeminiConfig._calculate_usage(
-                                completion_response=cast(
+                                completion_response=cast(  # cast-ok: json_message plus merged usageMetadata matches the wire shape
                                     BidiGenerateContentServerMessage,
                                     {
                                         **json_message,
@@ -1668,8 +1893,10 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                             response_done_event["response"]["temperature"] = tool_call_temperature
                         tool_call_max_output_tokens = tool_call_generation_config.get("maxOutputTokens")
                         if tool_call_max_output_tokens is not None:
-                            response_done_event["response"]["max_output_tokens"] = cast(
-                                int, tool_call_max_output_tokens
+                            response_done_event["response"]["max_output_tokens"] = (
+                                cast(  # cast-ok: provider-native config dict, no static type
+                                    int, tool_call_max_output_tokens
+                                )
                             )
                         returned_message.append(response_done_event)
                     else:
@@ -1677,7 +1904,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                         # other CorrelationEvent member) — it has no cancel_response()
                         # call in its implementation — so every remaining event here
                         # is a plain OpenAIRealtimeEvents member handled above by type.
-                        returned_message.append(cast(OpenAIRealtimeEvents, tool_event))
+                        returned_message.append(
+                            cast(  # cast-ok: exhaustiveness fallback, only remaining member
+                                OpenAIRealtimeEvents, tool_event
+                            )
+                        )
 
                 current_output_item_id = None
                 current_response_id = None
@@ -1724,7 +1955,9 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                     if event.get("type") == "response.output_item.done"
                     and event.get("item", {}).get("id") not in _already_closed_ids
                 ]
-                _effective_item_chunks = (current_item_chunks or []) + cast(
+                _effective_item_chunks = (
+                    current_item_chunks or []
+                ) + cast(  # cast-ok: filtered from returned_message entries already of this event type
                     List[OpenAIRealtimeOutputItemDone], _same_frame_done_items
                 )
                 _sc = json_message.get("serverContent")
@@ -1897,8 +2130,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         setup = request.get("setup")
         if not isinstance(setup, dict) or update.get("type") != "session.update":
             return None
+        setup_model = str(setup.get("model", "")).removeprefix("models/")
         session_payload = self._normalize_session_payload_for_mapping(update.get("session") or {})
-        new_overrides = self.map_openai_params(optional_params={}, non_default_params=session_payload)
+        new_overrides = self.map_openai_params(
+            optional_params={}, non_default_params=session_payload, model=setup_model
+        )
         merged_generation_config = {
             **setup.get("generationConfig", {}),
             **new_overrides.pop("generationConfig", {}),
@@ -1906,7 +2142,6 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         merged_setup = {**setup, **new_overrides}
         if merged_generation_config:
             merged_setup["generationConfig"] = merged_generation_config
-        setup_model = str(setup.get("model", "")).removeprefix("models/")
         request["setup"] = self._finalize_gemini_live_setup(setup_model, merged_setup)
         return json.dumps(request)
 

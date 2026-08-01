@@ -16,14 +16,30 @@ construction time (see ``handler.py``) so all normalization is isolated here
 and ``RealTimeStreaming`` stays provider-agnostic.
 """
 
-from typing import Any, FrozenSet, Optional
+import time
+from typing import Any, FrozenSet, Mapping, Optional
 
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
 from litellm.litellm_core_utils.realtime_correlation import (
     RealtimeCorrelationState,
     track_content_index,
     track_output_index,
 )
+
+# xAI drops cached conversation history after 30 minutes of inactivity
+# (https://docs.x.ai/build/features/sessions); a captured conversation_id
+# older than this is treated as expired rather than offered for resumption.
+_XAI_RESUMPTION_TTL_SECONDS = 30 * 60
+
+
+# Documented xAI ranges, narrower than GA's. The shared remap has already
+# clamped these to GA bounds, so they are re-clamped here to xAI's own.
+# https://docs.x.ai/developers/model-capabilities/audio/voice-agent
+_XAI_OUTPUT_SPEED_MIN = 0.7
+_XAI_OUTPUT_SPEED_MAX = 1.5
+_XAI_VAD_THRESHOLD_MIN = 0.1
+_XAI_VAD_THRESHOLD_MAX = 0.9
 
 
 def _derive_ga_server_event_types() -> Optional[FrozenSet[str]]:
@@ -98,6 +114,11 @@ class XAIRealtimeNormalizer:
         # threaded through the caller, mirroring GeminiRealtimeConfig/
         # BedrockRealtimeConfig's own _correlation_state attribute.
         self._correlation_state: RealtimeCorrelationState = RealtimeCorrelationState()
+        # Native resumption bookkeeping (https://docs.x.ai/build/features/sessions):
+        # captured from "conversation.created" once the client has opted in via
+        # session_resumption.enabled=true (see _apply_xai_only_fields below).
+        self._conversation_id: Optional[str] = None
+        self._conversation_id_captured_at: Optional[float] = None
 
     # ---------------------------------------------------------------------------
     # Public interface consumed by RealTimeStreaming
@@ -135,17 +156,179 @@ class XAIRealtimeNormalizer:
         event = self._normalize_response_usage_event(event, event_type)
         return event
 
-    def patch_outgoing_session(self, session: dict) -> dict:
+    def patch_outgoing_session(self, session: dict, canonical_session: Optional[dict] = None) -> dict:
         """Patch a client ``session.update`` payload before forwarding to xAI.
 
-        Unlike OpenAI, xAI does not default ``turn_detection.create_response``
-        to ``True`` for ``server_vad``. Clients such as Pipecat omit the field,
-        which leaves VAD detecting speech but never auto-creating a response.
-        Only fill the default when the client did not set ``create_response``.
+        Two jobs. First, xAI does not default ``turn_detection.create_response``
+        to ``True`` for ``server_vad`` the way OpenAI does; clients such as
+        Pipecat omit the field, which leaves VAD detecting speech but never
+        auto-creating a response, so the default is filled in when the client
+        did not set it.
+
+        Second, xAI accepts configuration OpenAI GA has no field for, which the
+        GA allowlist therefore strips before this point. ``canonical_session``
+        is the client's payload as it arrived, so those fields can be restored
+        in xAI's own spelling.
         """
         session = dict(session)
         self._default_server_vad_create_response(session)
+        # Realtime voice sessions need the model answering immediately, not
+        # deliberating: reasoning is always forced to xAI's lowest rung
+        # ("none"), regardless of what (or whether) the client's session.update
+        # requests via thinking_level. xAI defaults to "high" reasoning effort
+        # when this field is absent, so it cannot be left unset - this must run
+        # even when there is no canonical_session to restore other fields from.
+        session["reasoning"] = {"effort": "none"}
+        if canonical_session:
+            self._apply_xai_only_fields(session, canonical_session)
         return session
+
+    # ---------------------------------------------------------------------------
+    # Native session resumption (conversation_id-based)
+    # ---------------------------------------------------------------------------
+
+    def observe_backend_event(self, event: "Mapping[str, Any]") -> None:
+        """Capture the resumable conversation id xAI assigns on ``conversation.created``.
+
+        A side-effect-only hook: the event itself is not modified or dropped,
+        it keeps reaching the client unchanged. xAI's resumption id is not
+        delivered on a dedicated service frame the way Gemini's resumption
+        handle is (see ``GeminiRealtimeConfig``) — it rides on this ordinary,
+        client-visible event, so it must be observed here rather than
+        intercepted.
+
+        Field path unconfirmed against a live payload (no XAI_API_KEY was
+        available while implementing this): xAI's docs describe the id as
+        "delivered in the conversation.created event" without specifying the
+        exact nesting. Both a nested ``conversation.id`` (matching the
+        ``session.created`` -> ``session.id`` shape xAI already uses) and a
+        flat top-level ``id`` are accepted here; verify against a real
+        response and drop whichever guess is wrong once XAI_API_KEY is
+        available for a live test.
+        """
+        if event.get("type") != "conversation.created":
+            return
+        conversation = event.get("conversation")
+        conversation_id = conversation.get("id") if isinstance(conversation, dict) else event.get("id")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            return
+        self._conversation_id = conversation_id
+        self._conversation_id_captured_at = time.monotonic()
+
+    def native_resume_query_params(self) -> Optional[Mapping[str, str]]:
+        """Return reconnect URL query params for xAI's native resumption, if available.
+
+        ``None`` when no ``conversation.created`` was ever observed (the
+        client never opted into ``session_resumption.enabled: true``, or the
+        backend never got far enough to assign one), or when the captured id
+        is older than xAI's 30-minute inactivity expiry.
+        """
+        if self._conversation_id is None or self._conversation_id_captured_at is None:
+            return None
+        age = time.monotonic() - self._conversation_id_captured_at
+        if age >= _XAI_RESUMPTION_TTL_SECONDS:
+            return None
+        return {"conversation_id": self._conversation_id}
+
+    @staticmethod
+    def _apply_xai_only_fields(session: dict, canonical: dict) -> None:
+        """Restore canonical fields xAI honors but the GA allowlist dropped."""
+        session_resumption = canonical.get("session_resumption")
+        if isinstance(session_resumption, dict) and isinstance(session_resumption.get("enabled"), bool):
+            session["resumption"] = {"enabled": session_resumption["enabled"]}
+
+        XAIRealtimeNormalizer._apply_transcription_fields(session, canonical)
+        XAIRealtimeNormalizer._clamp_xai_audio_ranges(session)
+
+    @staticmethod
+    def _clamp_xai_audio_ranges(session: dict) -> None:
+        """Re-clamp audio tuning to xAI's ranges, which are narrower than GA's.
+
+        A value the shared remap left alone because GA accepts it can still be
+        out of range here, and xAI rejects the whole session.update on one.
+        """
+        audio = session.get("audio")
+        if not isinstance(audio, dict):
+            return
+        audio = dict(audio)
+
+        audio_output = audio.get("output")
+        if isinstance(audio_output, dict) and "speed" in audio_output:
+            audio_output = dict(audio_output)
+            audio_output["speed"] = XAIRealtimeNormalizer._clamp_logged(
+                audio_output["speed"], _XAI_OUTPUT_SPEED_MIN, _XAI_OUTPUT_SPEED_MAX, "output_audio_speed"
+            )
+            audio["output"] = audio_output
+
+        audio_input = audio.get("input")
+        if isinstance(audio_input, dict):
+            turn_detection = audio_input.get("turn_detection")
+            if isinstance(turn_detection, dict) and "threshold" in turn_detection:
+                audio_input = dict(audio_input)
+                turn_detection = dict(turn_detection)
+                turn_detection["threshold"] = XAIRealtimeNormalizer._clamp_logged(
+                    turn_detection["threshold"],
+                    _XAI_VAD_THRESHOLD_MIN,
+                    _XAI_VAD_THRESHOLD_MAX,
+                    "turn_detection.threshold",
+                )
+                audio_input["turn_detection"] = turn_detection
+                audio["input"] = audio_input
+
+        session["audio"] = audio
+
+    @staticmethod
+    def _clamp_logged(value: object, minimum: float, maximum: float, field: str) -> object:
+        clamped, changed = clamp_numeric(value, minimum, maximum)
+        if changed:
+            verbose_logger.warning(
+                "realtime session.update: clamped %s %s -> %s (unsupported_by_provider): xAI accepts %s..%s",
+                field,
+                value,
+                clamped,
+                minimum,
+                maximum,
+            )
+        return clamped
+
+    @staticmethod
+    def _apply_transcription_fields(session: dict, canonical: dict) -> None:
+        """Rewrite the transcription block into xAI's spelling.
+
+        xAI biases recognition with ``language_hint`` and a ``keyterms`` array
+        and, unlike OpenAI, takes no transcription ``model``. The GA normalizer
+        drops any transcription config without a model and folds keyterms into a
+        prompt string, so both canonical fields would otherwise be unreachable
+        here; they are rebuilt from the pre-remap payload instead.
+        """
+        language = canonical.get("language")
+        language = language if isinstance(language, str) and language else None
+        raw_keyterms = canonical.get("transcription_keyterms")
+        keyterms = (
+            [term for term in raw_keyterms if isinstance(term, str) and term] if isinstance(raw_keyterms, list) else []
+        )
+        if language is None and not keyterms:
+            return
+
+        audio = session.get("audio")
+        audio = dict(audio) if isinstance(audio, dict) else {}
+        audio_input = audio.get("input")
+        audio_input = dict(audio_input) if isinstance(audio_input, dict) else {}
+
+        transcription = audio_input.get("transcription")
+        transcription = dict(transcription) if isinstance(transcription, dict) else {}
+        transcription.pop("model", None)
+        transcription.pop("language", None)
+        # The GA remap folds keyterms into a prompt string; xAI takes the list.
+        transcription.pop("prompt", None)
+        if language is not None:
+            transcription["language_hint"] = language
+        if keyterms:
+            transcription["keyterms"] = keyterms
+
+        audio_input["transcription"] = transcription
+        audio["input"] = audio_input
+        session["audio"] = audio
 
     @staticmethod
     def _default_server_vad_create_response(session: dict) -> None:

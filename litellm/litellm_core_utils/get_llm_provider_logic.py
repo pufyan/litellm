@@ -2,7 +2,7 @@ from typing import Optional, Tuple, cast
 from urllib.parse import urlparse
 
 import litellm
-from litellm.constants import REPLICATE_MODEL_NAME_WITH_ID_LENGTH, YANDEX_REALTIME_API_BASE
+from litellm.constants import REPLICATE_MODEL_NAME_WITH_ID_LENGTH
 from litellm.litellm_core_utils.fallback_generalizations import (
     match_routing_generalization,
 )
@@ -701,7 +701,11 @@ def _get_openai_compatible_provider_info(
             dynamic_api_key,
         ) = litellm.XAIChatConfig()._get_openai_compatible_provider_info(api_base, api_key)
     elif custom_llm_provider == "yandex":
-        api_base = api_base or get_secret_str("YANDEX_REALTIME_API_BASE") or YANDEX_REALTIME_API_BASE
+        # api_base intentionally left unresolved here: chat completions and
+        # realtime (voice) use different Yandex hosts. The realtime path
+        # (realtime_api/main.py) falls back to YANDEX_REALTIME_API_BASE
+        # itself; the chat path (llms/yandex/chat/transformation.py) falls
+        # back to the Foundation Models host.
         dynamic_api_key = api_key or get_secret_str("YANDEX_API_KEY")
     elif custom_llm_provider == "zai":
         (

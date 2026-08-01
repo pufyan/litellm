@@ -444,8 +444,9 @@ class TestBedrockRealtimeResponseCreate:
 class TestBedrockRealtimeResponseTransformation:
     """Test suite for response transformation"""
 
-    def test_transform_session_start_response(self):
-        """Test sessionStart response transformation"""
+    def test_bedrock_session_start_does_not_emit_duplicate_session_created(self):
+        """A Bedrock output sessionStart must not forward a second session.created to the
+        client; session.created is sent exactly once on connect (LIT-4655)"""
         config = BedrockRealtimeConfig()
         logging_obj = MagicMock()
         logging_obj.litellm_trace_id = "trace_123"
@@ -469,10 +470,8 @@ class TestBedrockRealtimeResponseTransformation:
             },
         )
 
-        assert len(result["response"]) == 1
-        assert result["response"][0]["type"] == "session.created"
-        assert result["response"][0]["session"]["id"] == "trace_123"
-        assert "model" in result["response"][0]["session"]
+        assert result["response"] == []
+        assert result["session_configuration_request"] == json.dumps({"configured": True})
 
     def test_transform_text_output_response(self):
         """Test textOutput response transformation"""
@@ -1127,5 +1126,284 @@ class TestBedrockRealtimeResponseTransformation:
         assert result3["current_item_chunks"] is None
 
 
+class TestBedrockRealtimeSessionEvents:
+    """session.created / session.updated builders produce spec-shaped events (LIT-4655)"""
+
+    @staticmethod
+    def _logging():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(litellm_trace_id="trace_123")
+
+    def test_session_created_event_shape(self):
+        event = BedrockRealtimeConfig().session_created_event("amazon.nova-sonic-v1:0", self._logging())
+        assert event["type"] == "session.created"
+        assert event["session"]["id"] == "trace_123"
+        assert event["session"]["model"] == "amazon.nova-sonic-v1:0"
+        assert event["session"]["modalities"] == ["text", "audio"]
+        assert event["event_id"]
+
+    def test_session_updated_event_shape(self):
+        event = BedrockRealtimeConfig().session_updated_event("amazon.nova-sonic-v1:0", self._logging())
+        assert event["type"] == "session.updated"
+        assert event["session"]["id"] == "trace_123"
+        assert event["session"]["model"] == "amazon.nova-sonic-v1:0"
+        assert event["event_id"]
+
+    def test_created_and_updated_have_distinct_event_ids(self):
+        config = BedrockRealtimeConfig()
+        logging_obj = self._logging()
+        created = config.session_created_event("amazon.nova-sonic-v1:0", logging_obj)
+        updated = config.session_updated_event("amazon.nova-sonic-v1:0", logging_obj)
+        assert created["event_id"] != updated["event_id"]
+
+    def test_session_updated_reflects_requested_modalities(self):
+        event = BedrockRealtimeConfig().session_updated_event(
+            "amazon.nova-sonic-v1:0", self._logging(), modalities=["text"]
+        )
+        assert event["session"]["modalities"] == ["text"]
+
+    def test_session_updated_defaults_modalities_when_unspecified(self):
+        event = BedrockRealtimeConfig().session_updated_event("amazon.nova-sonic-v1:0", self._logging())
+        assert event["session"]["modalities"] == ["text", "audio"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestSessionInferenceAndTurnDetection:
+    """Canonical session fields Bedrock previously ignored.
+
+    ``top_p`` was never read from the session, so the hardcoded 0.9 always won;
+    Nova 2's ``turnDetectionConfiguration`` was not mapped at all, and the
+    implementation did not distinguish Nova 1 from Nova 2.
+    """
+
+    NOVA_1 = "amazon.nova-sonic-v1:0"
+    NOVA_2 = "amazon.nova-2-sonic-v1:0"
+
+    @staticmethod
+    def _session_start(model: str, session: dict) -> dict:
+        config = BedrockRealtimeConfig()
+        messages = config.transform_session_update_event(
+            {"type": "session.update", "session": session}, model=model
+        )
+        return json.loads(messages[0])["event"]["sessionStart"]
+
+    def test_top_p_from_session_overrides_the_protocol_default(self):
+        """``inferenceConfiguration`` is required by the Bedrock event schema,
+        so a default must be sent -- but a client value must win over it."""
+        session_start = self._session_start(self.NOVA_2, {"top_p": 0.5})
+
+        assert session_start["inferenceConfiguration"]["topP"] == 0.5
+
+    def test_inference_defaults_are_kept_when_client_omits_them(self):
+        session_start = self._session_start(self.NOVA_2, {})
+
+        assert session_start["inferenceConfiguration"] == {
+            "maxTokens": 1024,
+            "topP": 0.9,
+            "temperature": 0.7,
+        }
+
+    def test_all_inference_params_can_be_set_together(self):
+        session_start = self._session_start(
+            self.NOVA_2,
+            {"top_p": 0.3, "temperature": 0.2, "max_response_output_tokens": 512},
+        )
+
+        assert session_start["inferenceConfiguration"] == {
+            "maxTokens": 512,
+            "topP": 0.3,
+            "temperature": 0.2,
+        }
+
+    def test_nova_2_maps_end_sensitivity_to_endpointing(self):
+        session_start = self._session_start(
+            self.NOVA_2, {"turn_detection": {"type": "server_vad", "end_sensitivity": "high"}}
+        )
+
+        assert session_start["turnDetectionConfiguration"] == {"endpointingSensitivity": "HIGH"}
+
+    @pytest.mark.parametrize(
+        "canonical, expected", [("high", "HIGH"), ("medium", "MEDIUM"), ("low", "LOW")]
+    )
+    def test_every_sensitivity_level_maps(self, canonical, expected):
+        session_start = self._session_start(
+            self.NOVA_2, {"turn_detection": {"end_sensitivity": canonical}}
+        )
+
+        assert session_start["turnDetectionConfiguration"]["endpointingSensitivity"] == expected
+
+    def test_nova_1_drops_end_sensitivity_rather_than_sending_it(self):
+        """Nova 1 has no turnDetectionConfiguration; forwarding one would be
+        rejected by the backend and take the whole session down."""
+        session_start = self._session_start(
+            self.NOVA_1, {"turn_detection": {"end_sensitivity": "high"}}
+        )
+
+        assert "turnDetectionConfiguration" not in session_start
+
+    def test_nova_1_drop_is_logged(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            self._session_start(self.NOVA_1, {"turn_detection": {"end_sensitivity": "low"}})
+
+        assert any("end_sensitivity" in record.message for record in caplog.records)
+
+    def test_unknown_sensitivity_is_not_forwarded(self):
+        session_start = self._session_start(
+            self.NOVA_2, {"turn_detection": {"end_sensitivity": "aggressive"}}
+        )
+
+        assert "turnDetectionConfiguration" not in session_start
+
+    def test_turn_detection_without_end_sensitivity_sends_no_config(self):
+        """Other turn_detection fields have no Nova equivalent; an empty
+        turnDetectionConfiguration would be noise."""
+        session_start = self._session_start(
+            self.NOVA_2, {"turn_detection": {"type": "server_vad", "threshold": 0.5}}
+        )
+
+        assert "turnDetectionConfiguration" not in session_start
+
+    def test_null_turn_detection_sends_no_config(self):
+        session_start = self._session_start(self.NOVA_2, {"turn_detection": None})
+
+        assert "turnDetectionConfiguration" not in session_start
+
+
+class TestAudioFormatSampleRate:
+    """Canonical audio formats resolve to Nova sample rates.
+
+    The codec name implies a rate, but Nova accepts 8000/16000/24000 on either
+    direction, so "pcm16 at 8kHz" is only expressible through the object form of
+    the canonical field. Two non-canonical keys used to carry this instead,
+    which gave the setting a second address the contract does not define.
+    """
+
+    MODEL = "amazon.nova-2-sonic-v1:0"
+
+    @staticmethod
+    def _rates(session: dict) -> tuple:
+        config = BedrockRealtimeConfig()
+        config.transform_session_update_event(
+            {"type": "session.update", "session": session}, model=TestAudioFormatSampleRate.MODEL
+        )
+        return config.input_sample_rate_hertz, config.output_sample_rate_hertz
+
+    def test_string_format_keeps_the_implied_rates(self):
+        assert self._rates({"input_audio_format": "pcm16"}) == (16000, 24000)
+
+    def test_g711_implies_8k(self):
+        input_rate, _ = self._rates({"input_audio_format": "g711_ulaw"})
+
+        assert input_rate == 8000
+
+    def test_object_form_sets_an_explicit_input_rate(self):
+        """The whole point of the object form: pcm at a rate the codec name does
+        not imply."""
+        input_rate, _ = self._rates({"input_audio_format": {"type": "audio/pcm", "rate": 8000}})
+
+        assert input_rate == 8000
+
+    def test_object_form_sets_an_explicit_output_rate(self):
+        _, output_rate = self._rates({"output_audio_format": {"type": "audio/pcm", "rate": 16000}})
+
+        assert output_rate == 16000
+
+    def test_unsupported_rate_falls_back_instead_of_being_forwarded(self):
+        """Nova rejects rates outside its set, so forwarding one would fail the
+        session rather than degrade it."""
+        input_rate, _ = self._rates({"input_audio_format": {"type": "audio/pcm", "rate": 44100}})
+
+        assert input_rate == 16000
+
+    def test_unsupported_rate_is_logged(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            self._rates({"input_audio_format": {"type": "audio/pcm", "rate": 44100}})
+
+        assert any("44100" in record.message for record in caplog.records)
+
+    def test_object_without_rate_falls_back_to_the_codec_default(self):
+        input_rate, _ = self._rates({"input_audio_format": {"type": "audio/pcm"}})
+
+        assert input_rate == 16000
+
+    def test_boolean_rate_is_rejected(self):
+        """``True`` is an int in Python but never a sample rate."""
+        input_rate, _ = self._rates({"input_audio_format": {"type": "audio/pcm", "rate": True}})
+
+        assert input_rate == 16000
+
+    def test_non_canonical_sample_rate_keys_have_no_effect(self):
+        """These were a second address for a setting the canonical schema
+        already covers; the contract gives every field exactly one."""
+        assert self._rates({"input_sample_rate_hertz": 8000, "output_sample_rate_hertz": 8000}) == (16000, 24000)
+
+    def test_rate_reaches_the_audio_input_configuration(self):
+        """End-to-end: the resolved rate must appear in the Bedrock event, not
+        just on the config object."""
+        config = BedrockRealtimeConfig()
+        config.transform_session_update_event(
+            {"type": "session.update", "session": {"input_audio_format": {"type": "audio/pcm", "rate": 8000}}},
+            model=self.MODEL,
+        )
+        messages = config.transform_input_audio_buffer_append_event(
+            {"type": "input_audio_buffer.append", "audio": base64.b64encode(b"pcm").decode()}
+        )
+
+        content_start = next(
+            json.loads(message)["event"]["contentStart"]
+            for message in messages
+            if "contentStart" in json.loads(message)["event"]
+        )
+        assert content_start["audioInputConfiguration"]["sampleRateHertz"] == 8000
+
+
+class TestInferenceRangeClamping:
+    """``inferenceConfiguration`` is required by the Bedrock event schema, so a
+    bad value cannot be omitted -- it is clamped to the nearest bound."""
+
+    MODEL = "amazon.nova-2-sonic-v1:0"
+
+    def _inference(self, session: dict) -> dict:
+        config = BedrockRealtimeConfig()
+        messages = config.transform_session_update_event(
+            {"type": "session.update", "session": session}, model=self.MODEL
+        )
+        return json.loads(messages[0])["event"]["sessionStart"]["inferenceConfiguration"]
+
+    def test_top_p_above_one_is_clamped(self):
+        assert self._inference({"top_p": 5.0})["topP"] == 1.0
+
+    def test_temperature_above_one_is_clamped(self):
+        assert self._inference({"temperature": 99})["temperature"] == 1.0
+
+    def test_negative_max_tokens_is_raised_to_one(self):
+        assert self._inference({"max_response_output_tokens": -5})["maxTokens"] == 1
+
+    def test_in_range_values_are_untouched(self):
+        inference = self._inference({"top_p": 0.8, "temperature": 0.3, "max_response_output_tokens": 2048})
+
+        assert inference == {"maxTokens": 2048, "topP": 0.8, "temperature": 0.3}
+
+    def test_session_still_carries_tools_with_out_of_range_values(self):
+        config = BedrockRealtimeConfig()
+        messages = config.transform_session_update_event(
+            {
+                "type": "session.update",
+                "session": {
+                    "temperature": 99,
+                    "tools": [{"type": "function", "name": "attended_transfer", "parameters": {}}],
+                },
+            },
+            model=self.MODEL,
+        )
+
+        prompt_start = json.loads(messages[1])["event"]["promptStart"]
+        assert prompt_start["toolConfiguration"]["tools"][0]["toolSpec"]["name"] == "attended_transfer"

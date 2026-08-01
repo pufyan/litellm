@@ -1864,7 +1864,9 @@ def client(original_function):
                     except Exception:
                         pass
 
-            setattr(e, "num_retries", num_retries)  ## IMPORTANT: returns the deployment's num_retries to the router
+            deployment_num_retries = kwargs.get("num_retries")
+            if deployment_num_retries is not None:
+                setattr(e, "num_retries", deployment_num_retries)
 
             timeout = _get_wrapper_timeout(kwargs=kwargs, exception=e)
             setattr(e, "timeout", timeout)
@@ -7668,6 +7670,7 @@ class ProviderConfigManager:
             LlmProviders.GITHUB_COPILOT: (lambda: litellm.GithubCopilotConfig(), False),
             LlmProviders.CHATGPT: (lambda: litellm.ChatGPTConfig(), False),
             LlmProviders.GIGACHAT: (lambda: litellm.GigaChatConfig(), False),
+            LlmProviders.YANDEX: (lambda: litellm.YandexChatConfig(), False),
             LlmProviders.RAGFLOW: (lambda: litellm.RAGFlowConfig(), False),
             LlmProviders.CUSTOM: (lambda: litellm.OpenAILikeChatConfig(), False),
             LlmProviders.CUSTOM_OPENAI: (lambda: litellm.OpenAILikeChatConfig(), False),
