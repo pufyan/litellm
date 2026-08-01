@@ -855,8 +855,10 @@ def test_gemini_session_created_reports_audio_sample_rates():
 
 
 def test_gemini_audio_sample_rate_honors_model_cost_override(monkeypatch):
-    """A model with per-model sample rates in the cost map must override the
-    defaults, so a future model with different rates needs only a cost-map entry."""
+    """A model with a per-model output sample rate in the cost map must override
+    the default, so a future model with a different output rate needs only a
+    cost-map entry. Input has no such override: it is always advertised (and
+    actually sent) at the fixed native Gemini Live rate, regardless of model_cost."""
     import litellm
 
     monkeypatch.setitem(
@@ -867,7 +869,7 @@ def test_gemini_audio_sample_rate_honors_model_cost_override(monkeypatch):
     config = GeminiRealtimeConfig()
 
     audio = config.get_session_audio_config("gemini-future-audio")
-    assert audio["input"]["format"]["rate"] == 48000
+    assert audio["input"]["format"]["rate"] == 16000
     assert audio["output"]["format"]["rate"] == 48000
 
 
@@ -1868,8 +1870,9 @@ def test_gemini_realtime_pipecat_ga_session_voice_and_tools(patch_gemini_audio_c
     assert len(messages) == 1
     setup = json.loads(messages[0])["setup"]
     assert setup["generationConfig"]["responseModalities"] == ["AUDIO"]
-    # Native-audio Live rejects speechConfig on setup (see _finalize_gemini_live_setup).
-    assert "speechConfig" not in setup.get("generationConfig", {})
+    # Native-audio Live accepts speechConfig on setup; the client's requested voice
+    # ("Kore") must reach Gemini, not be silently dropped.
+    assert setup["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"] == "Kore"
     assert setup["tools"][0]["function_declarations"][0]["name"] == "terminate_call"
     assert setup["realtimeInputConfig"]["automaticActivityDetection"]["disabled"] is False
 
@@ -2413,20 +2416,6 @@ def test_is_audio_only_live_model_uses_cost_map(model, expected, patch_gemini_au
     assert GeminiRealtimeConfig._is_audio_only_live_model(model) == expected
 
 
-@pytest.mark.parametrize(
-    "model,expected",
-    [
-        ("gemini-2.5-flash-native-audio-latest", True),
-        ("gemini/gemini-2.5-flash-native-audio-latest", True),
-        ("gemini-3.1-flash-live-preview", False),
-        ("gemini/gemini-3.1-flash-live-preview", False),
-        ("gemini-2.0-flash", False),
-    ],
-)
-def test_is_native_audio_model_uses_cost_map(model, expected, patch_gemini_audio_cost_map_entries):
-    assert GeminiRealtimeConfig._is_native_audio_model(model) == expected
-
-
 def test_is_setup_message_and_is_content_message():
     config = GeminiRealtimeConfig()
     assert config.is_setup_message({"setup": {}}) is True
@@ -2498,12 +2487,17 @@ def test_gemini_multi_item_message_path_allocates_real_incrementing_indices():
 
 
 class TestThinkingConfigMapping:
-    """Canonical reasoning fields -> Gemini ``generationConfig.thinkingConfig``.
+    """Realtime voice sessions always force thinking off, ignoring any
+    client-supplied reasoning fields entirely -- deliberation adds latency a
+    live conversation cannot afford.
 
-    Gemini 3.x expresses reasoning effort as ``thinkingLevel`` and does not
-    accept ``thinkingBudget``; 2.5 is the reverse. Before this mapping existed
-    every reasoning field was dropped without reaching ``generationConfig``, so
-    a client disabling thinking for latency kept paying for thinking tokens.
+    Gemini 2.5 Live models: leaving ``thinkingConfig``/``thinkingBudget`` off
+    the setup entirely (not just setting a value) has been observed to break
+    the session, so ``thinkingBudget: 0`` is sent unconditionally.
+
+    Gemini 3.x Live models: thinking cannot be disabled at all on this family
+    and it rejects ``thinkingBudget``, so ``thinkingLevel`` is forced to its
+    lowest rung, ``"minimal"``.
     """
 
     GEMINI_3 = "gemini-3.1-flash-live-preview"
@@ -2514,97 +2508,48 @@ class TestThinkingConfigMapping:
         mapped = config.map_openai_params(optional_params={}, non_default_params=session, model=model)
         return mapped.get("generationConfig", {})
 
-    def test_gemini_3_maps_thinking_level(self):
-        generation_config = self._generation_config(self.GEMINI_3, {"thinking_level": "high"})
-
-        assert generation_config["thinkingConfig"] == {"thinkingLevel": "high"}
-
-    def test_gemini_25_maps_thinking_budget(self):
-        generation_config = self._generation_config(self.GEMINI_25, {"thinking_budget": 2048})
-
-        assert generation_config["thinkingConfig"] == {"thinkingBudget": 2048}
-
-    def test_zero_budget_reaches_backend_as_zero(self):
-        """``thinking_budget: 0`` disables thinking; treating 0 as "unset" would
-        silently keep thinking enabled, which is the exact production symptom
-        this mapping exists to fix."""
-        generation_config = self._generation_config(self.GEMINI_25, {"thinking_budget": 0})
+    def test_gemini_25_always_sends_zero_budget(self):
+        generation_config = self._generation_config(self.GEMINI_25, {})
 
         assert generation_config["thinkingConfig"] == {"thinkingBudget": 0}
 
-    def test_budget_is_dropped_on_a_level_based_model(self):
-        """Forwarding ``thinkingBudget`` to Gemini 3.x would be rejected by the
-        backend, so the field the model cannot express is dropped rather than
-        translated into the other one."""
-        generation_config = self._generation_config(self.GEMINI_3, {"thinking_budget": 2048})
+    def test_gemini_3_always_sends_minimal_level(self):
+        generation_config = self._generation_config(self.GEMINI_3, {})
 
-        assert "thinkingConfig" not in generation_config
+        assert generation_config["thinkingConfig"] == {"thinkingLevel": "minimal"}
 
-    def test_level_is_dropped_on_a_budget_based_model(self):
-        generation_config = self._generation_config(self.GEMINI_25, {"thinking_level": "high"})
+    def test_client_supplied_budget_is_ignored(self):
+        """A client asking for more thinking tokens must not get them: realtime
+        sessions never honor client-supplied reasoning fields."""
+        generation_config = self._generation_config(self.GEMINI_25, {"thinking_budget": 2048})
 
-        assert "thinkingConfig" not in generation_config
+        assert generation_config["thinkingConfig"] == {"thinkingBudget": 0}
 
-    def test_sending_both_is_resolved_by_the_proxy_not_rejected(self):
-        """A client may hold both in configuration and forward both; knowing
-        which one a given model wants is backend knowledge it is not supposed to
-        have. The proxy keeps the one the model expresses reasoning in."""
-        generation_config = self._generation_config(
-            self.GEMINI_3, {"thinking_level": "low", "thinking_budget": 2048}
-        )
+    def test_client_supplied_level_is_ignored(self):
+        generation_config = self._generation_config(self.GEMINI_3, {"thinking_level": "high"})
 
-        assert generation_config["thinkingConfig"] == {"thinkingLevel": "low"}
+        assert generation_config["thinkingConfig"] == {"thinkingLevel": "minimal"}
 
-    def test_include_thoughts_applies_to_both_families(self):
-        for model, field, value in (
-            (self.GEMINI_3, "thinking_level", "low"),
-            (self.GEMINI_25, "thinking_budget", 1024),
-        ):
-            generation_config = self._generation_config(model, {field: value, "include_thoughts": True})
+    def test_include_thoughts_is_ignored(self):
+        generation_config = self._generation_config(self.GEMINI_25, {"include_thoughts": True})
 
-            assert generation_config["thinkingConfig"]["includeThoughts"] is True
-
-    def test_include_thoughts_alone_still_reaches_backend(self):
-        generation_config = self._generation_config(self.GEMINI_3, {"include_thoughts": True})
-
-        assert generation_config["thinkingConfig"] == {"includeThoughts": True}
-
-    def test_absent_reasoning_fields_produce_no_thinking_config(self):
-        """Writing a default would override Gemini's own, which the contract
-        forbids for optional fields."""
-        generation_config = self._generation_config(self.GEMINI_3, {"temperature": 0.8})
-
-        assert "thinkingConfig" not in generation_config
-
-    def test_invalid_level_is_not_forwarded(self):
-        generation_config = self._generation_config(self.GEMINI_3, {"thinking_level": "extreme"})
-
-        assert "thinkingConfig" not in generation_config
-
-    def test_boolean_is_not_accepted_as_a_budget(self):
-        """``True`` is an int in Python; forwarding it would send
-        ``thinkingBudget: true`` and break the setup."""
-        generation_config = self._generation_config(self.GEMINI_25, {"thinking_budget": True})
-
-        assert "thinkingConfig" not in generation_config
+        assert generation_config["thinkingConfig"] == {"thinkingBudget": 0}
 
     def test_thinking_reaches_the_backend_setup_message(self):
-        """End-to-end through ``transform_realtime_request``: the mapping is
-        worthless if it does not survive into the actual ``setup`` frame."""
+        """End-to-end through ``transform_realtime_request``: the forced
+        ``thinkingConfig`` is worthless if it does not survive into the actual
+        ``setup`` frame, regardless of what the client's session.update asked for."""
         config = GeminiRealtimeConfig()
         messages = config.transform_realtime_request(
             message=json.dumps(
-                {"type": "session.update", "session": {"thinking_level": "medium", "include_thoughts": True}}
+                {"type": "session.update", "session": {"thinking_level": "high", "include_thoughts": True}}
             ),
             model=self.GEMINI_3,
             session_configuration_request=None,
         )
 
         setup = json.loads(messages[0])["setup"]
-        assert setup["generationConfig"]["thinkingConfig"] == {
-            "thinkingLevel": "medium",
-            "includeThoughts": True,
-        }
+        assert setup["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
 
 
 class TestBargeInMapping:

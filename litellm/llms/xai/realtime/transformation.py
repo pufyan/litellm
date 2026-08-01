@@ -27,17 +27,6 @@ from litellm.litellm_core_utils.realtime_correlation import (
 )
 
 
-# Canonical thinking_level -> xAI reasoning.effort. xAI documents two rungs
-# ("high", the default, and "none"), so the four canonical levels collapse onto
-# them: the two lower levels ask for as little reasoning as possible.
-_XAI_REASONING_EFFORT_MAP: "dict[str, str]" = {
-    "minimal": "none",
-    "low": "none",
-    "medium": "high",
-    "high": "high",
-}
-
-
 # Documented xAI ranges, narrower than GA's. The shared remap has already
 # clamped these to GA bounds, so they are re-clamped here to xAI's own.
 # https://docs.x.ai/developers/model-capabilities/audio/voice-agent
@@ -172,6 +161,13 @@ class XAIRealtimeNormalizer:
         """
         session = dict(session)
         self._default_server_vad_create_response(session)
+        # Realtime voice sessions need the model answering immediately, not
+        # deliberating: reasoning is always forced to xAI's lowest rung
+        # ("none"), regardless of what (or whether) the client's session.update
+        # requests via thinking_level. xAI defaults to "high" reasoning effort
+        # when this field is absent, so it cannot be left unset - this must run
+        # even when there is no canonical_session to restore other fields from.
+        session["reasoning"] = {"effort": "none"}
         if canonical_session:
             self._apply_xai_only_fields(session, canonical_session)
         return session
@@ -179,13 +175,6 @@ class XAIRealtimeNormalizer:
     @staticmethod
     def _apply_xai_only_fields(session: dict, canonical: dict) -> None:
         """Restore canonical fields xAI honors but the GA allowlist dropped."""
-        reasoning_effort = _XAI_REASONING_EFFORT_MAP.get(str(canonical.get("thinking_level", "")).lower())
-        if reasoning_effort is not None:
-            # xAI offers two rungs where the contract offers four, so the four
-            # canonical levels collapse onto them. Documented here rather than
-            # in the contract, which owns meaning, not per-backend degradation.
-            session["reasoning"] = {"effort": reasoning_effort}
-
         session_resumption = canonical.get("session_resumption")
         if isinstance(session_resumption, dict) and isinstance(session_resumption.get("enabled"), bool):
             session["resumption"] = {"enabled": session_resumption["enabled"]}

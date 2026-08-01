@@ -23,6 +23,10 @@ async def test_connect_returns_backend_ws_and_passes_config():
     kwargs = mock_connect.call_args.kwargs
     assert kwargs["additional_headers"] == {"Authorization": "Bearer sk-test"}
     assert kwargs["open_timeout"] == 8.0
+    # Native Live API clients (e.g. websocketpp-based ones) don't negotiate
+    # permessage-deflate; match that wire behavior instead of the library's
+    # default of offering compression.
+    assert kwargs["compression"] is None
     assert mock_connect.call_args.args == ("wss://example.com/ws",)
 
 

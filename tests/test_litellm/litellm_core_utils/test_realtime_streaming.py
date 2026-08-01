@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -2674,6 +2675,40 @@ async def test_deferred_setup_flush_buffers_audio_received_during_flush():
 
 
 @pytest.mark.asyncio
+async def test_flush_paces_consecutive_buffered_audio_frames(monkeypatch):
+    """Regression: replaying a reconnect backlog in a tight loop delivers many
+    audio frames within the same instant instead of ~real-time spacing, which
+    Gemini Live's server-side VAD treats as non-contiguous input. Consecutive
+    ``input_audio_buffer.append`` frames must be paced with a sleep; a single
+    audio frame, or a non-audio frame, must not be delayed."""
+    client_ws = MagicMock()
+    backend_ws = MagicMock()
+    logging_obj = MagicMock()
+    streaming = RealTimeStreaming(client_ws, backend_ws, logging_obj)
+    buffered_messages = [
+        json.dumps({"type": "input_audio_buffer.append", "audio": "AA=="}),
+        json.dumps({"type": "input_audio_buffer.append", "audio": "AQ=="}),
+        json.dumps({"type": "input_audio_buffer.append", "audio": "Ag=="}),
+        json.dumps({"type": "input_audio_buffer.commit"}),
+    ]
+    streaming._pending_messages_until_setup = list(buffered_messages)
+    streaming._pending_messages_byte_total = sum(len(message.encode("utf-8")) for message in buffered_messages)
+    streaming._send_to_backend = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+
+    await streaming._flush_pending_messages_until_setup()
+
+    # 4 messages sent, 2 sleeps: before the 2nd and 3rd append (both preceded
+    # by another append), none before the 1st append (nothing precedes it) or
+    # the commit (not an append).
+    assert streaming._send_to_backend.await_count == 4
+    assert sleep_mock.await_count == 2
+    for call in sleep_mock.await_args_list:
+        assert call.args == (streaming._BUFFERED_AUDIO_FRAME_PACING_SECONDS,)
+
+
+@pytest.mark.asyncio
 async def test_deferred_setup_flush_retains_unsent_messages_after_send_failure():
     client_ws = MagicMock()
     backend_ws = MagicMock()
@@ -3606,7 +3641,13 @@ async def test_canonical_session_reaches_the_provider_normalizer():
     await streaming.client_ack_messages()
 
     sent = json.loads(backend_ws.send.call_args_list[0].args[0])
-    assert sent["session"]["reasoning"] == {"effort": "high"}
+    # Wiring proof, not a reasoning-mapping proof: reasoning is always forced
+    # to "none" regardless of the client's thinking_level (realtime sessions
+    # never honor client-supplied reasoning fields), but instructions - a
+    # plain GA-remapped field - reaching the backend proves the canonical
+    # session was actually handed to the normalizer.
+    assert sent["session"]["reasoning"] == {"effort": "none"}
+    assert sent["session"]["instructions"] == "hi"
     # thinking_level itself is not GA-valid and must not reach the backend
     assert "thinking_level" not in sent["session"]
 

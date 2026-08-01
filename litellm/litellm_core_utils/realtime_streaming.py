@@ -208,6 +208,16 @@ class RealTimeStreaming:
     _MAX_BUFFERED_MESSAGES: int = 200
     _MAX_BUFFERED_BYTES: int = 10 * 1024 * 1024  # 10 MB
 
+    # Gemini Live's server-side VAD expects audio frames to arrive at roughly the
+    # cadence they were recorded at. Replaying a backlog (accumulated during a
+    # backend reconnect or deferred setup) in a tight loop delivers many frames
+    # within the same instant instead of the ~20-40ms real-time spacing a native
+    # client keeps even under network jitter; Google's own troubleshooting
+    # guidance ties exactly this kind of non-contiguous delivery to a
+    # saturated/misaligned VAD buffer. Pace replayed audio frames by this much so
+    # a flush looks like real-time audio to the backend, not a burst.
+    _BUFFERED_AUDIO_FRAME_PACING_SECONDS: float = 0.02
+
     _RECONNECT_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
     _MAX_CONSECUTIVE_IMMEDIATE_RECONNECT_CLOSES: int = 3
     _MAX_TRANSCRIPT_ENTRIES: int = 200
@@ -444,6 +454,12 @@ class RealTimeStreaming:
                     self.session_configuration_request, message
                 )
                 if merged_setup is not None:
+                    verbose_logger.debug(
+                        "Realtime: client session.update forced a proactive backend reconnect "
+                        "(follow-up setup rejected in-place). Merged setup to be sent on the new "
+                        "socket: %s",
+                        merged_setup,
+                    )
                     self.session_configuration_request = merged_setup
                     return await self._reconnect_backend(reason="client_session_update")
             sent = False
@@ -457,6 +473,7 @@ class RealTimeStreaming:
                         verbose_logger.debug("Dropping follow-up setup after content was already sent to backend")
                         continue
                     msg = self._maybe_inject_guardrail_auto_response_disable(msg)
+                    verbose_logger.debug("Realtime: WS SEND -> backend: %s", msg)
                     await self.backend_ws.send(msg)  # type: ignore[union-attr, attr-defined]
                     self._cache_session_configuration_request(msg)
                     sent = True
@@ -468,6 +485,7 @@ class RealTimeStreaming:
                     # content before send would leave the session believing the
                     # backend received a setup/content frame it never got, causing
                     # subsequent client session.update messages to be dropped.
+                    verbose_logger.debug("Realtime: WS SEND -> backend: %s", msg)
                     await self.backend_ws.send(msg)  # type: ignore[union-attr, attr-defined]
                     self._cache_session_configuration_request(msg)
                     if is_content_message:
@@ -644,6 +662,13 @@ class RealTimeStreaming:
         self._pending_messages_until_setup = []
         self._pending_messages_byte_total = 0
         for idx, message in enumerate(pending):
+            if idx > 0:
+                try:
+                    msg_type = json.loads(message).get("type")
+                except (json.JSONDecodeError, TypeError):
+                    msg_type = None
+                if msg_type == "input_audio_buffer.append":
+                    await asyncio.sleep(self._BUFFERED_AUDIO_FRAME_PACING_SECONDS)
             try:
                 await self._send_to_backend(message)
             except Exception as e:
@@ -706,6 +731,13 @@ class RealTimeStreaming:
             try:
                 new_ws = await self.backend_connector.connect()
                 if resume_request is not None:
+                    verbose_logger.debug(
+                        "Realtime: sending resume/setup request on reconnected backend socket "
+                        "(reason=%s, attempt=%d): %s",
+                        reason,
+                        attempt,
+                        resume_request,
+                    )
                     await new_ws.send(resume_request)
                 self.backend_ws = new_ws
                 self._reconnect_resumed_mode = "native" if (state is not None and state.resumable) else "fresh"
@@ -1295,6 +1327,10 @@ class RealTimeStreaming:
             close_code = getattr(rcvd, "code", None) if rcvd is not None else getattr(e, "code", None)
             close_reason = getattr(rcvd, "reason", None) if rcvd is not None else getattr(e, "reason", None)
             verbose_logger.warning("Realtime backend closed by provider: code=%s reason=%r", close_code, close_reason)
+            verbose_logger.debug(
+                "Realtime: provider_config diagnostic state at close: turn_closed_by_interrupt=%s",
+                getattr(self.provider_config, "_turn_closed_by_interrupt", "n/a"),
+            )
             if not self._supports_backend_reconnect():
                 raise
             self._consecutive_immediate_reconnect_closes += 1

@@ -1910,6 +1910,7 @@ if TYPE_CHECKING:
         JinaAIEmbeddingConfig as JinaAIEmbeddingConfig,
     )
     from .llms.xai.chat.transformation import XAIChatConfig as XAIChatConfig
+    from .llms.yandex.chat.transformation import YandexChatConfig as YandexChatConfig
     from .llms.zai.chat.transformation import ZAIChatConfig as ZAIChatConfig
     from .llms.aiml.chat.transformation import AIMLChatConfig as AIMLChatConfig
     from .llms.volcengine.chat.transformation import (

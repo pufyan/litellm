@@ -174,6 +174,8 @@ Sending both is **not** a client error. Resolving them is the proxy's job, like 
 
 An implementation whose backend expresses effort with a coarser scale maps the canonical levels onto it and documents the collapse in its own code, not here.
 
+Neither field is a promise of zero reasoning. `thinking_level: "minimal"` asks for as little effort as the backend allows, not for none — a backend may reserve some reasoning it will not let go below, and `thinking_budget: 0` only "disables reasoning" on a backend that treats 0 as a valid budget in the first place. A client that needs true zero-reasoning behavior must confirm the target model supports it; sending either field on a model that does not is not an error; the field is dropped or its value is clamped, and the model's own floor applies.
+
 #### Session lifetime and context
 
 | Field | Type | Meaning |
@@ -181,13 +183,6 @@ An implementation whose backend expresses effort with a coarser scale maps the c
 | `context_window_compression` | object | How to keep the context window from overflowing: `{ "sliding_window": {}, "trigger_tokens": int, "target_tokens": int }`. Expresses the intent "do not let the session die of context overflow"; a backend may satisfy it by compressing, summarizing, or truncating |
 | `session_resumption` | object | `{ "enabled": bool }`. Asks the backend to make the session resumable across a dropped connection. The proxy's own reconnection machinery is always active regardless; what this field changes is *how much context survives* a reconnect — see `resumed: "native"` under "Backend reconnection". Any resumption token the backend issues is held and used by the proxy, never surfaced to the client |
 | `media_resolution` | `"low"` \| `"medium"` \| `"high"` | Resolution at which visual input is processed |
-
-#### Conversational style
-
-| Field | Type | Meaning |
-|---|---|---|
-| `affective_dialog` | bool | Whether the model adapts tone and delivery to the emotional content of user speech |
-| `proactive_audio` | bool | Whether the model may decide on its own not to respond to input not addressed to it |
 
 ### Tools
 
@@ -330,7 +325,7 @@ Counter-example: `eagerness` and `end_sensitivity`. Both concern turn-end timing
 - Never add a provider name, a model name, or a support matrix to this document. If you feel the need to write "on backend X this field means…", the field is wrong: either its meaning is not universal (split it) or the note belongs in the implementation.
 - Before adding a field, enforce one-name-one-meaning. Before unifying two backend fields, apply the aliasing test. When in doubt, keep them separate.
 - A new field lands in the field reference with a type and a *meaning*, expressed without reference to any backend.
-- A field is worth adding as soon as one backend can honor it. The contract is the union of intents, not the intersection.
+- A field is worth adding as soon as one backend can honor it. The contract is the union of intents, not the intersection. This is not unconditional: a capability tied to one backend's preview API version, that the same backend's own next model generation already dropped, is not a stable enough intent to name in a client-facing contract. Gemini's `enableAffectiveDialog` and `proactivity.proactiveAudio` (2.5-only, `v1alpha`, explicitly removed in Google's 3.1 guidance) were tried here and reverted for exactly this reason. Wait for a second backend, or for the capability to survive a model generation, before adding one like it.
 
 **Implementation changes**
 

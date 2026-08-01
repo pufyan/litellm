@@ -325,8 +325,12 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
     def get_session_audio_config(self, model: str) -> OpenAIRealtimeAudioConfig:
         return OpenAIRealtimeAudioConfig(
+            # Input is always advertised (and actually sent, in get_audio_mime_type)
+            # at the fixed native Gemini Live rate; unlike output there is no
+            # per-model override, so what the client is told here always matches
+            # the mimeType on the wire.
             input=OpenAIRealtimeAudioDirectionConfig(
-                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self._audio_sample_rate(model, is_output=False))
+                format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self.DEFAULT_INPUT_AUDIO_SAMPLE_RATE_HZ)
             ),
             output=OpenAIRealtimeAudioDirectionConfig(
                 format=OpenAIRealtimeAudioFormat(type="audio/pcm", rate=self._audio_sample_rate(model, is_output=True))
@@ -398,9 +402,10 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "context_window_compression",
             "top_p",
             "top_k",
-            "thinking_budget",
-            "thinking_level",
-            "include_thoughts",
+            # thinking_budget / thinking_level / include_thoughts are
+            # intentionally absent: realtime sessions always force thinking off
+            # (see _build_thinking_config), so client-supplied values for these
+            # are never honored.
             "presence_penalty",
             "frequency_penalty",
             "stop_sequences",
@@ -461,42 +466,25 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         return mapped
 
     @staticmethod
-    def _build_thinking_config(model: str, non_default_params: Mapping[str, Any]) -> Optional[GeminiThinkingConfig]:
-        """Resolve the canonical reasoning fields into Gemini's ``thinkingConfig``.
+    def _build_thinking_config(model: str) -> GeminiThinkingConfig:
+        """Force thinking off for this realtime session, ignoring any client input.
 
-        Gemini 3.x expresses reasoning effort as ``thinkingLevel`` and rejects
-        ``thinkingBudget``; 2.5 is the reverse. The canonical contract keeps the
-        two as separate fields because a token count and an effort level are
-        different concepts, so the field the active model cannot express is
-        dropped here rather than translated into the other.
+        Realtime voice sessions need the model answering immediately, not
+        deliberating; thinking is therefore always disabled here rather than
+        left to whatever (or nothing) the client's session.update requests.
+
+        Gemini 2.5 Live models: leaving ``thinkingConfig``/``thinkingBudget`` off
+        the setup entirely (not just setting a value) has been observed to break
+        the session, so ``thinkingBudget: 0`` is sent unconditionally.
+
+        Gemini 3.x Live models: thinking cannot be disabled at all on this
+        family, and they reject ``thinkingBudget`` outright; ``thinkingLevel``
+        is set to its lowest rung, ``"minimal"``, as the closest available
+        approximation.
         """
-        uses_level = VertexGeminiConfig._is_gemini_3_or_newer(model)
-        thinking_config: GeminiThinkingConfig = {}
-
-        if uses_level:
-            level = non_default_params.get("thinking_level")
-            if level in ("minimal", "low", "medium", "high"):
-                thinking_config["thinkingLevel"] = level
-        else:
-            budget = non_default_params.get("thinking_budget")
-            if isinstance(budget, int) and not isinstance(budget, bool):
-                # 0 disables thinking; a negative budget is meaningless and
-                # would be rejected, so it is raised to that floor.
-                clamped_budget, changed = clamp_numeric(budget, 0, None)
-                if changed:
-                    verbose_logger.warning(
-                        "realtime session.update: clamped thinking_budget %s -> %s "
-                        "(unsupported_by_provider): must be >= 0",
-                        budget,
-                        clamped_budget,
-                    )
-                thinking_config["thinkingBudget"] = cast(int, clamped_budget)
-
-        include_thoughts = non_default_params.get("include_thoughts")
-        if isinstance(include_thoughts, bool):
-            thinking_config["includeThoughts"] = include_thoughts
-
-        return thinking_config or None
+        if VertexGeminiConfig._is_gemini_3_or_newer(model):
+            return {"thinkingLevel": "minimal"}
+        return {"thinkingBudget": 0}
 
     def _apply_turn_detection(self, optional_params: dict, value: OpenAIRealtimeTurnDetection) -> None:
         realtime_input_config = BidiGenerateContentRealtimeInputConfig()
@@ -599,9 +587,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 # rely on transcripts arriving), so sending it only re-states
                 # that default; it cannot currently be turned off.
                 optional_params["outputAudioTranscription"] = {}
-        thinking_config = self._build_thinking_config(model, non_default_params)
-        if thinking_config is not None:
-            optional_params["generationConfig"]["thinkingConfig"] = thinking_config
+        optional_params["generationConfig"]["thinkingConfig"] = self._build_thinking_config(model)
         if len(optional_params["generationConfig"]) == 0:
             optional_params.pop("generationConfig")
         return optional_params
@@ -678,10 +664,6 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         return bool(entry.get("gemini_native_audio") or entry.get("gemini_audio_only_live"))
 
     @staticmethod
-    def _is_native_audio_model(model: str) -> bool:
-        return bool(GeminiRealtimeConfig._model_cost_entry(model).get("gemini_native_audio"))
-
-    @staticmethod
     def _coerce_response_modalities(model: str, modalities: list[Any]) -> list[str]:
         """Map unsupported TEXT responseModalities to AUDIO for audio-only Live models."""
         normalized = [
@@ -696,7 +678,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
     @staticmethod
     def _finalize_gemini_live_setup(model: str, setup: Dict[str, Any]) -> Dict[str, Any]:
-        """Drop fields Gemini Live native-audio rejects on ``setup``."""
+        """Coerce fields on ``setup`` that Gemini Live can't take as-is for this model."""
         generation_config = setup.get("generationConfig")
         if isinstance(generation_config, dict):
             modalities = generation_config.get("responseModalities")
@@ -704,8 +686,6 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 generation_config["responseModalities"] = GeminiRealtimeConfig._coerce_response_modalities(
                     model, modalities
                 )
-            if GeminiRealtimeConfig._is_native_audio_model(model):
-                generation_config.pop("speechConfig", None)
         return setup
 
     def _handle_session_update(
@@ -754,8 +734,9 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             # on this backend.
             new_overrides.setdefault("sessionResumption", {})
             new_overrides["model"] = f"models/{model}"
-            verbose_logger.debug("Gemini Realtime: Sending initial setup with tools to backend")
-            return [json.dumps({"setup": self._finalize_gemini_live_setup(model, new_overrides)})]
+            setup_frame = json.dumps({"setup": self._finalize_gemini_live_setup(model, new_overrides)})
+            verbose_logger.debug("Gemini Realtime: Sending initial setup with tools to backend: %s", setup_frame)
+            return [setup_frame]
 
         # Gemini Live accepts exactly one ``setup`` message: the first and only
         # client message. A second ``setup`` closes the socket with
@@ -883,7 +864,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             )
 
             gemini_msg = json.dumps({"realtimeInput": realtime_input_dict})
-            verbose_logger.debug("Gemini Realtime: Sending audio realtimeInput to backend")
+            verbose_logger.debug(
+                "Gemini Realtime: Sending audio realtimeInput to backend (mimeType=%s, bytes=%s)",
+                self.get_audio_mime_type(),
+                len(json_message.get("audio") or ""),
+            )
             messages.append(gemini_msg)
             return messages
 
@@ -1420,6 +1405,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 # A real new turn is starting; the barge-in trailing-frame guard
                 # only applies to the one bare RESPONSE_DONE right after an
                 # interrupt, never to a turn that goes on to produce content.
+                if self._turn_closed_by_interrupt:
+                    verbose_logger.debug(
+                        "RT_PROBE _turn_closed_by_interrupt RESET False via new content delta (id=%s)",
+                        id(self),
+                    )
                 self._turn_closed_by_interrupt = False
                 # send the list of standard 'new' content.delta events
                 current_output_item_id = "item_{}".format(uuid.uuid4())
@@ -1589,6 +1579,12 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             # that flush playback / cancel on speech-start actually interrupt.
             if server_content.get("interrupted"):
                 self._turn_closed_by_interrupt = True
+                verbose_logger.debug(
+                    "RT_PROBE _turn_closed_by_interrupt SET True (id=%s) response_id=%s output_item_id=%s",
+                    id(self),
+                    current_response_id,
+                    current_output_item_id,
+                )
                 returned_message.append(
                     cast(
                         OpenAIRealtimeEvents,
@@ -1646,6 +1642,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 if current_response_id is None:
                     current_response_id = "resp_{}".format(uuid.uuid4())
                 if current_output_item_id is None:
+                    if self._turn_closed_by_interrupt:
+                        verbose_logger.debug(
+                            "RT_PROBE _turn_closed_by_interrupt RESET False via outputTranscription (id=%s)",
+                            id(self),
+                        )
                     self._turn_closed_by_interrupt = False
                     current_output_item_id = "item_{}".format(uuid.uuid4())
                     current_conversation_id = current_conversation_id or "conv_{}".format(uuid.uuid4())

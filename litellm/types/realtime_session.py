@@ -106,9 +106,6 @@ class CanonicalRealtimeSession(TypedDict, total=False):
     session_resumption: CanonicalSessionResumption
     media_resolution: MediaResolution
 
-    affective_dialog: bool
-    proactive_audio: bool
-
 
 CANONICAL_SESSION_KEYS: frozenset[str] = frozenset(CanonicalRealtimeSession.__annotations__)
 

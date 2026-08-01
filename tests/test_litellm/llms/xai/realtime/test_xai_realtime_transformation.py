@@ -220,21 +220,15 @@ class TestXaiOnlyFieldRestoration:
         ga_session = RealTimeStreaming._remap_beta_session_to_ga(dict(canonical))
         return normalizer.patch_outgoing_session(ga_session, dict(canonical))
 
-    def test_thinking_level_becomes_reasoning_effort(self):
-        assert self._patched({"thinking_level": "high"})["reasoning"] == {"effort": "high"}
-
-    @pytest.mark.parametrize(
-        "level, effort",
-        [("minimal", "none"), ("low", "none"), ("medium", "high"), ("high", "high")],
-    )
-    def test_all_canonical_levels_collapse_onto_xai_rungs(self, level, effort):
-        """xAI documents two rungs where the contract offers four; every
-        canonical level must still land on one of them rather than being
-        dropped for lack of an exact match."""
-        assert self._patched({"thinking_level": level})["reasoning"] == {"effort": effort}
-
-    def test_unknown_level_is_not_forwarded(self):
-        assert "reasoning" not in self._patched({"thinking_level": "extreme"})
+    @pytest.mark.parametrize("level", ["minimal", "low", "medium", "high", "extreme", None])
+    def test_reasoning_is_always_forced_off(self, level):
+        """Realtime voice sessions need the model answering immediately, not
+        deliberating: reasoning is always forced to xAI's lowest rung,
+        regardless of what (or whether) the client's thinking_level requests --
+        xAI defaults to "high" effort when the field is absent, so it can't be
+        left unset either."""
+        canonical: dict = {"thinking_level": level} if level is not None else {}
+        assert self._patched(canonical)["reasoning"] == {"effort": "none"}
 
     def test_session_resumption_becomes_resumption(self):
         patched = self._patched({"session_resumption": {"enabled": True}})
@@ -250,10 +244,12 @@ class TestXaiOnlyFieldRestoration:
     def test_resumption_without_enabled_is_not_forwarded(self):
         assert "resumption" not in self._patched({"session_resumption": {}})
 
-    def test_absent_fields_add_nothing(self):
+    def test_absent_fields_add_nothing_but_forced_reasoning(self):
+        """resumption stays absent when the client didn't ask for it; reasoning
+        is always present because it is forced, not restored from the client."""
         patched = self._patched({"instructions": "hi"})
 
-        assert "reasoning" not in patched
+        assert patched["reasoning"] == {"effort": "none"}
         assert "resumption" not in patched
 
     def test_ga_fields_still_survive_alongside_the_restored_ones(self):
@@ -273,15 +269,15 @@ class TestXaiOnlyFieldRestoration:
 
         assert patched["audio"]["input"]["turn_detection"]["create_response"] is True
 
-    def test_without_canonical_session_only_the_ga_patch_runs(self):
-        """Backends on the beta path pass no canonical session; the hook must
-        stay a no-op for the restoration half rather than raising."""
+    def test_without_canonical_session_ga_patch_runs_and_reasoning_still_forced(self):
+        """Backends on the beta path pass no canonical session; the restoration
+        half is a no-op then, but forcing reasoning off does not depend on it."""
         normalizer = XAIRealtimeNormalizer()
 
         patched = normalizer.patch_outgoing_session({"turn_detection": {"type": "server_vad"}})
 
         assert patched["turn_detection"]["create_response"] is True
-        assert "reasoning" not in patched
+        assert patched["reasoning"] == {"effort": "none"}
 
 
 class TestXaiTranscriptionLanguage:

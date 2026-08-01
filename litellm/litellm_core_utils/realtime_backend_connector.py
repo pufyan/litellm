@@ -52,6 +52,12 @@ class RealtimeBackendConnector:
             "additional_headers": dict(self.headers),
             "max_size": REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES,
             "ssl": self.ssl_context,
+            # Match native Live API clients (e.g. websocketpp-based ones), which
+            # don't negotiate permessage-deflate: the library defaults to
+            # offering it, so unlike a native client this socket would run
+            # compressed if the backend accepts. Disable it so the wire
+            # protocol matches a native connection exactly.
+            "compression": None,
         }
         if self.open_timeout is not None:
             connect_kwargs["open_timeout"] = self.open_timeout
