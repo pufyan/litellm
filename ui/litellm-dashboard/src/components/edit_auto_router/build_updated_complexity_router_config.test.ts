@@ -54,13 +54,16 @@ describe("buildUpdatedComplexityRouterConfig keyword matching", () => {
     expect(result.keyword_tier_rules).toEqual([{ keywords: ["chargeback"], tier: "COMPLEX" }]);
   });
 
-  it("drops a rule left empty rather than shipping one the backend 400s on", () => {
+  // getKeywordTierRulesError blocks this save, so the builder never runs on a real edit. Keeping
+  // the rule here means that if a caller ever reaches it anyway, the stored rules are replaced by
+  // something the backend rejects out loud rather than by silence that reads as a clean save.
+  it("keeps a rule left empty rather than quietly dropping the caller's row", () => {
     const result = buildUpdatedComplexityRouterConfig(STORED, FORM_VALUE, undefined, {
       ...hydratedState,
       keywordTierRules: [{ id: "new-1", keywords: ["   "], tier: "SIMPLE" }],
     });
 
-    expect(result.keyword_tier_rules).toBeUndefined();
+    expect(result.keyword_tier_rules).toEqual([{ keywords: [], tier: "SIMPLE" }]);
   });
 
   it("removes the semantic trio when the toggle is turned off", () => {
@@ -197,5 +200,140 @@ describe("buildUpdatedComplexityRouterConfig assistant turns", () => {
     // A MANAGED key: the form wins over the stored config, never falls back to it.
     const result = buildUpdatedComplexityRouterConfig(STORED_ASSISTANT_CTX, formBase);
     expect(result.classifier_context_include_assistant_turns).toBeUndefined();
+  });
+});
+
+describe("buildUpdatedComplexityRouterConfig session affinity", () => {
+  it("writes session_affinity=false when the toggle is off", () => {
+    const result = buildUpdatedComplexityRouterConfig(STORED, { ...FORM_VALUE, session_affinity: false });
+    expect(result.session_affinity).toBe(false);
+  });
+
+  it("writes session_affinity=true when the toggle is on", () => {
+    const result = buildUpdatedComplexityRouterConfig(STORED, { ...FORM_VALUE, session_affinity: true });
+    expect(result.session_affinity).toBe(true);
+  });
+
+  it("re-asserts the backend's off-by-default when the form value is absent, rather than dropping the key", () => {
+    const result = buildUpdatedComplexityRouterConfig({ ...STORED, session_affinity: true }, FORM_VALUE);
+    expect(result.session_affinity).toBe(false);
+  });
+
+  it("stops a stored session_affinity=true from surviving a save that turned the toggle back off", () => {
+    const result = buildUpdatedComplexityRouterConfig(
+      { ...STORED, session_affinity: true },
+      { ...FORM_VALUE, session_affinity: false },
+    );
+    expect(result.session_affinity).toBe(false);
+  });
+});
+
+describe("buildUpdatedComplexityRouterConfig deployment affinity", () => {
+  it("writes deployment_affinity=false when the toggle is off", () => {
+    const result = buildUpdatedComplexityRouterConfig(STORED, { ...FORM_VALUE, deployment_affinity: false });
+    expect(result.deployment_affinity).toBe(false);
+  });
+
+  it("writes deployment_affinity=true when the toggle is on", () => {
+    const result = buildUpdatedComplexityRouterConfig(STORED, { ...FORM_VALUE, deployment_affinity: true });
+    expect(result.deployment_affinity).toBe(true);
+  });
+
+  it("re-asserts the backend's on-by-default when the form value is absent, rather than dropping the key", () => {
+    const result = buildUpdatedComplexityRouterConfig({ ...STORED, deployment_affinity: false }, FORM_VALUE);
+    expect(result.deployment_affinity).toBe(true);
+  });
+
+  it("stops a stored deployment_affinity=false from surviving a save that turned the toggle back on", () => {
+    const result = buildUpdatedComplexityRouterConfig(
+      { ...STORED, deployment_affinity: false },
+      { ...FORM_VALUE, deployment_affinity: true },
+    );
+    expect(result.deployment_affinity).toBe(true);
+  });
+});
+
+describe("buildUpdatedComplexityRouterConfig tier labels", () => {
+  const RENAMED = { ...STORED, tier_labels: { SIMPLE: "Cheap", REASONING: "Deep" } };
+
+  it("round-trips stored labels through an untouched edit", () => {
+    const result = buildUpdatedComplexityRouterConfig(RENAMED, {
+      ...FORM_VALUE,
+      tier_labels: { SIMPLE: "Cheap", REASONING: "Deep" },
+    });
+    expect(result.tier_labels).toEqual({ SIMPLE: "Cheap", REASONING: "Deep" });
+  });
+
+  it("persists a renamed tier", () => {
+    const result = buildUpdatedComplexityRouterConfig(RENAMED, {
+      ...FORM_VALUE,
+      tier_labels: { SIMPLE: "Budget", REASONING: "Deep" },
+    });
+    expect(result.tier_labels).toEqual({ SIMPLE: "Budget", REASONING: "Deep" });
+  });
+
+  it("drops the key when every label is cleared back to the default", () => {
+    const result = buildUpdatedComplexityRouterConfig(RENAMED, { ...FORM_VALUE, tier_labels: {} });
+    expect(result.tier_labels).toBeUndefined();
+    expect("tier_labels" in result).toBe(false);
+  });
+
+  it("leaves an unrenamed router without the key", () => {
+    const result = buildUpdatedComplexityRouterConfig(STORED, FORM_VALUE);
+    expect("tier_labels" in result).toBe(false);
+  });
+
+  it("keeps the tiers keys canonical alongside a rename", () => {
+    const result = buildUpdatedComplexityRouterConfig(RENAMED, {
+      ...FORM_VALUE,
+      tier_labels: { SIMPLE: "Cheap" },
+    });
+    expect(Object.keys(result.tiers as Record<string, unknown>)).toEqual(["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"]);
+  });
+});
+
+describe("buildUpdatedComplexityRouterConfig scorer knobs", () => {
+  const BOUNDARIES = { simple_medium: 0.22, medium_complex: 0.44, complex_reasoning: 0.66 };
+  const STORED_WITH_KNOBS = { ...STORED, tier_boundaries: BOUNDARIES };
+  const HYDRATED = { ...FORM_VALUE, tier_boundaries: BOUNDARIES };
+
+  it("round-trips explicit stored knobs through an untouched edit", () => {
+    // These keys are MANAGED now, so the stored copy is dropped before the rebuild and only a faithful
+    // hydration puts them back. A regression here silently resets a tuned router.
+    expect(buildUpdatedComplexityRouterConfig(STORED_WITH_KNOBS, HYDRATED).tier_boundaries).toEqual(BOUNDARIES);
+  });
+
+  it("drops a stored knob when the operator resets it, instead of preserving the old value", () => {
+    const result = buildUpdatedComplexityRouterConfig(STORED_WITH_KNOBS, FORM_VALUE);
+
+    expect(result).not.toHaveProperty("tier_boundaries");
+    expect(result.some_future_backend_key).toEqual({ nested: true });
+  });
+
+  it("never invents knobs for a router that never had them", () => {
+    expect(buildUpdatedComplexityRouterConfig(STORED, FORM_VALUE)).not.toHaveProperty("tier_boundaries");
+  });
+});
+
+describe("buildUpdatedComplexityRouterConfig plan-mode minimum tier", () => {
+  it("round-trips a stored tier through an untouched open-and-save", () => {
+    const result = buildUpdatedComplexityRouterConfig(
+      { ...STORED, plan_mode_min_tier: "COMPLEX" },
+      { ...FORM_VALUE, plan_mode_min_tier: "COMPLEX" },
+    );
+    expect(result.plan_mode_min_tier).toBe("COMPLEX");
+  });
+
+  it("stops a stored tier from surviving a save that turned the override off", () => {
+    const result = buildUpdatedComplexityRouterConfig({ ...STORED, plan_mode_min_tier: "COMPLEX" }, FORM_VALUE);
+    expect(result).not.toHaveProperty("plan_mode_min_tier");
+  });
+
+  it("writes a newly selected tier over the stored one", () => {
+    const result = buildUpdatedComplexityRouterConfig(
+      { ...STORED, plan_mode_min_tier: "COMPLEX" },
+      { ...FORM_VALUE, plan_mode_min_tier: "MEDIUM" },
+    );
+    expect(result.plan_mode_min_tier).toBe("MEDIUM");
   });
 });

@@ -9,7 +9,7 @@ import copy
 import json
 import traceback
 from datetime import datetime, timezone
-from typing import Any
+from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 
@@ -23,6 +23,8 @@ from litellm.proxy._types import (
     LitellmTableNames,
     ProxyErrorTypes,
     ProxyException,
+    TeamCallbackDeleteResponse,
+    TeamCallbackDeleteResponseData,
     TeamCallbackMetadata,
     UserAPIKeyAuth,
 )
@@ -37,14 +39,17 @@ from litellm.proxy.litellm_pre_call_utils import (
     _get_validated_callback_metadata,
     convert_key_logging_metadata_to_callback,
 )
-from litellm.proxy.management_endpoints.team_endpoints import _verify_team_access
+from litellm.proxy.management_endpoints.team_endpoints import (
+    _refresh_cached_team,
+    _verify_team_access,
+)
 from litellm.proxy.management_helpers.utils import management_endpoint_wrapper
 from litellm.repositories.team_repository import TeamRepository
 
-router = APIRouter()
+router: Final = APIRouter()
 
 
-_CALLBACK_VARS_REDACTED = "***REDACTED***"
+_CALLBACK_VARS_REDACTED: Final = "***REDACTED***"
 
 
 def _redact_callback_secrets(metadata: Any) -> Any:
@@ -61,13 +66,13 @@ def _redact_callback_secrets(metadata: Any) -> Any:
     """
     if not isinstance(metadata, dict):
         return metadata
-    redacted = copy.deepcopy(metadata)
-    logging_entries = redacted.get("logging")
+    redacted: Final = copy.deepcopy(metadata)
+    logging_entries: Final = redacted.get("logging")
     if isinstance(logging_entries, list):
         for entry in logging_entries:
             if isinstance(entry, dict) and isinstance(entry.get("callback_vars"), dict):
                 entry["callback_vars"] = {k: _CALLBACK_VARS_REDACTED for k in entry["callback_vars"]}
-    callback_settings = redacted.get("callback_settings")
+    callback_settings: Final = redacted.get("callback_settings")
     if isinstance(callback_settings, dict) and isinstance(callback_settings.get("callback_vars"), dict):
         callback_settings["callback_vars"] = {k: _CALLBACK_VARS_REDACTED for k in callback_settings["callback_vars"]}
     return redacted
@@ -121,8 +126,8 @@ def _resolve_team_callbacks(team_metadata: object) -> TeamCallbackMetadata:
     if not isinstance(team_metadata, dict):
         return TeamCallbackMetadata()
 
-    decrypted = decrypt_callback_vars(team_metadata)
-    logging_entries = decrypted.get("logging")
+    decrypted: Final = decrypt_callback_vars(team_metadata)
+    logging_entries: Final = decrypted.get("logging")
 
     if logging_entries is not None:
         resolved = TeamCallbackMetadata()
@@ -134,7 +139,7 @@ def _resolve_team_callbacks(team_metadata: object) -> TeamCallbackMetadata:
                 continue
             resolved = convert_key_logging_metadata_to_callback(data=callback, team_callback_settings_obj=resolved)
     else:
-        callback_settings = decrypted.get("callback_settings")
+        callback_settings: Final = decrypted.get("callback_settings")
         resolved = (
             TeamCallbackMetadata(**callback_settings) if isinstance(callback_settings, dict) else TeamCallbackMetadata()
         )
@@ -153,7 +158,7 @@ def _log_audit_task_exception(task: "asyncio.Task[None]") -> None:
     """
     if task.cancelled():
         return
-    exc = task.exception()
+    exc: Final = task.exception()
     if exc is not None:
         verbose_proxy_logger.warning("Failed to write team-callback audit log: %s", exc)
 
@@ -185,10 +190,10 @@ async def _emit_team_callback_audit_log(
     )
     from litellm.proxy.proxy_server import litellm_proxy_admin_name
 
-    redacted_before = _redact_callback_secrets(before_metadata)
-    redacted_after = _redact_callback_secrets(after_metadata)
+    redacted_before: Final = _redact_callback_secrets(before_metadata)
+    redacted_after: Final = _redact_callback_secrets(after_metadata)
 
-    task = asyncio.create_task(
+    task: Final = asyncio.create_task(
         create_audit_log_for_update(
             request_data=LiteLLM_AuditLogs(
                 id=str(uuid.uuid4()),
@@ -204,6 +209,14 @@ async def _emit_team_callback_audit_log(
         )
     )
     task.add_done_callback(_log_audit_task_exception)
+
+
+def _callback_error(status_code: int, message: str) -> HTTPException:
+    """Build the ``{"error": ...}`` failure body the team callback endpoints return."""
+    return HTTPException(
+        status_code=status_code,
+        detail={"error": message},  # mutable-ok: the error response body is a JSON object
+    )
 
 
 @router.post(
@@ -262,7 +275,11 @@ async def add_team_callbacks(
     """
     try:
         from litellm.proxy._types import CommonProxyErrors
-        from litellm.proxy.proxy_server import prisma_client
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
 
         if prisma_client is None:
             raise HTTPException(
@@ -306,16 +323,27 @@ async def add_team_callbacks(
                     param="callback_name",
                 )
 
-        before_metadata = copy.deepcopy(team_metadata)
+        before_metadata: Final = copy.deepcopy(team_metadata)
         team_callback_settings.append(data.model_dump())
 
         team_metadata["logging"] = team_callback_settings
         team_metadata = encrypt_callback_vars(team_metadata)
-        team_metadata_json = json.dumps(team_metadata)  # update team_metadata
+        team_metadata_json: Final = json.dumps(team_metadata)  # update team_metadata
 
-        new_team_row = await TeamRepository(prisma_client).table.update(
+        new_team_row: Final = await TeamRepository(prisma_client).table.update(
             where={"team_id": team_id},
-            data={"metadata": team_metadata_json},  # type: ignore
+            data={"metadata": team_metadata_json},
+            # `object_permission` is included so `_refresh_cached_team` doesn't
+            # write a cached team with the relation nulled out — see
+            # team_model_add for the full rationale.
+            include={"object_permission": True},  # mutable-ok: prisma include takes a dict literal
+        )
+
+        # Without this a newly registered callback stays dormant for existing keys.
+        await _refresh_cached_team(
+            team_row=new_team_row,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
         )
 
         await _emit_team_callback_audit_log(
@@ -336,13 +364,158 @@ async def add_team_callbacks(
     except ProxyException as e:
         raise e
     except Exception as e:
-        verbose_proxy_logger.exception(f"litellm.proxy.proxy_server.add_team_callbacks(): Exception occured - {e!s}")
+        verbose_proxy_logger.exception("litellm.proxy.proxy_server.add_team_callbacks(): Exception occured - %s", e)
         raise ProxyException(
             message="Internal Server Error, " + str(e),
             type=ProxyErrorTypes.internal_server_error.value,
             param=getattr(e, "param", "None"),
             code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
+
+@router.delete(
+    "/team/{team_id:path}/callback/{callback_name}",
+    tags=["team management"],  # mutable-ok: FastAPI's route decorator takes a list of tags
+    dependencies=[Depends(user_api_key_auth)],  # mutable-ok: FastAPI's route decorator takes a list of dependencies
+    response_model=TeamCallbackDeleteResponse,
+)
+@management_endpoint_wrapper
+async def delete_team_callback(
+    http_request: Request,
+    team_id: str,
+    callback_name: str,
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+    litellm_changed_by: Annotated[
+        str | None,
+        Header(
+            description="The litellm-changed-by header enables tracking of actions performed by authorized users on behalf of other users, providing an audit trail for accountability"
+        ),
+    ] = None,
+):
+    """
+    Remove a single callback from a team
+
+    The team's other callbacks stay registered and keep firing. Use this instead of
+    POST /team/{team_id}/disable_logging, which clears every callback on the team at once.
+
+    Every entry registered under this callback_name is removed, across callback types, so a
+    callback registered for both "success" and "failure" is deregistered by one call.
+
+    Parameters:
+    - team_id (str, required): The unique identifier for the team
+    - callback_name (str, required): The name of the callback to remove, matched exactly as it was
+      registered with POST /team/{team_id}/callback (e.g. "langfuse", "langsmith", "gcs")
+
+    Example curl:
+    ```
+    curl -X DELETE 'http://localhost:4000/team/dbe2f686-a686-4896-864a-4c3924458709/callback/langsmith' \
+        -H 'Authorization: Bearer sk-1234'
+    ```
+
+    Covers callbacks registered through POST /team/{team_id}/callback and the Admin UI. Teams still
+    on the deprecated callback_settings metadata shape hold no such entries, so this returns 404 for
+    them; POST /team/{team_id}/disable_logging remains the way to clear those.
+
+    Returns 404 if the team does not exist, or if callback_name is not registered for the team.
+    """
+    try:
+        from litellm.proxy._types import CommonProxyErrors
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
+
+        if prisma_client is None:
+            raise _callback_error(500, CommonProxyErrors.db_not_connected_error.value)
+
+        _existing_team: Final = await prisma_client.get_data(
+            team_id=team_id, table_name="team", query_type="find_unique"
+        )
+        if _existing_team is None:
+            raise _callback_error(404, f"Team id = {team_id} does not exist.")
+
+        # IDOR guard: only proxy admins / org admins / team admins of THIS team may
+        # deregister its callbacks, otherwise any authenticated key holder could
+        # silence another team's observability integration.
+        await _verify_team_access(
+            team_obj=LiteLLM_TeamTable(**_existing_team.model_dump()),
+            user_api_key_dict=user_api_key_dict,
+        )
+
+        team_metadata: Final = _existing_team.metadata
+        registered_callbacks: Final = team_metadata.get("logging")
+        entries: Final = registered_callbacks if isinstance(registered_callbacks, list) else ()
+
+        remaining_callbacks: Final = [  # mutable-ok: metadata["logging"] is isinstance-checked for list downstream
+            entry for entry in entries if not (isinstance(entry, dict) and entry.get("callback_name") == callback_name)
+        ]
+        if len(remaining_callbacks) == len(entries):
+            raise _callback_error(404, f"callback_name = {callback_name} is not registered for team_id = {team_id}.")
+
+        updated_metadata: Final = {**team_metadata, "logging": remaining_callbacks}  # mutable-ok: persisted as JSON
+        encrypted_metadata: Final = encrypt_callback_vars(updated_metadata)
+        team_metadata_json: Final = json.dumps(encrypted_metadata)
+
+        updated_team: Final = await TeamRepository(prisma_client).table.update(
+            where={"team_id": team_id},  # mutable-ok: prisma where takes a dict literal
+            data={"metadata": team_metadata_json},  # mutable-ok: prisma data takes a dict literal
+            # `object_permission` is included so `_refresh_cached_team` doesn't write a
+            # cached team with the relation nulled out, see team_model_add for the rationale.
+            include={"object_permission": True},  # mutable-ok: prisma include takes a dict literal
+        )
+
+        if updated_team is None:
+            raise _callback_error(404, f"Team id = {team_id} does not exist. Error removing team callback")
+
+        # Request-time callback resolution reads the cached team, so without this
+        # the removed callback keeps firing for live keys until the cache expires.
+        await _refresh_cached_team(
+            team_row=updated_team,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+        await _emit_team_callback_audit_log(
+            team_id=team_id,
+            before_metadata=team_metadata,
+            after_metadata=encrypted_metadata,
+            user_api_key_dict=user_api_key_dict,
+            litellm_changed_by=litellm_changed_by,
+        )
+
+        # Report what survives with the same resolution the GET endpoint uses, so a
+        # caller can confirm in one round trip that its other callbacks are intact.
+        surviving: Final = _resolve_team_callbacks(encrypted_metadata)
+
+        response: Final = TeamCallbackDeleteResponse(
+            status="success",
+            message=f"Callback {callback_name} removed for team {team_id}",
+            data=TeamCallbackDeleteResponseData(
+                team_id=team_id,
+                success_callbacks=tuple(surviving.success_callback or ()),
+                failure_callbacks=tuple(surviving.failure_callback or ()),
+            ),
+        )
+
+    except HTTPException:
+        # Legitimate 4xx (403 from the access guard, 404 for an unknown team or
+        # an unregistered callback). Re-raise without the error-level log noise
+        # the catch-all below would produce.
+        raise
+    except ProxyException:
+        raise
+    except Exception as e:
+        verbose_proxy_logger.error("litellm.proxy.proxy_server.delete_team_callback(): Exception occurred - %s", e)
+        verbose_proxy_logger.debug(traceback.format_exc())
+        raise ProxyException(
+            message="Internal Server Error, " + str(e),
+            type=ProxyErrorTypes.internal_server_error.value,
+            param=getattr(e, "param", "None"),
+            code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    else:
+        return response
 
 
 @router.post(
@@ -363,6 +536,9 @@ async def disable_team_logging(
     """
     Disable all logging callbacks for a team
 
+    Callbacks registered through POST /team/{team_id}/callback and the Admin UI are cleared, so
+    re-enabling logging means registering them again with their callback_vars
+
     Parameters:
     - team_id (str, required): The unique identifier for the team
 
@@ -375,7 +551,11 @@ async def disable_team_logging(
 
     """
     try:
-        from litellm.proxy.proxy_server import prisma_client
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
 
         if prisma_client is None:
             raise HTTPException(status_code=500, detail={"error": "No db connected"})
@@ -398,9 +578,9 @@ async def disable_team_logging(
 
         # Update team metadata to disable logging
         team_metadata = _existing_team.metadata
-        before_metadata = copy.deepcopy(team_metadata)
-        team_callback_settings = team_metadata.get("callback_settings", {})
-        team_callback_settings_obj = TeamCallbackMetadata(**team_callback_settings)
+        before_metadata: Final = copy.deepcopy(team_metadata)
+        team_callback_settings: Final = team_metadata.get("callback_settings", {})
+        team_callback_settings_obj: Final = TeamCallbackMetadata(**team_callback_settings)
 
         # Reset callbacks
         team_callback_settings_obj.success_callback = []
@@ -408,13 +588,20 @@ async def disable_team_logging(
 
         # Update metadata
         team_metadata["callback_settings"] = team_callback_settings_obj.model_dump()
+        # _get_dynamic_logging_metadata stops at metadata["logging"], where the API
+        # and Admin UI register callbacks, without ever reading callback_settings.
+        team_metadata["logging"] = []  # mutable-ok: the disabled state is persisted as an empty JSON array
         team_metadata = encrypt_callback_vars(team_metadata)
-        team_metadata_json = json.dumps(team_metadata)
+        team_metadata_json: Final = json.dumps(team_metadata)
 
         # Update team in database
-        updated_team = await TeamRepository(prisma_client).table.update(
+        updated_team: Final = await TeamRepository(prisma_client).table.update(
             where={"team_id": team_id},
-            data={"metadata": team_metadata_json},  # type: ignore
+            data={"metadata": team_metadata_json},
+            # `object_permission` is included so `_refresh_cached_team` doesn't
+            # write a cached team with the relation nulled out — see
+            # team_model_add for the full rationale.
+            include={"object_permission": True},  # mutable-ok: prisma include takes a dict literal
         )
 
         if updated_team is None:
@@ -422,6 +609,14 @@ async def disable_team_logging(
                 status_code=404,
                 detail={"error": f"Team id = {team_id} does not exist. Error updating team logging"},
             )
+
+        # Request-time callback resolution reads the cached team, so without this
+        # the DB says logging is off while live keys keep sending until it expires.
+        await _refresh_cached_team(
+            team_row=updated_team,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
 
         # Disabling a team's logging callbacks is itself a logging-control
         # action — emit an audit-log row so the action remains traceable
@@ -452,7 +647,7 @@ async def disable_team_logging(
     except ProxyException:
         raise
     except Exception as e:
-        verbose_proxy_logger.error(f"litellm.proxy.proxy_server.disable_team_logging(): Exception occurred - {e!s}")
+        verbose_proxy_logger.error("litellm.proxy.proxy_server.disable_team_logging(): Exception occurred - %s", e)
         verbose_proxy_logger.debug(traceback.format_exc())
         raise ProxyException(
             message="Internal Server Error, " + str(e),
@@ -525,7 +720,7 @@ async def get_team_callbacks(
             user_api_key_dict=user_api_key_dict,
         )
 
-        team_callback_settings_obj = _resolve_team_callbacks(_existing_team.metadata)
+        team_callback_settings_obj: Final = _resolve_team_callbacks(_existing_team.metadata)
 
         return {
             "status": "success",
@@ -545,11 +740,11 @@ async def get_team_callbacks(
     except ProxyException:
         raise
     except Exception as e:
-        verbose_proxy_logger.error(f"litellm.proxy.proxy_server.get_team_callbacks(): Exception occurred - {e!s}")
+        verbose_proxy_logger.error("litellm.proxy.proxy_server.get_team_callbacks(): Exception occurred - %s", e)
         verbose_proxy_logger.debug(traceback.format_exc())
         if isinstance(e, HTTPException):
             raise ProxyException(
-                message=getattr(e, "detail", f"Internal Server Error({e!s})"),
+                message=getattr(e, "detail", f"Internal Server Error({e})"),
                 type=ProxyErrorTypes.internal_server_error.value,
                 param=getattr(e, "param", "None"),
                 code=getattr(e, "status_code", status.HTTP_500_INTERNAL_SERVER_ERROR),
