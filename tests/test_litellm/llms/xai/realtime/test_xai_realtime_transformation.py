@@ -342,6 +342,80 @@ class TestXaiTranscriptionLanguage:
         assert audio == {}
 
 
+class TestXaiSampleRateValidation:
+    """xAI documents a closed, per-format set of accepted sample rates
+    (https://docs.x.ai/developers/model-capabilities/audio/voice-agent):
+    audio/pcm accepts {8000, 16000, 22050, 24000, 32000, 44100, 48000},
+    audio/pcmu and audio/pcma only 8000, audio/opus only 24000. xAI rejects
+    the whole session.update on an unsupported rate, so an out-of-set value
+    must be substituted rather than forwarded as-is.
+    """
+
+    @staticmethod
+    def _patched_audio(canonical: dict) -> dict:
+        from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
+
+        normalizer = XAIRealtimeNormalizer()
+        ga_session = RealTimeStreaming._remap_beta_session_to_ga(dict(canonical))
+        return normalizer.patch_outgoing_session(ga_session, dict(canonical)).get("audio", {})
+
+    @pytest.mark.parametrize("rate", [8000, 16000, 22050, 24000, 32000, 44100, 48000])
+    def test_documented_pcm_rate_passes_through_unchanged(self, rate: int):
+        audio = self._patched_audio({"input_audio_format": {"type": "audio/pcm", "rate": rate}})
+
+        assert audio["input"]["format"]["rate"] == rate
+
+    def test_undocumented_pcm_rate_falls_back_to_24000(self):
+        audio = self._patched_audio({"input_audio_format": {"type": "audio/pcm", "rate": 12345}})
+
+        assert audio["input"]["format"]["rate"] == 24000
+
+    def test_output_rate_is_validated_independently_of_input(self):
+        audio = self._patched_audio(
+            {
+                "input_audio_format": {"type": "audio/pcm", "rate": 16000},
+                "output_audio_format": {"type": "audio/pcm", "rate": 999},
+            }
+        )
+
+        assert audio["input"]["format"]["rate"] == 16000
+        assert audio["output"]["format"]["rate"] == 24000
+
+    def test_pcmu_only_accepts_8000(self):
+        audio = self._patched_audio({"input_audio_format": {"type": "audio/pcmu", "rate": 16000}})
+
+        assert audio["input"]["format"]["rate"] == 8000
+
+    def test_pcmu_at_8000_passes_through(self):
+        audio = self._patched_audio({"input_audio_format": {"type": "audio/pcmu", "rate": 8000}})
+
+        assert audio["input"]["format"]["rate"] == 8000
+
+    def test_opus_only_accepts_24000(self):
+        audio = self._patched_audio({"input_audio_format": {"type": "audio/opus", "rate": 16000}})
+
+        assert audio["input"]["format"]["rate"] == 24000
+
+    def test_string_codec_alias_has_no_format_object_to_validate(self):
+        """A plain "pcm16" string never reaches this validator: the shared GA
+        remap already expands it to {"type": "audio/pcm", "rate": 24000} via
+        its own codec-name map before xAI's patch runs, so this only confirms
+        that path still yields a passing rate untouched by the new check."""
+        audio = self._patched_audio({"input_audio_format": "pcm16"})
+
+        assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+
+    def test_missing_rate_is_left_alone(self):
+        audio = self._patched_audio({"input_audio_format": {"type": "audio/pcm"}})
+
+        assert "rate" not in audio["input"]["format"]
+
+    def test_unknown_format_type_is_left_alone(self):
+        audio = self._patched_audio({"input_audio_format": {"type": "audio/mystery", "rate": 999}})
+
+        assert audio["input"]["format"]["rate"] == 999
+
+
 class TestXaiKeyterms:
     """xAI takes domain terms as a ``keyterms`` array, not a prompt string.
 

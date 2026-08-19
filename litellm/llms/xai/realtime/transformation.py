@@ -41,6 +41,19 @@ _XAI_OUTPUT_SPEED_MAX = 1.5
 _XAI_VAD_THRESHOLD_MIN = 0.1
 _XAI_VAD_THRESHOLD_MAX = 0.9
 
+# Sample rates xAI accepts, keyed by audio/* format type. The GA contract's
+# canonical map (pcm16 -> 24000) only covers OpenAI's fixed rate, so a client
+# asking for another of these via an explicit {"type": ..., "rate": N} format
+# object would otherwise reach xAI unchecked.
+# https://docs.x.ai/developers/model-capabilities/audio/voice-agent
+_XAI_SUPPORTED_SAMPLE_RATES: Mapping[str, FrozenSet[int]] = {
+    "audio/pcm": frozenset({8000, 16000, 22050, 24000, 32000, 44100, 48000}),
+    "audio/pcmu": frozenset({8000}),
+    "audio/pcma": frozenset({8000}),
+    "audio/opus": frozenset({24000}),
+}
+_XAI_DEFAULT_SAMPLE_RATE = 24000
+
 
 def _derive_ga_server_event_types() -> Optional[FrozenSet[str]]:
     """Derive the canonical GA server-event vocabulary from the openai SDK.
@@ -253,18 +266,23 @@ class XAIRealtimeNormalizer:
         audio = dict(audio)
 
         audio_output = audio.get("output")
-        if isinstance(audio_output, dict) and "speed" in audio_output:
+        if isinstance(audio_output, dict):
             audio_output = dict(audio_output)
-            audio_output["speed"] = XAIRealtimeNormalizer._clamp_logged(
-                audio_output["speed"], _XAI_OUTPUT_SPEED_MIN, _XAI_OUTPUT_SPEED_MAX, "output_audio_speed"
-            )
+            if "speed" in audio_output:
+                audio_output["speed"] = XAIRealtimeNormalizer._clamp_logged(
+                    audio_output["speed"], _XAI_OUTPUT_SPEED_MIN, _XAI_OUTPUT_SPEED_MAX, "output_audio_speed"
+                )
+            if isinstance(audio_output.get("format"), dict):
+                audio_output["format"] = XAIRealtimeNormalizer._snap_sample_rate_logged(
+                    audio_output["format"], "audio.output.format.rate"
+                )
             audio["output"] = audio_output
 
         audio_input = audio.get("input")
         if isinstance(audio_input, dict):
+            audio_input = dict(audio_input)
             turn_detection = audio_input.get("turn_detection")
             if isinstance(turn_detection, dict) and "threshold" in turn_detection:
-                audio_input = dict(audio_input)
                 turn_detection = dict(turn_detection)
                 turn_detection["threshold"] = XAIRealtimeNormalizer._clamp_logged(
                     turn_detection["threshold"],
@@ -273,7 +291,11 @@ class XAIRealtimeNormalizer:
                     "turn_detection.threshold",
                 )
                 audio_input["turn_detection"] = turn_detection
-                audio["input"] = audio_input
+            if isinstance(audio_input.get("format"), dict):
+                audio_input["format"] = XAIRealtimeNormalizer._snap_sample_rate_logged(
+                    audio_input["format"], "audio.input.format.rate"
+                )
+            audio["input"] = audio_input
 
         session["audio"] = audio
 
@@ -290,6 +312,36 @@ class XAIRealtimeNormalizer:
                 maximum,
             )
         return clamped
+
+    @staticmethod
+    def _snap_sample_rate_logged(audio_format: "dict[str, Any]", field: str) -> "dict[str, Any]":
+        """Fall back to the format's default rate when xAI does not accept the requested one.
+
+        xAI rejects the whole session.update on an unsupported rate rather than
+        ignoring the field, mirroring why ``_clamp_logged`` substitutes instead
+        of dropping. Unlike the numeric fields above, the accepted rates are a
+        discrete, format-dependent set (see ``_XAI_SUPPORTED_SAMPLE_RATES``), so
+        this snaps to the nearest documented default instead of clamping to a
+        min/max range.
+        """
+        rate = audio_format.get("rate")
+        format_type = audio_format.get("type")
+        allowed = _XAI_SUPPORTED_SAMPLE_RATES.get(format_type) if isinstance(format_type, str) else None
+        if allowed is None or rate is None:
+            return audio_format
+        if isinstance(rate, bool) or not isinstance(rate, int) or rate in allowed:
+            return audio_format
+        default_rate = _XAI_DEFAULT_SAMPLE_RATE if _XAI_DEFAULT_SAMPLE_RATE in allowed else min(allowed)
+        verbose_logger.warning(
+            "realtime session.update: %s=%r not supported by xAI for %s (unsupported_by_provider): "
+            "falling back to %s. xAI accepts %s",
+            field,
+            rate,
+            format_type,
+            default_rate,
+            sorted(allowed),
+        )
+        return {**audio_format, "rate": default_rate}
 
     @staticmethod
     def _apply_transcription_fields(session: dict, canonical: dict) -> None:
