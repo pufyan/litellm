@@ -7,7 +7,8 @@ Each span kind declares its schema as a flat ``attribute key -> extractor``
 table: one lambda per mapping operation, applied against the typed span data.
 """
 
-from typing import Callable
+from collections.abc import Callable
+from typing import Final
 
 from litellm.integrations.otel.mappers.base import AttributeMap, AttrValue, SpanData
 from litellm.integrations.otel.mappers.utils import (
@@ -17,6 +18,7 @@ from litellm.integrations.otel.mappers.utils import (
     serialize_messages,
     tool_definition_attrs,
 )
+from litellm.integrations.otel.model.db_endpoint import db_span_attributes
 from litellm.integrations.otel.model.payloads import (
     GuardrailSpanData,
     LLMCallSpanData,
@@ -26,14 +28,14 @@ from litellm.integrations.otel.model.payloads import (
     ToolDefinition,
 )
 from litellm.integrations.otel.model.semconv import (
-    DB,
     MCP,
     Error,
     GenAI,
+    JsonRpc,
     LiteLLM,
+    RpcSystem,
     Server,
 )
-from litellm.integrations.otel.model.spans import db_system
 
 
 class GenAIMapper:
@@ -93,11 +95,14 @@ class GenAIMapper:
 
     _MCP_ATTRS: dict[str, Callable[[MCPToolCallSpanData], AttrValue | None]] = {
         GenAI.OPERATION_NAME: lambda d: d.operation.value,
+        JsonRpc.SYSTEM: lambda d: RpcSystem.JSONRPC.value if d.server_address and d.server_port else None,
         MCP.METHOD_NAME: lambda d: d.method,
         MCP.SESSION_ID: lambda d: d.session_id,
         GenAI.TOOL_NAME: lambda d: d.tool_name or None,
         GenAI.TOOL_CALL_ARGUMENTS: lambda d: d.arguments_json,
         GenAI.TOOL_CALL_RESULT: lambda d: d.result_json,
+        Server.ADDRESS: lambda d: d.server_address,
+        Server.PORT: lambda d: d.server_port,
         LiteLLM.MCP_SERVER_NAME: lambda d: d.server_name,
         LiteLLM.CALL_ID: lambda d: d.identity.call_id or None,
         f"{LiteLLM.COST_PREFIX}total": lambda d: d.response_cost,
@@ -155,7 +160,7 @@ class GenAIMapper:
                 return {}
 
     def _llm_call(self, data: LLMCallSpanData) -> AttributeMap:
-        attrs = collect(self._LLM_CALL_ATTRS, data)
+        attrs: Final = collect(self._LLM_CALL_ATTRS, data)
         if data.tools:
             attrs[LiteLLM.TOOLS_DECLARED] = len(data.tools)
             attrs.update(
@@ -174,14 +179,10 @@ class GenAIMapper:
 
     @classmethod
     def _service(cls, data: ServiceSpanData) -> AttributeMap:
-        attrs = collect(cls._SERVICE_ATTRS, data)
+        attrs: Final = collect(cls._SERVICE_ATTRS, data)
         # An outbound datastore call (DB_CALL / CLIENT span) also carries db.*
-        # semconv. Internal services (router, budget jobs, …) have no db.system,
-        # so they get only the litellm.service.* keys above.
-        system = db_system(data.service_name)
-        if system is not None:
-            attrs[DB.SYSTEM_NAME] = system
-            if data.call_type:
-                attrs[DB.OPERATION_NAME] = data.call_type
+        # semconv naming the server it reached. Internal services (router, budget
+        # jobs, …) have no db.system, so they get only the litellm.service.* keys.
+        attrs.update(db_span_attributes(data.service_name, data.call_type))
         attrs.update({f"{LiteLLM.METADATA_PREFIX}{key}": value for key, value in data.event_metadata.items()})
         return attrs
