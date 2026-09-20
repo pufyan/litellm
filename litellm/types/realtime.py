@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel
-from typing_extensions import TypedDict
+from typing_extensions import ReadOnly, TypedDict
 
 from .llms.openai import (
     OpenAIRealtimeEvents,
@@ -170,3 +170,36 @@ class RealtimeTranscriptionSessionResponse(BaseModel):
     model_config = {"extra": "allow"}
 
     client_secret: dict[str, Any] | None = None
+
+
+class RealtimeErrorDetail(TypedDict):
+    type: ReadOnly[str]
+    message: ReadOnly[str]
+
+
+class RealtimeErrorEvent(TypedDict):
+    type: ReadOnly[Literal["error"]]
+    error: ReadOnly[RealtimeErrorDetail]
+
+
+class RealtimeInputAudioTranscriptionUsageInputTokenDetails(TypedDict):
+    text_tokens: ReadOnly[int]
+    audio_tokens: ReadOnly[int]
+
+
+class RealtimeInputAudioTranscriptionTokenUsage(TypedDict):
+    type: ReadOnly[Literal["tokens"]]
+    input_tokens: ReadOnly[int]
+    output_tokens: ReadOnly[int]
+    total_tokens: ReadOnly[int]
+    input_token_details: ReadOnly[RealtimeInputAudioTranscriptionUsageInputTokenDetails]
+
+
+class RealtimeInputAudioTranscriptionDurationUsage(TypedDict):
+    type: ReadOnly[Literal["duration"]]
+    seconds: ReadOnly[float]
+
+
+RealtimeInputAudioTranscriptionUsage = (
+    RealtimeInputAudioTranscriptionTokenUsage | RealtimeInputAudioTranscriptionDurationUsage
+)

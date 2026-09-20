@@ -1,8 +1,6 @@
 "use client";
 
 import { zodResolver } from "@hookform/resolvers/zod";
-// eslint-disable-next-line no-restricted-imports -- the dashboard has no shadcn date-time picker; the PTU window fields need one
-import { DatePicker } from "antd";
 import { CircleHelp } from "lucide-react";
 import type { Dayjs } from "dayjs";
 import * as React from "react";
@@ -11,6 +9,7 @@ import { z } from "zod/v4";
 
 import { TagsInput } from "@/app/(dashboard)/guardrails/_components/content_filter/TagsInput";
 import { FormField } from "@/components/shared/form/FormField";
+import { UtcDateTimeInput } from "@/components/shared/form/UtcDateTimeInput";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,9 +24,11 @@ import CacheControlInjectionPoints, {
   CACHE_CONTROL_TOOLTIP,
   type CacheControlInjectionPoint,
 } from "./add_model/cache_control_settings";
+import type { Team } from "./key_team_helpers/key_list";
 import type { CredentialItem } from "./networking";
 import NumericalInput from "./shared/numerical_input";
 import type { Tag } from "./tag_management/types";
+import { ModelTeamSelect } from "./view_model/ModelTeamSelect";
 import VectorStoreSelector from "./vector_store_management/VectorStoreSelector";
 import { formatPtuUtcDisplay, utcIsoToPickerValue } from "../utils/ptuDatetime";
 import { isMaskedSecret } from "../utils/maskedSecretUtils";
@@ -104,6 +105,7 @@ export interface ModelEditFormValues {
   litellm_credential_name?: string;
   litellm_extra_params?: string;
   model_info?: string;
+  team_id?: string;
 }
 
 type ModelEditFieldName = keyof ModelEditFormValues;
@@ -140,6 +142,7 @@ const modelEditShape = {
   litellm_credential_name: textish,
   litellm_extra_params: textish,
   model_info: textish,
+  team_id: textish,
 };
 
 const isJson = (value: string): boolean => {
@@ -261,6 +264,7 @@ export const toModelEditFormValues = (localModelData: any, isWildcardModel: bool
     null,
     2,
   ),
+  team_id: localModelData.model_info?.team_id ?? undefined,
 });
 
 const displayCost = (localModelData: any, field: TouchedPricingField): string => {
@@ -271,7 +275,8 @@ const displayCost = (localModelData: any, field: TouchedPricingField): string =>
 
 interface ModelInfoEditFormProps {
   localModelData: any;
-  modelData: { model_info: { team_id?: string | null } & Record<string, unknown> };
+  modelData: { model_info: { team_id?: string | null } };
+  teamAlias: string | null;
   accessToken: string | null;
   isEditing: boolean;
   isSaving: boolean;
@@ -286,15 +291,23 @@ interface ModelInfoEditFormProps {
   tagsList: Record<string, Tag>;
   credentialsList: CredentialItem[];
   healthCheckModelOptions: { value: string; label: string }[];
+  teams: Team[] | null;
 }
 
 const Display: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div className="mt-1 rounded-sm bg-muted p-2">{children}</div>
 );
 
-const FieldLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
-  <p className="text-sm font-medium text-foreground">{children}</p>
-);
+const FIELD_LABEL_CLASS = "text-sm font-medium text-foreground";
+
+const FieldLabel: React.FC<{ htmlFor?: string; children: React.ReactNode }> = ({ htmlFor, children }) =>
+  htmlFor === undefined ? (
+    <p className={FIELD_LABEL_CLASS}>{children}</p>
+  ) : (
+    <label htmlFor={htmlFor} className={FIELD_LABEL_CLASS}>
+      {children}
+    </label>
+  );
 
 const Hint: React.FC<{ text: string }> = ({ text }) => (
   <Tooltip>
@@ -335,6 +348,7 @@ const ChipList: React.FC<{ values: unknown; emptyLabel: string }> = ({ values, e
 const ModelInfoEditForm: React.FC<ModelInfoEditFormProps> = ({
   localModelData,
   modelData,
+  teamAlias,
   accessToken,
   isEditing,
   isSaving,
@@ -349,6 +363,7 @@ const ModelInfoEditForm: React.FC<ModelInfoEditFormProps> = ({
   tagsList,
   credentialsList,
   healthCheckModelOptions,
+  teams,
 }) => {
   // Neither RHF's blur-based touchedFields nor its resettable dirtyFields matches antd's touched-on-change.
   const touchedRef = React.useRef<ReadonlySet<string>>(new Set<string>());
@@ -463,13 +478,14 @@ const ModelInfoEditForm: React.FC<ModelInfoEditFormProps> = ({
             {ptuCostAttributionEnabled &&
               PTU_EDIT_FIELDS.map((ptuField) => (
                 <div key={ptuField.name}>
-                  <FieldLabel>{ptuField.label}</FieldLabel>
+                  <FieldLabel htmlFor={ptuField.name}>{ptuField.label}</FieldLabel>
                   {isEditing ? (
                     <FormField control={form.control} name={ptuField.name as ModelEditFieldName}>
                       {({ value, onChange, ...control }) =>
                         ptuField.input === "number" ? (
                           <NumericalInput
                             {...control}
+                            id={ptuField.name}
                             onChange={onChange}
                             value={value ?? ""}
                             placeholder={ptuField.placeholder}
@@ -477,10 +493,10 @@ const ModelInfoEditForm: React.FC<ModelInfoEditFormProps> = ({
                             min={ptuField.isCount ? 1 : 0}
                           />
                         ) : (
-                          <DatePicker
-                            showTime
-                            style={{ width: "100%" }}
-                            value={(value as Dayjs | null) ?? null}
+                          <UtcDateTimeInput
+                            {...control}
+                            id={ptuField.name}
+                            value={value as Dayjs | null}
                             onChange={onChange}
                           />
                         )
@@ -792,8 +808,20 @@ const ModelInfoEditForm: React.FC<ModelInfoEditFormProps> = ({
             </div>
 
             <div>
-              <FieldLabel>Team ID</FieldLabel>
-              <Display>{modelData.model_info.team_id || "Not Set"}</Display>
+              <FieldLabel>Team</FieldLabel>
+              {isEditing ? (
+                <FormField control={form.control} name="team_id">
+                  {({ id, value, onChange, onBlur }) => (
+                    <ModelTeamSelect id={id} value={value} onChange={onChange} onBlur={onBlur} teams={teams} />
+                  )}
+                </FormField>
+              ) : (
+                <Display>
+                  {teamAlias
+                    ? `${teamAlias} (${localModelData.model_info?.team_id})`
+                    : localModelData.model_info?.team_id || "Not Set"}
+                </Display>
+              )}
             </div>
           </div>
 

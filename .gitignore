@@ -1,9 +1,13 @@
 .python-version
 .venv
+tests/e2e/.fixtures/
 .venv-typecheck
 .venv_policy_test
+.venv-mutmut
+mutants/
 .env
 .claude
+CLAUDE.local.md
 .newenv
 newenv/*
 litellm/proxy/myenv/*
@@ -144,6 +148,11 @@ crash.*.log
 ui/litellm-dashboard/out/
 .mcp.json
 *.log
+
 litellm_migration_analysis.md
 UPDATE_FROM_UPSTREAM.md
-litellm.log
+
+
+.coverage-rust
+coverage-rust.xml
+
