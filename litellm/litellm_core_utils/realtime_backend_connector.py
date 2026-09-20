@@ -1,5 +1,6 @@
 import ssl
 from dataclasses import dataclass, field, replace
+from types import ModuleType
 from typing import TYPE_CHECKING, Mapping, Optional
 
 from litellm.constants import REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
@@ -32,7 +33,7 @@ class RealtimeBackendConnector:
         """
         return replace(self, url=url)
 
-    async def connect(self) -> "ClientConnection":
+    async def connect(self, websockets_module: ModuleType | None = None) -> "ClientConnection":
         """Open the backend realtime websocket, retrying a hung open handshake.
 
         The upstream Live handshake (e.g. Gemini Live) intermittently hangs on
@@ -46,14 +47,17 @@ class RealtimeBackendConnector:
         import websockets
         import websockets.exceptions
 
+        websockets_module = websockets_module if websockets_module is not None else websockets
+        exceptions_module = websockets_module.exceptions
+
         # Handshake-status rejections are deterministic (auth / 4xx): retrying
         # cannot help and the caller must see the upstream status, not a generic
         # 1011. websockets <15 raises InvalidStatusCode, >=15 raises InvalidStatus.
         deterministic_errors = tuple(
             exc
             for exc in (
-                getattr(websockets.exceptions, "InvalidStatus", None),
-                getattr(websockets.exceptions, "InvalidStatusCode", None),
+                getattr(exceptions_module, "InvalidStatus", None),
+                getattr(exceptions_module, "InvalidStatusCode", None),
             )
             if exc is not None
         )
@@ -73,13 +77,13 @@ class RealtimeBackendConnector:
         last_exc: Optional[BaseException] = None
         for _ in range(self.max_attempts):
             try:
-                return await websockets.connect(self.url, **connect_kwargs)
+                return await websockets_module.connect(self.url, **connect_kwargs)
             except deterministic_errors:
                 raise
             except (
                 TimeoutError,
                 OSError,
-                websockets.exceptions.WebSocketException,
+                exceptions_module.WebSocketException,
             ) as e:
                 last_exc = e
         assert last_exc is not None  # loop only exits via return or a captured exc

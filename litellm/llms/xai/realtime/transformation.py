@@ -41,6 +41,19 @@ _XAI_OUTPUT_SPEED_MAX = 1.5
 _XAI_VAD_THRESHOLD_MIN = 0.1
 _XAI_VAD_THRESHOLD_MAX = 0.9
 
+# Sample rates xAI accepts, keyed by audio/* format type. The GA contract's
+# canonical map (pcm16 -> 24000) only covers OpenAI's fixed rate, so a client
+# asking for another of these via an explicit {"type": ..., "rate": N} format
+# object would otherwise reach xAI unchecked.
+# https://docs.x.ai/developers/model-capabilities/audio/voice-agent
+_XAI_SUPPORTED_SAMPLE_RATES: Mapping[str, FrozenSet[int]] = {
+    "audio/pcm": frozenset({8000, 16000, 22050, 24000, 32000, 44100, 48000}),
+    "audio/pcmu": frozenset({8000}),
+    "audio/pcma": frozenset({8000}),
+    "audio/opus": frozenset({24000}),
+}
+_XAI_DEFAULT_SAMPLE_RATE = 24000
+
 
 def _derive_ga_server_event_types() -> Optional[FrozenSet[str]]:
     """Derive the canonical GA server-event vocabulary from the openai SDK.
@@ -150,7 +163,7 @@ class XAIRealtimeNormalizer:
     def normalize(self, event: "dict[str, Any]") -> "dict[str, Any]":
         """Apply all xAI normalization passes in order."""
         event = self._normalize_content_part_events(event)
-        event_type = event.get("type") or ""
+        event_type: Final = event.get("type") or ""
         event = self._normalize_conversation_item_added(event, event_type)
         event = self._inject_missing_indices(event, event_type)
         event = self._normalize_response_usage_event(event, event_type)
@@ -253,18 +266,23 @@ class XAIRealtimeNormalizer:
         audio = dict(audio)
 
         audio_output = audio.get("output")
-        if isinstance(audio_output, dict) and "speed" in audio_output:
+        if isinstance(audio_output, dict):
             audio_output = dict(audio_output)
-            audio_output["speed"] = XAIRealtimeNormalizer._clamp_logged(
-                audio_output["speed"], _XAI_OUTPUT_SPEED_MIN, _XAI_OUTPUT_SPEED_MAX, "output_audio_speed"
-            )
+            if "speed" in audio_output:
+                audio_output["speed"] = XAIRealtimeNormalizer._clamp_logged(
+                    audio_output["speed"], _XAI_OUTPUT_SPEED_MIN, _XAI_OUTPUT_SPEED_MAX, "output_audio_speed"
+                )
+            if isinstance(audio_output.get("format"), dict):
+                audio_output["format"] = XAIRealtimeNormalizer._snap_sample_rate_logged(
+                    audio_output["format"], "audio.output.format.rate"
+                )
             audio["output"] = audio_output
 
         audio_input = audio.get("input")
         if isinstance(audio_input, dict):
+            audio_input = dict(audio_input)
             turn_detection = audio_input.get("turn_detection")
             if isinstance(turn_detection, dict) and "threshold" in turn_detection:
-                audio_input = dict(audio_input)
                 turn_detection = dict(turn_detection)
                 turn_detection["threshold"] = XAIRealtimeNormalizer._clamp_logged(
                     turn_detection["threshold"],
@@ -273,7 +291,11 @@ class XAIRealtimeNormalizer:
                     "turn_detection.threshold",
                 )
                 audio_input["turn_detection"] = turn_detection
-                audio["input"] = audio_input
+            if isinstance(audio_input.get("format"), dict):
+                audio_input["format"] = XAIRealtimeNormalizer._snap_sample_rate_logged(
+                    audio_input["format"], "audio.input.format.rate"
+                )
+            audio["input"] = audio_input
 
         session["audio"] = audio
 
@@ -290,6 +312,36 @@ class XAIRealtimeNormalizer:
                 maximum,
             )
         return clamped
+
+    @staticmethod
+    def _snap_sample_rate_logged(audio_format: "dict[str, Any]", field: str) -> "dict[str, Any]":
+        """Fall back to the format's default rate when xAI does not accept the requested one.
+
+        xAI rejects the whole session.update on an unsupported rate rather than
+        ignoring the field, mirroring why ``_clamp_logged`` substitutes instead
+        of dropping. Unlike the numeric fields above, the accepted rates are a
+        discrete, format-dependent set (see ``_XAI_SUPPORTED_SAMPLE_RATES``), so
+        this snaps to the nearest documented default instead of clamping to a
+        min/max range.
+        """
+        rate = audio_format.get("rate")
+        format_type = audio_format.get("type")
+        allowed = _XAI_SUPPORTED_SAMPLE_RATES.get(format_type) if isinstance(format_type, str) else None
+        if allowed is None or rate is None:
+            return audio_format
+        if isinstance(rate, bool) or not isinstance(rate, int) or rate in allowed:
+            return audio_format
+        default_rate = _XAI_DEFAULT_SAMPLE_RATE if _XAI_DEFAULT_SAMPLE_RATE in allowed else min(allowed)
+        verbose_logger.warning(
+            "realtime session.update: %s=%r not supported by xAI for %s (unsupported_by_provider): "
+            "falling back to %s. xAI accepts %s",
+            field,
+            rate,
+            format_type,
+            default_rate,
+            sorted(allowed),
+        )
+        return {**audio_format, "rate": default_rate}
 
     @staticmethod
     def _apply_transcription_fields(session: dict, canonical: dict) -> None:
@@ -332,15 +384,15 @@ class XAIRealtimeNormalizer:
 
     @staticmethod
     def _default_server_vad_create_response(session: dict) -> None:
-        turn_detection = session.get("turn_detection")
+        turn_detection: Final = session.get("turn_detection")
         if isinstance(turn_detection, dict):
             XAIRealtimeNormalizer._ensure_server_vad_create_response(turn_detection)
 
-        audio = session.get("audio")
+        audio: Final = session.get("audio")
         if isinstance(audio, dict):
-            audio_input = audio.get("input")
+            audio_input: Final = audio.get("input")
             if isinstance(audio_input, dict):
-                nested_td = audio_input.get("turn_detection")
+                nested_td: Final = audio_input.get("turn_detection")
                 if isinstance(nested_td, dict):
                     XAIRealtimeNormalizer._ensure_server_vad_create_response(nested_td)
 
@@ -362,15 +414,15 @@ class XAIRealtimeNormalizer:
         )
 
     def _remember_content_part(self, event: dict) -> None:
-        part = event.get("part")
+        part: Final = event.get("part")
         if isinstance(part, dict):
             self._content_part_by_key[self._content_part_key(event)] = part
 
     def _update_content_part_field(self, event: dict, *, part_type: str, field: str, value: object) -> None:
         if value is None:
             return
-        key = self._content_part_key(event)
-        existing = self._content_part_by_key.get(key)
+        key: Final = self._content_part_key(event)
+        existing: Final = self._content_part_by_key.get(key)
         if not isinstance(existing, dict):
             updated = {"type": part_type, field: value}
         else:
@@ -382,16 +434,16 @@ class XAIRealtimeNormalizer:
         self._content_part_by_key[key] = updated
 
     def _resolve_content_part(self, event: dict) -> dict[str, Any]:
-        part = event.get("part")
+        part: Final = event.get("part")
         if isinstance(part, dict):
             return part
-        cached = self._content_part_by_key.get(self._content_part_key(event))
+        cached: Final = self._content_part_by_key.get(self._content_part_key(event))
         if isinstance(cached, dict):
             return cached
         return {"type": "audio", "transcript": ""}
 
     def _normalize_content_part_events(self, event: dict) -> dict:
-        event_type = event.get("type")
+        event_type: Final = event.get("type")
 
         if event_type == "response.content_part.added":
             self._remember_content_part(event)
@@ -433,7 +485,7 @@ class XAIRealtimeNormalizer:
         """
         if event_type != "conversation.item.added":
             return event
-        item = event.get("item")
+        item: Final = event.get("item")
         if not isinstance(item, dict):
             return event
         if item.get("role") == "tool":
@@ -503,16 +555,13 @@ class XAIRealtimeNormalizer:
         the shared realtime_correlation module so multi-item/multi-part
         responses get real, monotonically increasing indices.
         """
-        needs_output = event_type in self._EVENTS_NEEDING_OUTPUT_INDEX
-        needs_content = event_type in self._EVENTS_NEEDING_CONTENT_INDEX
+        needs_output: Final = event_type in self._EVENTS_NEEDING_OUTPUT_INDEX
+        needs_content: Final = event_type in self._EVENTS_NEEDING_CONTENT_INDEX
         if not needs_output and not needs_content:
             return event
-
         response_id = event.get("response_id")
         item_id = self._event_item_id(event, event_type)
         if not isinstance(response_id, str) or not isinstance(item_id, str):
-            # Can't resolve a real index without both ids; leave the event
-            # unpatched rather than guessing.
             return event
 
         patch: dict[str, Any] = {}
@@ -535,7 +584,7 @@ class XAIRealtimeNormalizer:
 
     @staticmethod
     def _default_ga_usage() -> dict[str, Any]:
-        default_details: dict[str, Any] = {
+        default_details: Final[dict[str, Any]] = {
             "cached_tokens": 0,
             "text_tokens": 0,
             "audio_tokens": 0,
@@ -549,7 +598,7 @@ class XAIRealtimeNormalizer:
         }
 
     @staticmethod
-    def _normalize_usage(usage: object, *, empty_as_null: bool) -> Optional[dict[str, Any]]:
+    def _normalize_usage(usage: object, *, empty_as_null: bool) -> dict[str, Any] | None:
         """Coerce a usage object into the full OpenAI GA shape.
 
         ``empty_as_null=True`` for ``response.created`` (usage optional).
@@ -559,12 +608,12 @@ class XAIRealtimeNormalizer:
             return None
         if not usage:
             return None if empty_as_null else XAIRealtimeNormalizer._default_ga_usage()
-        default_details: dict[str, Any] = {
+        default_details: Final[dict[str, Any]] = {
             "cached_tokens": 0,
             "text_tokens": 0,
             "audio_tokens": 0,
         }
-        normalized: dict[str, Any] = {
+        normalized: Final[dict[str, Any]] = {
             "total_tokens": usage.get("total_tokens", 0),
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
@@ -580,10 +629,10 @@ class XAIRealtimeNormalizer:
     def _normalize_response_usage_event(self, event: dict, event_type: str) -> dict:
         if event_type not in ("response.created", "response.done"):
             return event
-        response = event.get("response")
+        response: Final = event.get("response")
         if not isinstance(response, dict) or "usage" not in response:
             return event
-        normalized_usage = self._normalize_usage(
+        normalized_usage: Final = self._normalize_usage(
             response.get("usage"),
             empty_as_null=event_type == "response.created",
         )
