@@ -549,23 +549,42 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         return not any(family in lowered_model for family in ("gemini-3.7", "gemini-3.8", "gemini-3.1-pro"))
 
     @staticmethod
-    def _build_thinking_config(model: str) -> GeminiThinkingConfig:
+    def _supports_live_thinking(model: str) -> bool:
+        """Whether this Live model accepts a ``thinkingConfig`` at all.
+
+        Source: ai.google.dev/gemini-api/docs/live-api/thinking (Sept 2026) —
+        plain ``gemini-3.8-live`` is the non-thinking variant (thinking lives
+        only in ``gemini-3.8-live-extended-thinking``) and kills the session
+        with 1007 'Thinking level is not supported for this model' when setup
+        carries any thinking level, including ``low``.
+        """
+        lowered_model: Final = model.lower()
+        return not ("gemini-3.8" in lowered_model and "extended-thinking" not in lowered_model)
+
+    @staticmethod
+    def _build_thinking_config(model: str) -> GeminiThinkingConfig | None:
         """Force thinking off for this realtime session, ignoring any client input.
 
         Realtime voice sessions need the model answering immediately, not
         deliberating; thinking is therefore always disabled here rather than
         left to whatever (or nothing) the client's session.update requests.
 
+        Returns None for Live models without thinking support (plain
+        ``gemini-3.8-live``): any ``thinkingConfig`` there kills the session
+        with 1007, so the key is omitted from setup entirely.
+
         Gemini 2.5 Live models: leaving ``thinkingConfig``/``thinkingBudget`` off
         the setup entirely (not just setting a value) has been observed to break
         the session, so ``thinkingBudget: 0`` is sent unconditionally.
 
-        Gemini 3.x Live models: thinking cannot be disabled at all on this
+        Other Gemini 3.x Live models: thinking cannot be disabled at all on this
         family, and they reject ``thinkingBudget`` outright; ``thinkingLevel``
         is set to its lowest supported rung — ``"minimal"``, or ``"low"`` on
         families where ``minimal`` itself is an error (3.7/3.8, 3.1 Pro),
         which the backend kills the session for (1007).
         """
+        if not GeminiRealtimeConfig._supports_live_thinking(model):
+            return None
         if VertexGeminiConfig._is_gemini_3_or_newer(model):
             if GeminiRealtimeConfig._supports_minimal_thinking_level(model):
                 return {"thinkingLevel": "minimal"}
@@ -677,7 +696,9 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 # rely on transcripts arriving), so sending it only re-states
                 # that default; it cannot currently be turned off.
                 optional_params["outputAudioTranscription"] = {}
-        optional_params["generationConfig"]["thinkingConfig"] = self._build_thinking_config(model)
+        thinking_config: Final = self._build_thinking_config(model)
+        if thinking_config is not None:
+            optional_params["generationConfig"]["thinkingConfig"] = thinking_config
         if len(optional_params["generationConfig"]) == 0:
             optional_params.pop("generationConfig")
         return optional_params

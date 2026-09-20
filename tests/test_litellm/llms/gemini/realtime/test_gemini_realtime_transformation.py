@@ -2558,21 +2558,26 @@ class TestThinkingConfigMapping:
 
         assert generation_config["thinkingConfig"] == {"thinkingLevel": "minimal"}
 
-    def test_gemini_38_live_sends_low_instead_of_minimal(self):
-        """Regression: gemini-3.8-live closes the session with 1007
-        'Thinking level is not supported for this model' when setup carries
-        thinkingLevel minimal. Per ai.google.dev/gemini-api/docs/thinking
-        (Sept 2026) minimal is an error on the 3.8 family; low is the lowest
-        supported rung."""
-        for model in (self.GEMINI_38_LIVE, self.GEMINI_38_LIVE_EXTENDED_THINKING):
-            generation_config = self._generation_config(model, {})
+    def test_gemini_38_live_omits_thinking_config(self):
+        """Regression: plain gemini-3.8-live is the non-thinking variant and
+        closes the session with 1007 'Thinking level is not supported for this
+        model' when setup carries any thinking level, including low. Per
+        ai.google.dev/gemini-api/docs/live-api/thinking (Sept 2026) thinking
+        lives only in gemini-3.8-live-extended-thinking, so setup must omit
+        thinkingConfig entirely here."""
+        generation_config = self._generation_config(self.GEMINI_38_LIVE, {})
 
-            assert generation_config["thinkingConfig"] == {"thinkingLevel": "low"}
+        assert "thinkingConfig" not in generation_config
+
+    def test_gemini_38_live_extended_thinking_sends_low(self):
+        generation_config = self._generation_config(self.GEMINI_38_LIVE_EXTENDED_THINKING, {})
+
+        assert generation_config["thinkingConfig"] == {"thinkingLevel": "low"}
 
     def test_client_supplied_level_is_ignored_on_38_live(self):
         generation_config = self._generation_config(self.GEMINI_38_LIVE, {"thinking_level": "high"})
 
-        assert generation_config["thinkingConfig"] == {"thinkingLevel": "low"}
+        assert "thinkingConfig" not in generation_config
 
     def test_client_supplied_budget_is_ignored(self):
         """A client asking for more thinking tokens must not get them: realtime
