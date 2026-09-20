@@ -2540,6 +2540,8 @@ class TestThinkingConfigMapping:
 
     GEMINI_3 = "gemini-3.1-flash-live-preview"
     GEMINI_25 = "gemini-live-2.5-flash-preview-native-audio-09-2025"
+    GEMINI_38_LIVE = "gemini-3.8-live"
+    GEMINI_38_LIVE_EXTENDED_THINKING = "gemini-3.8-live-extended-thinking"
 
     def _generation_config(self, model: str, session: dict) -> dict:
         config = GeminiRealtimeConfig()
@@ -2555,6 +2557,22 @@ class TestThinkingConfigMapping:
         generation_config = self._generation_config(self.GEMINI_3, {})
 
         assert generation_config["thinkingConfig"] == {"thinkingLevel": "minimal"}
+
+    def test_gemini_38_live_sends_low_instead_of_minimal(self):
+        """Regression: gemini-3.8-live closes the session with 1007
+        'Thinking level is not supported for this model' when setup carries
+        thinkingLevel minimal. Per ai.google.dev/gemini-api/docs/thinking
+        (Sept 2026) minimal is an error on the 3.8 family; low is the lowest
+        supported rung."""
+        for model in (self.GEMINI_38_LIVE, self.GEMINI_38_LIVE_EXTENDED_THINKING):
+            generation_config = self._generation_config(model, {})
+
+            assert generation_config["thinkingConfig"] == {"thinkingLevel": "low"}
+
+    def test_client_supplied_level_is_ignored_on_38_live(self):
+        generation_config = self._generation_config(self.GEMINI_38_LIVE, {"thinking_level": "high"})
+
+        assert generation_config["thinkingConfig"] == {"thinkingLevel": "low"}
 
     def test_client_supplied_budget_is_ignored(self):
         """A client asking for more thinking tokens must not get them: realtime

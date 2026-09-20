@@ -538,6 +538,17 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         return mapped
 
     @staticmethod
+    def _supports_minimal_thinking_level(model: str) -> bool:
+        """Whether ``thinkingLevel: minimal`` is accepted by this model.
+
+        Source: ai.google.dev/gemini-api/docs/thinking (Sept 2026) — ``minimal``
+        is an error on Gemini 3.8/3.7 Flash and 3.1 Pro; the lowest supported
+        rung there is ``low``.
+        """
+        lowered_model: Final = model.lower()
+        return not any(family in lowered_model for family in ("gemini-3.7", "gemini-3.8", "gemini-3.1-pro"))
+
+    @staticmethod
     def _build_thinking_config(model: str) -> GeminiThinkingConfig:
         """Force thinking off for this realtime session, ignoring any client input.
 
@@ -551,11 +562,14 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
         Gemini 3.x Live models: thinking cannot be disabled at all on this
         family, and they reject ``thinkingBudget`` outright; ``thinkingLevel``
-        is set to its lowest rung, ``"minimal"``, as the closest available
-        approximation.
+        is set to its lowest supported rung — ``"minimal"``, or ``"low"`` on
+        families where ``minimal`` itself is an error (3.7/3.8, 3.1 Pro),
+        which the backend kills the session for (1007).
         """
         if VertexGeminiConfig._is_gemini_3_or_newer(model):
-            return {"thinkingLevel": "minimal"}
+            if GeminiRealtimeConfig._supports_minimal_thinking_level(model):
+                return {"thinkingLevel": "minimal"}
+            return {"thinkingLevel": "low"}
         return {"thinkingBudget": 0}
 
     def _apply_turn_detection(self, optional_params: dict, value: OpenAIRealtimeTurnDetection) -> None:
