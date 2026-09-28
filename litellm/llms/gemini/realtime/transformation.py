@@ -2,7 +2,6 @@
 This file contains the transformation logic for the Gemini realtime API.
 """
 
-import copy
 import json
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
@@ -539,42 +538,6 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         return mapped
 
     @staticmethod
-    def _carry_parameters_as_json_schema(client_tools: list[Any], mapped_tools: list[Any]) -> list[Any]:
-        """Send each function's client JSON Schema verbatim as ``parametersJsonSchema``.
-
-        Live validates ``parameters`` as the restricted OpenAPI proto Schema and
-        closes the whole session with 1007 on the first unrepresentable node
-        (e.g. an array whose ``items`` is ``{}``), while ``parametersJsonSchema``
-        accepts standard JSON Schema as MCP servers advertise it.
-        """
-        raw_schemas: Final = {
-            function["name"]: function["parameters"]
-            for tool in client_tools
-            if isinstance(tool, dict)
-            for function in (tool.get("function", tool),)
-            if isinstance(function, dict)
-            and isinstance(function.get("name"), str)
-            and isinstance(function.get("parameters"), dict)
-        }
-        return [
-            {
-                **tool,
-                "function_declarations": [
-                    {
-                        **{k: v for k, v in declaration.items() if k != "parameters"},
-                        "parametersJsonSchema": raw_schemas[declaration["name"]],
-                    }
-                    if declaration.get("name") in raw_schemas
-                    else declaration
-                    for declaration in tool["function_declarations"]
-                ],
-            }
-            if isinstance(tool, dict) and "function_declarations" in tool
-            else tool
-            for tool in mapped_tools
-        ]
-
-    @staticmethod
     def _supports_minimal_thinking_level(model: str) -> bool:
         """Whether ``thinkingLevel: minimal`` is accepted by this model.
 
@@ -687,13 +650,12 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
                 vertex_gemini_config = VertexGeminiConfig()
                 # Tools should be at the top level of setup, not inside generationConfig
-                client_tools: Final = cast(list[Any], value)  # cast-ok: narrowed only by the key=="tools" discriminant
-                optional_params["tools"] = self._carry_parameters_as_json_schema(
-                    client_tools,
-                    vertex_gemini_config._map_function(
-                        value=self._map_builtin_tools(model, copy.deepcopy(client_tools)),
-                        optional_params=optional_params,
+                optional_params["tools"] = vertex_gemini_config._map_function(
+                    value=self._map_builtin_tools(
+                        model,
+                        cast(List[Any], value),  # cast-ok: narrowed only by the key=="tools" discriminant
                     ),
+                    optional_params=optional_params,
                 )
             elif key == "input_audio_transcription" and value is not None:
                 optional_params["inputAudioTranscription"] = {}

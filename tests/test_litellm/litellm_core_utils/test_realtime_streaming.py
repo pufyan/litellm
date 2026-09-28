@@ -3389,24 +3389,6 @@ async def test_reconnect_loop_gives_up_after_repeated_immediate_backend_rejectio
 
 
 @pytest.mark.asyncio
-async def test_invalid_payload_close_is_not_retried():
-    """1007 means the provider rejected the setup payload itself; replaying the
-    same setup can never succeed, so the proxy must surface it without reconnecting."""
-    rejection: Final = "Invalid value at 'setup.tools[0].function_declarations[16]'"
-    streaming, sockets, connector, client_ws = _make_gemini_reconnect_streaming(
-        recv_sequences=[[ConnectionClosed(Close(1007, rejection), None)]],
-        connector_outcomes=[1],
-    )
-
-    with patch("asyncio.sleep", new=AsyncMock()):
-        close = await streaming.backend_to_client_send_messages()
-
-    assert connector.connect.await_count == 0
-    assert "litellm.session.reconnecting" not in [e["type"] for e in _client_events(client_ws)]
-    assert (close.code, close.reason) == (1007, rejection)
-
-
-@pytest.mark.asyncio
 async def test_reconnect_counter_resets_once_a_frame_is_received():
     """A reconnect that DOES receive at least one frame before the next drop
     must not count toward the immediate-rejection limit — only truly

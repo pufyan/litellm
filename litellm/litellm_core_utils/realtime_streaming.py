@@ -1471,7 +1471,7 @@ class RealTimeStreaming:
                 "Realtime: provider_config diagnostic state at close: turn_closed_by_interrupt=%s",
                 getattr(self.provider_config, "_turn_closed_by_interrupt", "n/a"),
             )
-            if not self._supports_backend_reconnect() or close_code == 1007:
+            if not self._supports_backend_reconnect():
                 raise
             self._consecutive_immediate_reconnect_closes += 1
             if self._consecutive_immediate_reconnect_closes > self._MAX_CONSECUTIVE_IMMEDIATE_RECONNECT_CLOSES:
