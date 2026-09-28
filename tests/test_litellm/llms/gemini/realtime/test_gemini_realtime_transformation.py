@@ -1,6 +1,6 @@
 import json
 from collections.abc import Mapping
-from typing import cast
+from typing import Final, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -756,7 +756,53 @@ def test_gemini_realtime_session_update_with_tools():
     function_decl = tools[0]["function_declarations"][0]
     assert function_decl["name"] == "get_weather"
     assert "Get the current weather" in function_decl["description"]
-    assert "parameters" in function_decl
+    assert function_decl["parametersJsonSchema"] == session_update["session"]["tools"][0]["function"]["parameters"]
+    assert "parameters" not in function_decl
+
+
+def test_gemini_realtime_tool_schema_rides_verbatim_as_parameters_json_schema():
+    """Regression: MCP JSON Schemas sent via the strict proto ``parameters`` field
+    made Gemini Live close the session with 1007 on an item-less nested array;
+    they must reach Gemini unchanged in ``parametersJsonSchema``."""
+    schema: Final = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "fields": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "kind": {"type": ["string", "null"]},
+                        "options": {"type": "array", "items": {}},
+                    },
+                },
+            },
+        },
+    }
+    session_update: Final = {
+        "type": "session.update",
+        "session": {
+            "tools": [
+                {"type": "function", "name": "schema_add_field", "description": "Add a field.", "parameters": schema},
+                {"type": "function", "name": "no_args", "description": "No arguments."},
+            ],
+        },
+    }
+
+    messages: Final = GeminiRealtimeConfig().transform_realtime_request(
+        json.dumps(session_update), "gemini-3.8-live", session_configuration_request=None
+    )
+
+    declarations: Final = json.loads(messages[0])["setup"]["tools"][0]["function_declarations"]
+    assert declarations[0] == {
+        "name": "schema_add_field",
+        "description": "Add a field.",
+        "parametersJsonSchema": schema,
+    }
+    assert declarations[1] == {"name": "no_args", "description": "No arguments."}
 
 
 def test_gemini_session_update_defaults_to_audio_modality():
@@ -2861,7 +2907,11 @@ class TestBuiltinToolMapping:
         tools = self._tools(self.GEMINI_25, [self.FUNCTION])
 
         assert tools == [
-            {"function_declarations": [{"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}]}
+            {
+                "function_declarations": [
+                    {"name": "f", "description": "d", "parametersJsonSchema": {"type": "object", "properties": {}}}
+                ]
+            }
         ]
 
 
