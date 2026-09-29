@@ -15,8 +15,9 @@ from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from litellm.proxy.db.gateway_request_tracking import GatewayRequestAccumulator
 from litellm.proxy.middleware.billable_request_metrics_middleware import (
@@ -592,3 +593,68 @@ def test_sink_factory_resolved_once_across_requests():
     client.post("/v1/chat/completions")
     assert calls == [1]
     assert len(sink.calls) == 2
+
+
+# ── realtime websocket sessions ───────────────────────────────────────────────
+
+
+def _make_realtime_app(recorder: FakeRecorder | None, sink: FakeSink | None, behavior: str) -> Starlette:
+    async def handler(websocket: WebSocket) -> None:
+        if behavior == "refuse":
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        if behavior == "upstream_error":
+            await websocket.close(code=1011)
+        elif behavior == "normal_close":
+            await websocket.close(code=1000)
+        elif behavior == "client_hangup":
+            await websocket.receive()
+
+    routes = [WebSocketRoute(path, handler) for path in ("/v1/realtime", "/realtime", "/openai/v1/realtime", "/ws")]
+    app = Starlette(routes=routes)
+    app.add_middleware(BillableRequestMetricsMiddleware, recorder=recorder, sink=sink)
+    return app
+
+
+def _open_realtime(app: Starlette, path: str = "/v1/realtime") -> None:
+    try:
+        with TestClient(app).websocket_connect(f"{path}?model=gpt-realtime") as ws:
+            ws.close()
+    except WebSocketDisconnect:
+        pass
+
+
+@pytest.mark.parametrize("path", ["/v1/realtime", "/realtime", "/openai/v1/realtime"])
+@pytest.mark.parametrize("behavior", ["normal_close", "client_hangup"])
+def test_realtime_session_counts_as_successful_llm_request(path: str, behavior: str):
+    sink, recorder = FakeSink(), FakeRecorder()
+    _open_realtime(_make_realtime_app(recorder, sink, behavior), path)
+    assert sink.calls == [{"category": BillableCategory.LLM, "route": "/realtime", "status_code": 200}]
+    assert [call["route"] for call in recorder.calls] == ["/realtime"]
+
+
+@pytest.mark.parametrize("behavior", ["refuse", "upstream_error"])
+def test_failed_realtime_session_counts_as_failure_and_is_not_billed(behavior: str):
+    sink, recorder = FakeSink(), FakeRecorder()
+    _open_realtime(_make_realtime_app(recorder, sink, behavior))
+    assert len(sink.calls) == 1
+    assert not 200 <= sink.calls[0]["status_code"] < 300
+    assert recorder.calls == []
+
+
+def test_non_realtime_websocket_is_not_counted():
+    sink = FakeSink()
+    _open_realtime(_make_realtime_app(None, sink, "normal_close"), "/ws")
+    assert sink.calls == []
+
+
+def test_realtime_sessions_reach_the_gateway_accumulator():
+    accumulator = GatewayRequestAccumulator()
+    app = _make_realtime_app(None, None, "normal_close")
+    app.user_middleware.clear()
+    app.add_middleware(BillableRequestMetricsMiddleware, sink=accumulator)
+    _open_realtime(app)
+    _open_realtime(app)
+    [counts] = accumulator.drain().values()
+    assert (counts.successful_requests, counts.failed_requests) == (2, 0)
