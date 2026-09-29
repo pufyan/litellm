@@ -796,7 +796,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         return normalized
 
     @staticmethod
-    def _finalize_gemini_live_setup(model: str, setup: dict[str, Any]) -> dict[str, Any]:
+    def _finalize_gemini_live_setup(model: str, setup: dict[str, object]) -> dict[str, object]:
         generation_config: Final = setup.get("generationConfig")
         if isinstance(generation_config, dict):
             modalities: Final = generation_config.get("responseModalities")
@@ -1597,7 +1597,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
     def map_openai_event(
         self,
         key: str,
-        value: Any,
+        value: object,
         current_delta_type: ALL_DELTA_TYPES | None,
     ) -> OpenAIRealtimeEventTypes | ResponsesAPIStreamEvents:
         if isinstance(value, dict):

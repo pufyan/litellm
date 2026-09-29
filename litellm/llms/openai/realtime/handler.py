@@ -12,6 +12,7 @@ from litellm.types.realtime import RealtimeQueryParams
 
 from ....litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from ....litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
+from ....litellm_core_utils.realtime_errors import close_after_upstream_handshake_refusal
 from ....litellm_core_utils.realtime_streaming import (
     RealtimeEventNormalizer,
     RealTimeStreaming,
@@ -177,8 +178,8 @@ class OpenAIRealtime(OpenAIChatCompletion):
                 )
                 await realtime_streaming.bidirectional_forward()
 
-        except websockets.exceptions.InvalidStatusCode as e:
-            await websocket.close(code=e.status_code, reason=_redact_string(str(e)))
+        except websockets.exceptions.InvalidStatus as e:
+            await close_after_upstream_handshake_refusal(websocket, e.response.status_code)
         except Exception as e:
             try:
                 await websocket.close(code=1011, reason=_redact_string(f"Internal server error: {e}"))
