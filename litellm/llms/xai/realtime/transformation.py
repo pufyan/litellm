@@ -17,7 +17,7 @@ and ``RealTimeStreaming`` stays provider-agnostic.
 """
 
 import time
-from typing import Any, FrozenSet, Mapping, Optional
+from typing import Any, Final, FrozenSet, Mapping, Optional
 
 from litellm._logging import verbose_logger
 from litellm.litellm_core_utils.realtime_schema_normalization import clamp_numeric
@@ -433,7 +433,7 @@ class XAIRealtimeNormalizer:
             }
         self._content_part_by_key[key] = updated
 
-    def _resolve_content_part(self, event: dict) -> dict[str, Any]:
+    def _resolve_content_part(self, event: dict) -> dict[str, object]:
         part: Final = event.get("part")
         if isinstance(part, dict):
             return part
@@ -564,7 +564,7 @@ class XAIRealtimeNormalizer:
         if not isinstance(response_id, str) or not isinstance(item_id, str):
             return event
 
-        patch: dict[str, Any] = {}
+        patch: Final[dict[str, Any]] = {}
         if needs_output and "output_index" not in event:
             self._correlation_state, output_index = track_output_index(self._correlation_state, response_id, item_id)
             patch["output_index"] = output_index
@@ -583,8 +583,8 @@ class XAIRealtimeNormalizer:
     # ---------------------------------------------------------------------------
 
     @staticmethod
-    def _default_ga_usage() -> dict[str, Any]:
-        default_details: Final[dict[str, Any]] = {
+    def _default_ga_usage() -> dict[str, object]:
+        default_details: Final[dict[str, int]] = {
             "cached_tokens": 0,
             "text_tokens": 0,
             "audio_tokens": 0,
@@ -598,7 +598,7 @@ class XAIRealtimeNormalizer:
         }
 
     @staticmethod
-    def _normalize_usage(usage: object, *, empty_as_null: bool) -> dict[str, Any] | None:
+    def _normalize_usage(usage: object, *, empty_as_null: bool) -> dict[str, object] | None:
         """Coerce a usage object into the full OpenAI GA shape.
 
         ``empty_as_null=True`` for ``response.created`` (usage optional).
@@ -608,12 +608,12 @@ class XAIRealtimeNormalizer:
             return None
         if not usage:
             return None if empty_as_null else XAIRealtimeNormalizer._default_ga_usage()
-        default_details: Final[dict[str, Any]] = {
+        default_details: Final[dict[str, int]] = {
             "cached_tokens": 0,
             "text_tokens": 0,
             "audio_tokens": 0,
         }
-        normalized: Final[dict[str, Any]] = {
+        normalized: Final[dict[str, object]] = {
             "total_tokens": usage.get("total_tokens", 0),
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),

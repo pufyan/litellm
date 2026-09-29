@@ -1,5 +1,5 @@
 """
-Counts HTTP requests to LLM inference, MCP, and A2A endpoints.
+Counts HTTP requests to LLM inference, MCP, and A2A endpoints, plus inference WebSocket sessions.
 
 Feeds two independent sinks off one classification:
 
@@ -17,8 +17,9 @@ pass-through.
 
 import re
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
+from types import MappingProxyType
 from typing import Final, Protocol, runtime_checkable
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -180,6 +181,63 @@ def classify_billable_request(path: str, method: str = "POST") -> tuple[Billable
     return None
 
 
+_REALTIME_ROUTES: Final = frozenset({"/realtime", "/v1/realtime", "/openai/v1/realtime"})
+_WEBSOCKET_NORMAL_CLOSE_CODES: Final = frozenset({1000, 1001})
+
+
+def classify_websocket_session(path: str) -> tuple[BillableCategory, str] | None:
+    """Every WebSocket route the proxy serves is inference, so there is no method gate to apply."""
+    normalized: Final = path.rstrip("/") or "/"
+    if normalized in _REALTIME_ROUTES:
+        return (BillableCategory.LLM, "/realtime")
+    llm_route: Final = _classify_llm_route(normalized)
+    return (BillableCategory.LLM, llm_route) if llm_route is not None else None
+
+
+def websocket_session_status(*, accepted: bool, close_code: int | None, denial_status: int | None) -> int:
+    """
+    Collapse a WebSocket session into the HTTP-style status both sinks key on.
+
+    A session the server never accepted is a refusal (Starlette answers it with 403 unless the app sent its own
+    denial response). An accepted session succeeded unless the server closed it with an abnormal code; a client
+    hang-up leaves no server close and still counts as served.
+    """
+    if not accepted:
+        return denial_status if denial_status is not None else 403
+    if close_code is None or close_code in _WEBSOCKET_NORMAL_CLOSE_CODES:
+        return 200
+    return 500
+
+
+def _str_field(asgi_mapping: Scope | Message, key: str, default: str) -> str:
+    match asgi_mapping.get(key):
+        case str() as value:
+            return value
+        case _:
+            return default
+
+
+def _int_field(asgi_mapping: Message, key: str, default: int) -> int:
+    match asgi_mapping.get(key):
+        case int() as value:
+            return value
+        case _:
+            return default
+
+
+def _classify_http_scope(scope: Scope) -> tuple[BillableCategory, str] | None:
+    return classify_billable_request(_str_field(scope, "path", ""), _str_field(scope, "method", "POST"))
+
+
+def _classify_websocket_scope(scope: Scope) -> tuple[BillableCategory, str] | None:
+    return classify_websocket_session(_str_field(scope, "path", ""))
+
+
+_SCOPE_CLASSIFIERS: Final[Mapping[str, Callable[[Scope], tuple[BillableCategory, str] | None]]] = MappingProxyType(
+    {"http": _classify_http_scope, "websocket": _classify_websocket_scope}
+)
+
+
 def _extract_model_id(headers: Sequence[tuple[bytes, bytes]]) -> str | None:
     return next(
         (value.decode("latin-1") for name, value in headers if name.lower() == _MODEL_ID_HEADER and value),
@@ -244,7 +302,9 @@ class BillableRequestMetricsMiddleware:
         return self.sink
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        scope_type: Final = _str_field(scope, "type", "")
+        classify: Final = _SCOPE_CLASSIFIERS.get(scope_type)
+        if classify is None:
             await self.app(scope, receive, send)
             return
 
@@ -254,23 +314,14 @@ class BillableRequestMetricsMiddleware:
             await self.app(scope, receive, send)
             return
 
-        classification: Final = classify_billable_request(scope.get("path", ""), scope.get("method", "POST"))
+        classification: Final = classify(scope)
         if classification is None:
             await self.app(scope, receive, send)
             return
 
         category, route = classification
-        status_code = 0
-        model_id: str | None = None
-
-        async def send_wrapper(message: Message) -> None:
-            nonlocal status_code, model_id
-            if message["type"] == "http.response.start":
-                status_code = message["status"]
-                model_id = _extract_model_id(message.get("headers", []))
-            await send(message)
-
-        await self.app(scope, receive, send_wrapper)
+        serve: Final = self._serve_http if scope_type == "http" else self._serve_websocket
+        status_code, model_id = await serve(scope, receive, send)
 
         if sink is not None:
             try:
@@ -283,3 +334,38 @@ class BillableRequestMetricsMiddleware:
                 recorder.record(category=category, route=route, status_code=status_code, model_id=model_id)
             except Exception:  # noqa: BLE001 -- metering must never fail a request that was already served
                 verbose_proxy_logger.warning("billable request metering failed for %s", route, exc_info=True)
+
+    async def _serve_http(self, scope: Scope, receive: Receive, send: Send) -> tuple[int, str | None]:
+        status_code = 0
+        model_id: str | None = None
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal status_code, model_id
+            if message["type"] == "http.response.start":
+                status_code = _int_field(message, "status", 0)
+                model_id = _extract_model_id(message.get("headers", []))
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+        return status_code, model_id
+
+    async def _serve_websocket(self, scope: Scope, receive: Receive, send: Send) -> tuple[int, str | None]:
+        accepted = False
+        close_code: int | None = None
+        denial_status: int | None = None
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal accepted, close_code, denial_status
+            match _str_field(message, "type", ""):
+                case "websocket.accept":
+                    accepted = True
+                case "websocket.close" if close_code is None:
+                    close_code = _int_field(message, "code", 1000)
+                case "websocket.http.response.start":
+                    denial_status = _int_field(message, "status", 403)
+                case _:
+                    pass
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+        return websocket_session_status(accepted=accepted, close_code=close_code, denial_status=denial_status), None
