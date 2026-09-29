@@ -611,7 +611,8 @@ def _make_realtime_app(recorder: FakeRecorder | None, sink: FakeSink | None, beh
         elif behavior == "client_hangup":
             await websocket.receive()
 
-    routes = [WebSocketRoute(path, handler) for path in ("/v1/realtime", "/realtime", "/openai/v1/realtime", "/ws")]
+    paths = ("/v1/realtime", "/realtime", "/openai/v1/realtime", "/v1/responses", "/vertex_ai/live", "/ws")
+    routes = [WebSocketRoute(path, handler) for path in paths]
     app = Starlette(routes=routes)
     app.add_middleware(BillableRequestMetricsMiddleware, recorder=recorder, sink=sink)
     return app
@@ -643,7 +644,14 @@ def test_failed_realtime_session_counts_as_failure_and_is_not_billed(behavior: s
     assert recorder.calls == []
 
 
-def test_non_realtime_websocket_is_not_counted():
+@pytest.mark.parametrize(("path", "route"), [("/v1/responses", "/responses"), ("/vertex_ai/live", "/vertex_ai")])
+def test_non_realtime_inference_websocket_is_counted_under_its_llm_route(path: str, route: str):
+    sink = FakeSink()
+    _open_realtime(_make_realtime_app(None, sink, "normal_close"), path)
+    assert sink.calls == [{"category": BillableCategory.LLM, "route": route, "status_code": 200}]
+
+
+def test_unclassified_websocket_is_not_counted():
     sink = FakeSink()
     _open_realtime(_make_realtime_app(None, sink, "normal_close"), "/ws")
     assert sink.calls == []

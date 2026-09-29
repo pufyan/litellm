@@ -1,5 +1,5 @@
 """
-Counts HTTP requests to LLM inference, MCP, and A2A endpoints, plus realtime WebSocket sessions.
+Counts HTTP requests to LLM inference, MCP, and A2A endpoints, plus inference WebSocket sessions.
 
 Feeds two independent sinks off one classification:
 
@@ -185,13 +185,18 @@ _REALTIME_ROUTES: Final = frozenset({"/realtime", "/v1/realtime", "/openai/v1/re
 _WEBSOCKET_NORMAL_CLOSE_CODES: Final = frozenset({1000, 1001})
 
 
-def classify_realtime_session(path: str) -> tuple[BillableCategory, str] | None:
-    return (BillableCategory.LLM, "/realtime") if (path.rstrip("/") or "/") in _REALTIME_ROUTES else None
+def classify_websocket_session(path: str) -> tuple[BillableCategory, str] | None:
+    """Every WebSocket route the proxy serves is inference, so there is no method gate to apply."""
+    normalized: Final = path.rstrip("/") or "/"
+    if normalized in _REALTIME_ROUTES:
+        return (BillableCategory.LLM, "/realtime")
+    llm_route: Final = _classify_llm_route(normalized)
+    return (BillableCategory.LLM, llm_route) if llm_route is not None else None
 
 
 def websocket_session_status(*, accepted: bool, close_code: int | None, denial_status: int | None) -> int:
     """
-    Collapse a realtime WebSocket session into the HTTP-style status both sinks key on.
+    Collapse a WebSocket session into the HTTP-style status both sinks key on.
 
     A session the server never accepted is a refusal (Starlette answers it with 403 unless the app sent its own
     denial response). An accepted session succeeded unless the server closed it with an abnormal code; a client
@@ -225,7 +230,7 @@ def _classify_http_scope(scope: Scope) -> tuple[BillableCategory, str] | None:
 
 
 def _classify_websocket_scope(scope: Scope) -> tuple[BillableCategory, str] | None:
-    return classify_realtime_session(_str_field(scope, "path", ""))
+    return classify_websocket_session(_str_field(scope, "path", ""))
 
 
 _SCOPE_CLASSIFIERS: Final[Mapping[str, Callable[[Scope], tuple[BillableCategory, str] | None]]] = MappingProxyType(
