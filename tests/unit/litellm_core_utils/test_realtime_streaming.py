@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections.abc import Coroutine
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +15,7 @@ from litellm.constants import REALTIME_SESSION_FAILURE_LOGGED_KEY, REALTIME_SESS
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
 from litellm.litellm_core_utils.realtime_streaming import (
+    BackendClose,
     RealTimeStreaming,
     client_sent_openai_beta_realtime_header,
 )
@@ -4705,3 +4707,25 @@ async def test_reconnect_closes_new_socket_when_cancelled_mid_resume():
 
     sockets[1].close.assert_awaited_once()
     assert streaming.backend_ws is sockets[0]
+
+
+@pytest.mark.asyncio
+async def test_backend_relay_stops_once_client_socket_is_disconnected():
+    model_turn: Final = b'{"serverContent": {"modelTurn": {"parts": [{"text": "hi"}]}}}'
+    streaming, sockets, _, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[[model_turn] * 5],
+        connector_outcomes=[],
+    )
+    client_ws.application_state = SimpleNamespace(name="CONNECTED")
+
+    async def send_after_client_left(_data: str) -> None:
+        client_ws.application_state = SimpleNamespace(name="DISCONNECTED")
+        raise RuntimeError('Cannot call "send" once a close message has been sent.')
+
+    client_ws.send_text = AsyncMock(side_effect=send_after_client_left)
+
+    close: Final = await streaming.backend_to_client_send_messages()
+
+    assert close == BackendClose(code=1000, reason="client disconnected")
+    assert sockets[0].recv.await_count == 1
+    assert client_ws.send_text.await_count == 1

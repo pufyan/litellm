@@ -1541,6 +1541,8 @@ class RealTimeStreaming:
                 try:
                     await self._handle_provider_config_message(raw_response)
                 except Exception as e:
+                    if self._client_disconnected():
+                        raise
                     verbose_logger.exception("Error processing backend message, skipping: %s", e)
                     continue
             else:
@@ -1593,10 +1595,17 @@ class RealTimeStreaming:
             await self.log_messages()
             raise
         except Exception as e:
-            verbose_logger.exception("Error in backend to client send messages: %s", e)
             self._flush_unbilled_transcription_usage()
             await self.log_messages()
+            if self._client_disconnected():
+                verbose_logger.debug("Client disconnected; stopping backend relay: %r", e)
+                return BackendClose(code=1000, reason="client disconnected")
+            verbose_logger.exception("Error in backend to client send messages: %s", e)
             return BackendClose(code=1011, reason="proxy failed while relaying the upstream websocket")
+
+    def _client_disconnected(self) -> bool:
+        state: Final = getattr(self.websocket, "application_state", None)
+        return getattr(state, "name", None) == "DISCONNECTED"
 
     def _backend_refused_session(self, close: BackendClose) -> bool:
         return close.code != 1000 and not self._backend_sent_frames
