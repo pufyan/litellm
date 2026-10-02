@@ -405,10 +405,7 @@ class RealTimeStreaming:
                 session: Final = msg_obj.get("session", {})
                 instructions: Final = session.get("instructions", "")
                 if instructions:
-                    self.input_messages = [
-                        {"role": "system", "content": instructions},
-                        *(m for m in self.input_messages if m.get("role") != "system"),
-                    ]
+                    self.input_messages.append({"role": "system", "content": instructions})
                 tools: Final = session.get("tools")
                 if tools and isinstance(tools, list):
                     self.session_tools = tools
@@ -515,19 +512,11 @@ class RealTimeStreaming:
         except (AttributeError, TypeError):
             pass
 
-    @staticmethod
-    def _is_audio_append(message: str | dict) -> bool:
-        try:
-            msg_obj: Final = message if isinstance(message, dict) else _decode_json_object(message)
-        except (json.JSONDecodeError, TypeError):
-            return False
-        return isinstance(msg_obj, Mapping) and msg_obj.get("type") == "input_audio_buffer.append"
-
     def store_input(self, message: str | dict):
         """Store input message"""
         self.input_message = message if isinstance(message, dict) else {}
         self._collect_user_input_from_client_event(message)
-        if self.logging_obj and not self._is_audio_append(message):
+        if self.logging_obj:
             self.logging_obj.pre_call(input=message, api_key="")
 
     async def log_messages(self):
