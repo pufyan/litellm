@@ -862,18 +862,17 @@ class RealTimeStreaming:
                         attempt,
                         resume_request,
                     )
-                    try:
-                        await new_ws.send(resume_request)
-                    except BaseException:
-                        await self._close_backend_socket_quietly(new_ws)
-                        raise
+                    await new_ws.send(resume_request)
                 self.backend_ws = new_ws
                 if native_resume_connector is not None:
                     self.backend_connector = native_resume_connector
                     self._reconnect_resumed_mode = "native"
                 else:
                     self._reconnect_resumed_mode = "native" if (state is not None and state.resumable) else "fresh"
-                await self._close_backend_socket_quietly(old_ws)
+                try:
+                    await old_ws.close()
+                except (OSError, RuntimeError, websockets.exceptions.WebSocketException):
+                    pass
                 verbose_logger.info(
                     "Realtime backend reconnected (attempt %d, reason=%s, resumed=%s)",
                     attempt,
@@ -888,15 +887,6 @@ class RealTimeStreaming:
                 await asyncio.sleep(delay)
         self._reconnecting_backend = False
         return False
-
-    @staticmethod
-    async def _close_backend_socket_quietly(ws: CLIENT_CONNECTION_CLASS | RealtimeBackend) -> None:
-        import websockets.exceptions
-
-        try:
-            await ws.close()
-        except (OSError, RuntimeError, websockets.exceptions.WebSocketException) as e:
-            verbose_logger.debug("Realtime: closing backend socket failed: %s", e)
 
     def _append_transcript_entry(self, role: Literal["user", "assistant", "note"], text: str) -> None:
         if not text or len(self._transcript_entries) >= self._MAX_TRANSCRIPT_ENTRIES:
@@ -2229,8 +2219,6 @@ class RealTimeStreaming:
             forward_task.cancel()
             client_task.cancel()
             await asyncio.gather(forward_task, client_task, return_exceptions=True)
-            # The handler's `async with` owns only the original backend socket; a reconnect hands ownership here.
-            await self._close_backend_socket_quietly(self.backend_ws)
 
     async def _close_client(self, close: BackendClose) -> None:
         redacted_message: Final = redact_internal_details_from_client_message(close.message)
