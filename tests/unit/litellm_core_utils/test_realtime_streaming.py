@@ -915,6 +915,38 @@ def test_collect_user_input_from_session_update_instructions():
     assert streaming.input_messages[0]["content"] == "You are a helpful assistant."
 
 
+def test_repeated_session_update_keeps_only_latest_instructions():
+    streaming: Final = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    user_turn: Final = {
+        "type": "conversation.item.create",
+        "item": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+
+    streaming.store_input(json.dumps({"type": "session.update", "session": {"instructions": "v1"}}))
+    streaming.store_input(json.dumps(user_turn))
+    for version in ("v2", "v3"):
+        streaming.store_input(json.dumps({"type": "session.update", "session": {"instructions": version}}))
+
+    assert streaming.input_messages == [
+        {"role": "system", "content": "v3"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_audio_append_frames_skip_per_frame_pre_call_logging():
+    logging_obj: Final = MagicMock()
+    streaming: Final = RealTimeStreaming(MagicMock(), MagicMock(), logging_obj)
+    commit: Final = json.dumps({"type": "input_audio_buffer.commit"})
+
+    for _ in range(50):
+        streaming.store_input(json.dumps({"type": "input_audio_buffer.append", "audio": "AAAA"}))
+    streaming.store_input({"type": "input_audio_buffer.append", "audio": "AAAA"})
+    streaming.store_input(commit)
+    streaming.store_input("not json")
+
+    assert [c.kwargs["input"] for c in logging_obj.pre_call.call_args_list] == [commit, "not json"]
+
+
 def test_collect_user_input_from_transcription_event():
     """
     Test that conversation.item.input_audio_transcription.completed events
