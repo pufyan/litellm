@@ -4254,6 +4254,7 @@ def _client_ws_that_never_sends() -> MagicMock:
 def _backend_ws_closing_with(*frames: bytes | Exception) -> MagicMock:
     backend_ws: Final = MagicMock()
     backend_ws.recv = AsyncMock(side_effect=list(frames))
+    backend_ws.close = AsyncMock()
     return backend_ws
 
 
@@ -4397,6 +4398,7 @@ async def test_upstream_closing_while_a_client_message_is_forwarded_still_reache
     backend_ws: Final = MagicMock()
     backend_ws.send = send_to_backend
     backend_ws.recv = recv_from_backend
+    backend_ws.close = AsyncMock()
     session: Final = _relay_session(client_ws, backend_ws)
 
     await session.run()
@@ -4413,6 +4415,7 @@ async def test_client_hanging_up_first_ends_the_session_without_a_relayed_close(
     client_ws.receive_text = AsyncMock(side_effect=RuntimeError("client went away"))
     backend_ws: Final = MagicMock()
     backend_ws.recv = AsyncMock(side_effect=_wait_forever)
+    backend_ws.close = AsyncMock()
     session: Final = _relay_session(client_ws, backend_ws)
 
     await session.run()
@@ -4428,6 +4431,7 @@ async def test_client_hanging_up_with_a_websockets_close_is_not_mistaken_for_the
     client_ws.receive_text = AsyncMock(side_effect=ConnectionClosed(None, None))
     backend_ws: Final = MagicMock()
     backend_ws.recv = AsyncMock(side_effect=_wait_forever)
+    backend_ws.close = AsyncMock()
     session: Final = _relay_session(client_ws, backend_ws)
 
     await session.run()
@@ -4619,3 +4623,53 @@ async def test_provider_bytes_are_sent_raw_after_pacing():
 
     assert [call.args[0] for call in backend_ws.send.await_args_list] == [b"\x00\x01", '{"type":"endStream"}']
     provider_config.pace_backend_send.assert_awaited_once_with(b"\x00\x01")
+
+
+@pytest.mark.asyncio
+async def test_bidirectional_forward_closes_backend_socket_opened_by_reconnect():
+    streaming, sockets, _, _ = _make_gemini_reconnect_streaming(
+        recv_sequences=[
+            [ConnectionClosed(None, None)],
+            [b'{"setupComplete": {}}', ConnectionClosed(None, None)],
+        ],
+        connector_outcomes=[1, ConnectionClosed(None, None), ConnectionClosed(None, None)],
+    )
+    streaming.websocket.receive_text = AsyncMock(side_effect=asyncio.Event().wait)
+
+    with patch.object(RealTimeStreaming, "_RECONNECT_BACKOFF_SECONDS", (0.0, 0.0, 0.0)):
+        await streaming.bidirectional_forward()
+
+    assert streaming.backend_ws is sockets[1]
+    sockets[0].close.assert_awaited()
+    sockets[1].close.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_closes_new_socket_when_resume_request_send_fails():
+    streaming, sockets, _, _ = _make_gemini_reconnect_streaming(
+        recv_sequences=[[], [], []],
+        connector_outcomes=[1, 2],
+    )
+    sockets[1].send = AsyncMock(side_effect=ConnectionClosed(None, None))
+
+    with patch.object(RealTimeStreaming, "_RECONNECT_BACKOFF_SECONDS", (0.0, 0.0)):
+        assert await streaming._reconnect_backend(reason="connection_closed") is True
+
+    sockets[1].close.assert_awaited_once()
+    sockets[2].close.assert_not_awaited()
+    assert streaming.backend_ws is sockets[2]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_closes_new_socket_when_cancelled_mid_resume():
+    streaming, sockets, _, _ = _make_gemini_reconnect_streaming(
+        recv_sequences=[[], []],
+        connector_outcomes=[1],
+    )
+    sockets[1].send = AsyncMock(side_effect=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await streaming._reconnect_backend(reason="go_away")
+
+    sockets[1].close.assert_awaited_once()
+    assert streaming.backend_ws is sockets[0]
