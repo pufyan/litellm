@@ -70,7 +70,7 @@ def _run_client_secret(session, model, monkeypatch):
         captured.update(kwargs)
         return object()
 
-    def mock_get_llm_provider(model, api_base, api_key):
+    def mock_get_llm_provider(model, api_base, api_key, **kwargs):
         return model, "openai", None, api_base
 
     monkeypatch.setattr(realtime_main, "get_llm_provider", mock_get_llm_provider)
@@ -167,7 +167,7 @@ async def test_meta_realtime_dispatches_to_base_handler_with_meta_config(monkeyp
 
     captured: dict[str, object] = {}
 
-    def mock_get_llm_provider(model, api_base, api_key):
+    def mock_get_llm_provider(model, api_base, api_key, **kwargs):
         return model.removeprefix("meta/"), "meta", None, api_base
 
     async def mock_async_realtime(**kwargs):
@@ -197,7 +197,7 @@ async def test_arealtime_vertex_branch_resolves_credentials_under_a_bound(monkey
     async def hanging_token_refresh(**kwargs):
         await asyncio.sleep(30)
 
-    def mock_get_llm_provider(model, api_base, api_key):
+    def mock_get_llm_provider(model, api_base, api_key, **kwargs):
         return model, "vertex_ai", None, api_base
 
     monkeypatch.setattr(realtime_main, "get_llm_provider", mock_get_llm_provider)
@@ -516,7 +516,7 @@ async def _vertex_provider_config_for(monkeypatch, model: str, vertex_location: 
 
     captured: dict[str, object] = {}
 
-    def mock_get_llm_provider(model, api_base, api_key):
+    def mock_get_llm_provider(model, api_base, api_key, **kwargs):
         return model.removeprefix("vertex_ai/"), "vertex_ai", None, api_base
 
     async def mock_token_resolver(**kwargs):
@@ -574,3 +574,51 @@ async def test_arealtime_keeps_gemini_live_on_the_vertex_realtime_websocket(monk
 async def test_realtime_health_check_names_the_batch_mode_for_chirp_models():
     with pytest.raises(ValueError, match="mode audio_transcription"):
         await realtime_main._realtime_health_check(model="chirp_3", custom_llm_provider="vertex_ai", api_key=None)
+
+
+def test_route_registry_covers_every_dispatched_provider():
+    from litellm.litellm_core_utils.realtime_capabilities import get_realtime_capability
+    from litellm.realtime_api.main import _REALTIME_ROUTE_HANDLERS, _route_azure_realtime
+
+    assert set(_REALTIME_ROUTE_HANDLERS) == {"openai", "bedrock", "xai", "yandex", "vertex_ai"}
+    for provider in list(_REALTIME_ROUTE_HANDLERS) + ["azure", "azure_ai"]:
+        get_realtime_capability(provider)
+    assert _route_azure_realtime is not None
+
+
+async def test_arealtime_dispatches_openai_through_registry_without_changing_arguments(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def mock_get_llm_provider(model, api_base, api_key, **kwargs):
+        return "gpt-realtime", "openai", api_key, api_base
+
+    async def mock_async_realtime(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(realtime_main, "get_llm_provider", mock_get_llm_provider)
+    monkeypatch.setattr(realtime_main.openai_realtime, "async_realtime", mock_async_realtime)
+
+    await realtime_main._arealtime.__wrapped__(
+        model="openai/gpt-realtime",
+        websocket=MagicMock(),
+        api_key="fake-key",
+        litellm_logging_obj=FakeLogging(),
+    )
+
+    assert captured["model"] == "gpt-realtime"
+    assert captured["api_base"] == "https://api.openai.com/"
+    assert captured["api_key"] == "fake-key"
+
+
+async def test_arealtime_rejects_unsupported_provider_with_the_same_error(monkeypatch):
+    def mock_get_llm_provider(model, api_base, api_key, **kwargs):
+        return model, "not-a-provider", None, api_base
+
+    monkeypatch.setattr(realtime_main, "get_llm_provider", mock_get_llm_provider)
+
+    with pytest.raises(ValueError, match="Unsupported model"):
+        await realtime_main._arealtime.__wrapped__(
+            model="not-a-provider/m",
+            websocket=MagicMock(),
+            litellm_logging_obj=FakeLogging(),
+        )

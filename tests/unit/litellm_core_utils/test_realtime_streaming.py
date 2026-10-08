@@ -4729,3 +4729,124 @@ async def test_backend_relay_stops_once_client_socket_is_disconnected():
     assert close == BackendClose(code=1000, reason="client disconnected")
     assert sockets[0].recv.await_count == 1
     assert client_ws.send_text.await_count == 1
+
+
+def _baseline_streaming(provider_config=None):
+    client_ws = MagicMock()
+    client_ws.scope = {"headers": []}
+    client_ws.send_text = AsyncMock()
+    backend_ws = MagicMock()
+    backend_ws.send = AsyncMock()
+    logging_obj = MagicMock()
+    streaming = RealTimeStreaming(
+        client_ws, backend_ws, logging_obj, provider_config=provider_config
+    )
+    return streaming, client_ws, backend_ws
+
+
+async def test_send_to_backend_direct_path_forwards_message_verbatim_in_one_send():
+    streaming, _, backend_ws = _baseline_streaming()
+    message = json.dumps({"type": "input_audio_buffer.append", "audio": "QUJD"})
+
+    sent = await streaming._send_to_backend(message)
+
+    assert sent is True
+    assert backend_ws.send.await_count == 1
+    assert backend_ws.send.await_args.args[0] == message
+
+
+async def test_send_to_backend_delivers_transformed_messages_in_order():
+    provider_config = MagicMock()
+    frames = [
+        json.dumps({"type": "input_audio_buffer.append", "audio": "AAA"}),
+        json.dumps({"type": "input_audio_buffer.append", "audio": "BBB"}),
+        json.dumps({"type": "input_audio_buffer.commit"}),
+    ]
+    provider_config.transform_realtime_request = MagicMock(return_value=list(frames))
+    provider_config.is_setup_message = MagicMock(return_value=False)
+    provider_config.is_content_message = MagicMock(return_value=False)
+    streaming, _, backend_ws = _baseline_streaming(provider_config=provider_config)
+
+    sent = await streaming._send_to_backend(frames[0])
+
+    assert sent is True
+    assert [c.args[0] for c in backend_ws.send.await_args_list] == frames
+
+
+async def test_send_to_backend_failed_send_leaves_setup_state_untouched():
+    """Send first, mutate after: a failed send must not poison setup tracking,
+    or later session.update frames get dropped against a setup that never landed."""
+    provider_config = MagicMock()
+    message = json.dumps({"type": "input_audio_buffer.append", "audio": "QUJD"})
+    provider_config.transform_realtime_request = MagicMock(return_value=[message])
+    provider_config.is_setup_message = MagicMock(return_value=False)
+    provider_config.is_content_message = MagicMock(return_value=True)
+    streaming, _, backend_ws = _baseline_streaming(provider_config=provider_config)
+    backend_ws.send = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await streaming._send_to_backend(message)
+
+    assert streaming.session_configuration_request is None
+    assert streaming._content_sent_after_setup is False
+
+
+async def test_provider_config_message_response_created_adopts_returned_response_id():
+    provider_config = MagicMock()
+    provider_config.transform_realtime_response = MagicMock(
+        return_value={
+            "response": [{"type": "response.created", "response": {"id": "resp_123"}}],
+            "current_output_item_id": None,
+            "current_response_id": "resp_123",
+            "current_delta_chunks": [],
+            "current_conversation_id": None,
+            "current_item_chunks": [],
+            "current_delta_type": None,
+            "session_configuration_request": None,
+        }
+    )
+    streaming, client_ws, _ = _baseline_streaming(provider_config=provider_config)
+
+    await streaming._handle_provider_config_message("{}")
+
+    assert streaming.current_response_id == "resp_123"
+    assert client_ws.send_text.await_count == 1
+    sent = json.loads(client_ws.send_text.await_args.args[0])
+    assert sent["type"] == "response.created"
+
+
+async def test_provider_config_message_replaces_progress_state_wholesale():
+    """Progress state has a single owner: whatever the transform round-trip
+    returns replaces every current_* field, stale values never survive."""
+    provider_config = MagicMock()
+    provider_config.transform_realtime_response = MagicMock(
+        return_value={
+            "response": [{"type": "response.done", "response": {"id": "resp_new"}}],
+            "current_output_item_id": None,
+            "current_response_id": None,
+            "current_delta_chunks": [],
+            "current_conversation_id": None,
+            "current_item_chunks": [],
+            "current_delta_type": None,
+            "session_configuration_request": None,
+        }
+    )
+    streaming, _, _ = _baseline_streaming(provider_config=provider_config)
+    streaming.current_response_id = "resp_old"
+    streaming.current_delta_chunks = [{"type": "response.output_text.delta"}]
+    streaming.current_item_chunks = [{"type": "response.output_item.done"}]
+
+    await streaming._handle_provider_config_message("{}")
+
+    assert streaming.current_response_id is None
+    assert streaming.current_delta_chunks == []
+    assert streaming.current_item_chunks == []
+
+
+async def test_raw_backend_message_response_done_falls_through_to_store_and_forward():
+    """Without provider_config the bridge owns no turn state: response.done
+    is not consumed here, the relay loop stores and forwards it."""
+    streaming, _, _ = _baseline_streaming()
+    event = {"type": "response.done", "response": {"id": "resp_9", "status": "completed"}}
+
+    assert await streaming._handle_raw_backend_message(event, json.dumps(event)) is False
