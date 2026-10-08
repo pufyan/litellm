@@ -91,7 +91,7 @@ async def test_construct_url_default_beta_protocol():
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="gpt-4o-realtime-preview",
         api_version="2024-10-01-preview",
@@ -112,7 +112,7 @@ async def test_construct_url_beta_protocol_explicit():
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="gpt-4o-realtime-preview",
         api_version="2024-10-01-preview",
@@ -132,7 +132,7 @@ async def test_construct_url_ga_protocol():
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="gpt-4o-realtime-preview",
         api_version="2024-10-01-preview",
@@ -159,7 +159,7 @@ async def test_construct_url_forwards_transcription_intent_ga():
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="gpt-realtime-whisper",
         api_version="2025-04-01-preview",
@@ -182,7 +182,7 @@ async def test_construct_url_forwards_transcription_intent_ga_without_model_quer
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="gpt-realtime-whisper",
         api_version="2025-04-01-preview",
@@ -201,7 +201,7 @@ async def test_construct_url_forwards_transcription_intent_beta():
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="whisper-deploy",
         api_version="2024-10-01-preview",
@@ -219,7 +219,7 @@ async def test_construct_url_encodes_intent_value():
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="gpt-realtime-whisper",
         api_version="2025-04-01-preview",
@@ -236,7 +236,7 @@ async def test_construct_url_no_intent_when_absent():
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="gpt-4o-realtime-preview",
         api_version="2024-10-01-preview",
@@ -254,7 +254,7 @@ async def test_construct_url_v1_protocol():
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="gpt-4o-realtime-preview",
         api_version="2024-10-01-preview",
@@ -274,7 +274,7 @@ async def test_construct_url_case_insensitive_protocol(protocol):
     from litellm.llms.azure.realtime.handler import AzureOpenAIRealtime
 
     handler = AzureOpenAIRealtime()
-    url = handler._construct_url(
+    url = handler.construct_url(
         api_base="https://my-endpoint.openai.azure.com",
         model="gpt-realtime-deployment",
         api_version=None,

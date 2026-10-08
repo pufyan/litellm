@@ -205,7 +205,7 @@ def _gemini_live_speech_config(voice: object) -> Mapping[str, object] | None:
             audio_params["voice"],
         )
         return None
-    return VertexGeminiConfig()._map_audio_params(audio_params)
+    return VertexGeminiConfig().map_audio_params(audio_params)
 
 
 class _GeminiLiveSetupEnvelope(TypedDict, total=False):
@@ -650,7 +650,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
                 vertex_gemini_config = VertexGeminiConfig()
                 # Tools should be at the top level of setup, not inside generationConfig
-                optional_params["tools"] = vertex_gemini_config._map_function(
+                optional_params["tools"] = vertex_gemini_config.map_function(
                     value=self._map_builtin_tools(
                         model,
                         cast(List[Any], value),  # cast-ok: narrowed only by the key=="tools" discriminant
@@ -1460,7 +1460,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         _modalities: Final = [modality.lower() for modality in cast(list[str], gemini_modalities)]
         resolved_usage_metadata: Final = self._consume_usage_metadata_for_response_done(cast(dict, message))
         if resolved_usage_metadata is not None:
-            _chat_completion_usage = VertexGeminiConfig._calculate_usage(
+            _chat_completion_usage = VertexGeminiConfig.calculate_usage(
                 completion_response=cast(
                     BidiGenerateContentServerMessage,
                     {**cast(dict, message), "usageMetadata": resolved_usage_metadata},
@@ -1474,7 +1474,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         else:
             _chat_completion_usage = get_empty_usage()
 
-        responses_api_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        responses_api_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             _chat_completion_usage,
         )
         _usage_dict: Final = responses_api_usage.model_dump()
@@ -2003,7 +2003,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                             _patch_function_call_item(output_item)
                         resolved_tool_call_usage_metadata = self._consume_usage_metadata_for_response_done(json_message)
                         if resolved_tool_call_usage_metadata is not None:
-                            _tool_call_chat_completion_usage = VertexGeminiConfig._calculate_usage(
+                            _tool_call_chat_completion_usage = VertexGeminiConfig.calculate_usage(
                                 completion_response=cast(  # cast-ok: json_message plus merged usageMetadata matches the wire shape
                                     BidiGenerateContentServerMessage,
                                     {
@@ -2015,7 +2015,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                         else:
                             _tool_call_chat_completion_usage = get_empty_usage()
                         tool_call_responses_api_usage = (
-                            LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+                            LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
                                 _tool_call_chat_completion_usage,
                             )
                         )
@@ -2033,18 +2033,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                                     int, tool_call_max_output_tokens
                                 )
                             )
-                        returned_message.append(response_done_event)
-                    else:
-                        # tool_call_events() never emits SpeechStartedEvent (the only
-                        # other CorrelationEvent member) — it has no cancel_response()
-                        # call in its implementation — so every remaining event here
-                        # is a plain OpenAIRealtimeEvents member handled above by type.
-                        returned_message.append(
-                            cast(  # cast-ok: exhaustiveness fallback, only remaining member
-                                OpenAIRealtimeEvents, tool_event
-                            )
-                        )
-
+                returned_message.append(response_done_event)
                 current_output_item_id = None
                 current_response_id = None
             elif openai_event == OpenAIRealtimeEventTypes.RESPONSE_DONE:

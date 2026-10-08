@@ -162,7 +162,7 @@ class BidiGenerateContentSetup(TypedDict, total=False):
 
 
 # Image Generation Types
-from pydantic import BaseModel
+from litellm.types.llms.base import LiteLLMBaseModel
 
 
 class GeminiImageGenerationInstance(TypedDict):
@@ -171,7 +171,7 @@ class GeminiImageGenerationInstance(TypedDict):
     prompt: str
 
 
-class GeminiImageGenerationParameters(BaseModel):
+class GeminiImageGenerationParameters(LiteLLMBaseModel):
     """Parameters for Gemini image generation request"""
 
     sampleCount: int | None = None
@@ -215,7 +215,7 @@ class GeminiImageGenerationParameters(BaseModel):
     """User specification"""
 
 
-class GeminiImageGenerationRequest(BaseModel):
+class GeminiImageGenerationRequest(LiteLLMBaseModel):
     """Complete request body for Gemini image generation"""
 
     instances: list[GeminiImageGenerationInstance]
@@ -249,7 +249,7 @@ class GeminiVideoGenerationInstance(TypedDict, total=False):
     image: dict[str, Any]
 
 
-class GeminiVideoGenerationParameters(BaseModel):
+class GeminiVideoGenerationParameters(LiteLLMBaseModel):
     """
     Parameters for Gemini video generation request.
 
@@ -301,7 +301,7 @@ class GeminiVideoGenerationParameters(BaseModel):
     """
 
 
-class GeminiVideoGenerationRequest(BaseModel):
+class GeminiVideoGenerationRequest(LiteLLMBaseModel):
     """Complete request body for Gemini video generation"""
 
     instances: list[GeminiVideoGenerationInstance]
@@ -309,35 +309,35 @@ class GeminiVideoGenerationRequest(BaseModel):
 
 
 # Video Generation Operation Response Types
-class GeminiVideoUri(BaseModel):
+class GeminiVideoUri(LiteLLMBaseModel):
     """Video URI in the generated sample"""
 
     uri: str
     """File URI of the generated video (e.g., 'files/abc123...')"""
 
 
-class GeminiGeneratedVideoSample(BaseModel):
+class GeminiGeneratedVideoSample(LiteLLMBaseModel):
     """Individual generated video sample"""
 
     video: GeminiVideoUri
     """Video object containing the URI"""
 
 
-class GeminiGenerateVideoResponse(BaseModel):
+class GeminiGenerateVideoResponse(LiteLLMBaseModel):
     """Generate video response containing the samples"""
 
     generatedSamples: list[GeminiGeneratedVideoSample]
     """List of generated video samples"""
 
 
-class GeminiOperationResponse(BaseModel):
+class GeminiOperationResponse(LiteLLMBaseModel):
     """Response object in the operation when done"""
 
     generateVideoResponse: GeminiGenerateVideoResponse
     """Video generation response"""
 
 
-class GeminiOperationMetadata(BaseModel):
+class GeminiOperationMetadata(LiteLLMBaseModel):
     """Metadata for the operation"""
 
     createTime: str | None = None
@@ -346,7 +346,7 @@ class GeminiOperationMetadata(BaseModel):
     """Model used for generation"""
 
 
-class GeminiLongRunningOperationResponse(BaseModel):
+class GeminiLongRunningOperationResponse(LiteLLMBaseModel):
     """
     Complete response for a long-running operation.
 
