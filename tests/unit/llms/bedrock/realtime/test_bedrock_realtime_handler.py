@@ -562,6 +562,52 @@ class TestBedrockRealtimeHandler:
 
         assert client_ws.closed
 
+    @pytest.mark.asyncio
+    async def test_idle_timeout_ends_hanging_bedrock_leg(self):
+        handler = BedrockRealtime(forward_idle_timeout=0.05)
+        stream = ScriptedBedrockStream([], receiver_type=DrainedThenOpenBedrockReceiver)
+        client_ws = ConnectedClientWS([])
+
+        outcome = await asyncio.wait_for(
+            handler._bridge(
+                client_ws,
+                stream,
+                BedrockRealtimeConfig(),
+                "amazon.nova-sonic-v1:0",
+                {},
+                FakeLogging(),
+                initial_message=None,
+            ),
+            timeout=5,
+        )
+
+        assert outcome.logged_events == ()
+
+    @pytest.mark.asyncio
+    async def test_bridge_logged_events_capped(self, monkeypatch):
+        monkeypatch.setattr(litellm, "logged_real_time_event_types", "*")
+        handler = BedrockRealtime()
+        total = BedrockRealtime._MAX_BRIDGE_LOGGED_EVENTS + 50
+        stream = ScriptedBedrockStream(
+            [json.dumps({"event": {"userSpeechStart": {}}}) for _ in range(total)]
+        )
+        client_ws = ConnectedClientWS([])
+
+        outcome = await asyncio.wait_for(
+            handler._bridge(
+                client_ws,
+                stream,
+                BedrockRealtimeConfig(),
+                "amazon.nova-sonic-v1:0",
+                {},
+                FakeLogging(),
+                initial_message=None,
+            ),
+            timeout=30,
+        )
+
+        assert len(outcome.logged_events) == BedrockRealtime._MAX_BRIDGE_LOGGED_EVENTS
+
 
 class TestBedrockRealtimeSessionLifecycle:
     """Server must emit session.created on connect and session.updated on session.update (LIT-4655 regression)"""
@@ -709,7 +755,7 @@ class TestBedrockRealtimeProviderFailurePropagation:
             )
 
         assert replay.value.status_code == 400, "a committed session must not be silently restarted on a fallback"
-        assert not litellm._should_retry(replay.value.status_code), "the router must not retry the replay refusal"
+        assert not litellm.should_retry(replay.value.status_code), "the router must not retry the replay refusal"
         assert "Nova Sonic stream broke" in replay.value.message, "the router surfaces the last attempt's error"
 
     @pytest.mark.asyncio

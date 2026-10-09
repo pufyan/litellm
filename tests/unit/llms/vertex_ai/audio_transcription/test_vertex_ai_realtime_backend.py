@@ -15,7 +15,10 @@ from google.cloud.speech_v2.types import (
 )
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
-from litellm.llms.vertex_ai.audio_transcription.realtime_backend import REQUEST_QUEUE_SIZE, SpeechStreamingBackend
+from litellm.llms.vertex_ai.audio_transcription.realtime_backend import (
+    REQUEST_QUEUE_SIZE,
+    SpeechStreamingBackend,
+)
 from litellm.llms.vertex_ai.audio_transcription.realtime_transformation import SpeechStreamingTarget
 
 
@@ -489,3 +492,34 @@ async def test_audio_sends_block_once_the_request_queue_is_full():
         hold.set()
         await asyncio.wait_for(blocked, timeout=2)
         assert await _transcript(backend) == "late"
+
+
+@pytest.mark.asyncio
+async def test_turn_rotation_bounds_retained_streams():
+    now = [0.0]
+    client = _FakeSpeechClient()
+    async with _backend(client, clock=lambda: now[0], rotation_seconds=240.0) as backend:
+        await _configure(backend)
+        for _ in range(SpeechStreamingBackend._MAX_TURN_STREAMS + 4):
+            now[0] += 240.0
+            await backend.send(b"\x01\x01")
+            await asyncio.sleep(0)
+
+        assert len(backend._turn) == SpeechStreamingBackend._MAX_TURN_STREAMS
+        assert backend._turn_streams_dropped == 4
+
+
+@pytest.mark.asyncio
+async def test_close_unblocks_full_request_queue():
+    hold = asyncio.Event()
+    client = _FakeSpeechClient([hold])
+    backend = _backend(client)
+    await _configure(backend)
+    for _ in range(REQUEST_QUEUE_SIZE + 1):
+        await backend.send(b"\x00\x00")
+    blocked = asyncio.create_task(backend.send(b"\x00\x00"))
+    await asyncio.sleep(0)
+    assert not blocked.done()
+
+    await backend.close()
+    await asyncio.wait_for(blocked, timeout=2)

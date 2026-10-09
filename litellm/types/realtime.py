@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import ConfigDict
 from typing_extensions import ReadOnly, TypedDict
+
+from litellm.types.llms.base import LiteLLMBaseModel
 
 from .llms.openai import (
     OpenAIRealtimeEvents,
@@ -75,14 +77,14 @@ class RealtimeQueryParams(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 
 
-class RealtimeExpiresAfter(BaseModel):
+class RealtimeExpiresAfter(LiteLLMBaseModel):
     """Expiration config for a client secret."""
 
     anchor: str | None = "created_at"
     seconds: int | None = None
 
 
-class RealtimeSessionConfig(BaseModel):
+class RealtimeSessionConfig(LiteLLMBaseModel):
     """
     Session configuration nested inside the client_secrets request body.
 
@@ -91,7 +93,7 @@ class RealtimeSessionConfig(BaseModel):
     Extra/unknown fields are passed through unchanged.
     """
 
-    model_config = {"extra": "allow"}
+    model_config = ConfigDict(extra="allow")
 
     type: str | None = None
     model: str | None = None
@@ -107,7 +109,7 @@ class RealtimeSessionConfig(BaseModel):
     prompt: dict[str, object] | None = None
 
 
-class RealtimeClientSecretRequest(BaseModel):
+class RealtimeClientSecretRequest(LiteLLMBaseModel):
     """
     Request body for POST /v1/realtime/client_secrets.
 
@@ -121,7 +123,7 @@ class RealtimeClientSecretRequest(BaseModel):
     model: str | None = None
 
 
-class RealtimeClientSecretResponse(BaseModel):
+class RealtimeClientSecretResponse(LiteLLMBaseModel):
     """
     Response from POST /v1/realtime/client_secrets.
 
@@ -135,7 +137,7 @@ class RealtimeClientSecretResponse(BaseModel):
     session: dict[str, object] | None = None
 
 
-class RealtimeTranscriptionSessionRequest(BaseModel):
+class RealtimeTranscriptionSessionRequest(LiteLLMBaseModel):
     """
     Request body for POST /v1/realtime/transcription_sessions.
 
@@ -145,7 +147,7 @@ class RealtimeTranscriptionSessionRequest(BaseModel):
     unchanged to the provider.
     """
 
-    model_config = {"extra": "allow"}
+    model_config = ConfigDict(extra="allow")
 
     # LiteLLM-only routing hint — stripped before forwarding upstream.
     model: str | None = None
@@ -159,7 +161,7 @@ class RealtimeTranscriptionSessionRequest(BaseModel):
         return None
 
 
-class RealtimeTranscriptionSessionResponse(BaseModel):
+class RealtimeTranscriptionSessionResponse(LiteLLMBaseModel):
     """
     Response from POST /v1/realtime/transcription_sessions.
 
@@ -167,7 +169,7 @@ class RealtimeTranscriptionSessionResponse(BaseModel):
     ephemeral key. Unknown fields pass through unchanged.
     """
 
-    model_config = {"extra": "allow"}
+    model_config = ConfigDict(extra="allow")
 
     client_secret: dict[str, object] | None = None
 

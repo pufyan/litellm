@@ -16,7 +16,7 @@ from typing import Final, NoReturn, Protocol, runtime_checkable
 from pydantic import JsonValue, TypeAdapter
 
 import litellm
-from litellm._logging import _redact_string, verbose_proxy_logger
+from litellm._logging import redact_string, verbose_proxy_logger
 from litellm.constants import (
     BEDROCK_REALTIME_COMMITTED_FAILURE_SCOPE_KEY,
     BEDROCK_REALTIME_PENDING_SESSION_UPDATE_SCOPE_KEY,
@@ -192,9 +192,9 @@ def _pending_session_update(scope: Mapping[str, object]) -> str | None:
 
 def _raise_provider_failure(scope: MutableMapping[str, object], failure: BaseException) -> NoReturn:
     error: Final = _as_bedrock_error(failure)
-    verbose_proxy_logger.error("Bedrock Realtime: provider stream failed: %s", _redact_string(str(error)))
+    verbose_proxy_logger.error("Bedrock Realtime: provider stream failed: %s", redact_string(str(error)))
     if scope.get(BEDROCK_REALTIME_SESSION_COMMITTED_SCOPE_KEY) is True:
-        scope[BEDROCK_REALTIME_COMMITTED_FAILURE_SCOPE_KEY] = _redact_string(str(error))
+        scope[BEDROCK_REALTIME_COMMITTED_FAILURE_SCOPE_KEY] = redact_string(str(error))
     raise error from failure
 
 
@@ -235,9 +235,16 @@ async def _ack_session_update(
 class BedrockRealtime(BaseAWSLLM):
     """Handler for Bedrock Nova Sonic realtime speech-to-speech API."""
 
-    def __init__(self, sdk_version_lookup: Callable[[], str | None] = _installed_sdk_version):
+    _MAX_BRIDGE_LOGGED_EVENTS = 5000
+
+    def __init__(
+        self,
+        sdk_version_lookup: Callable[[], str | None] = _installed_sdk_version,
+        forward_idle_timeout: float | None = None,
+    ):
         super().__init__()
         self._sdk_version_lookup: Final = sdk_version_lookup
+        self.forward_idle_timeout = forward_idle_timeout
 
     async def async_realtime(
         self,
@@ -395,7 +402,7 @@ class BedrockRealtime(BaseAWSLLM):
         if logged_events:
             GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
                 logging_obj.dispatch_success_handlers(
-                    list(logged_events),  # mutable-ok: realtime spend logging requires a list result
+                    list(logged_events),
                     prefer_async_handlers=True,
                 )
             )
@@ -422,12 +429,17 @@ class BedrockRealtime(BaseAWSLLM):
     ) -> _BridgeOutcome:
         """Run both forwarding directions until the client leaves or either side fails."""
         logged: Final[list[OpenAIRealtimeEvents]] = []  # mutable-ok: events forwarded before a failure are still spend
+        logged_dropped = 0
 
         async def collect_logged_events() -> None:
+            nonlocal logged_dropped
             async for event in self._forward_bedrock_to_client(
                 bedrock_stream, websocket, transformation_config, model, logging_obj, session_state
             ):
                 logged.append(event)
+                if len(logged) > BedrockRealtime._MAX_BRIDGE_LOGGED_EVENTS:
+                    del logged[0]
+                    logged_dropped += 1
 
         client_task: Final = asyncio.create_task(
             self._forward_client_to_bedrock(
@@ -443,6 +455,12 @@ class BedrockRealtime(BaseAWSLLM):
         client_task.cancel()
         bedrock_task.cancel()
         client_outcome, bedrock_outcome = await asyncio.gather(client_task, bedrock_task, return_exceptions=True)
+        if logged_dropped:
+            verbose_proxy_logger.warning(
+                "Bedrock Realtime bridge log over cap; dropped %d oldest event(s), retained %d",
+                logged_dropped,
+                len(logged),
+            )
 
         return _BridgeOutcome(
             logged_events=tuple(logged),
@@ -535,7 +553,17 @@ class BedrockRealtime(BaseAWSLLM):
 
         output: Final = await bedrock_stream.await_output()
         while True:
-            result = await output[1].receive()
+            if self.forward_idle_timeout is None:
+                result = await output[1].receive()
+            else:
+                try:
+                    result = await asyncio.wait_for(output[1].receive(), timeout=self.forward_idle_timeout)
+                except TimeoutError:
+                    verbose_proxy_logger.warning(
+                        "Bedrock Realtime output idle for %ss with no frame; ending bridge leg",
+                        self.forward_idle_timeout,
+                    )
+                    return
 
             if result is None:
                 verbose_proxy_logger.debug("Bedrock Realtime: Bedrock stream ended")

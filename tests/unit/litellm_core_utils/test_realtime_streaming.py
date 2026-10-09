@@ -1,11 +1,13 @@
 import asyncio
 import json
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass
-from typing import Final
+from types import SimpleNamespace
+from typing import Final, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from typing_extensions import ReadOnly, TypedDict
 from websockets.exceptions import ConnectionClosed
 from websockets.frames import Close
 
@@ -14,11 +16,13 @@ from litellm.constants import REALTIME_SESSION_FAILURE_LOGGED_KEY, REALTIME_SESS
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.litellm_core_utils.realtime_backend_connector import RealtimeBackendConnector
 from litellm.litellm_core_utils.realtime_streaming import (
+    BackendClose,
     RealTimeStreaming,
     client_sent_openai_beta_realtime_header,
 )
 from litellm.llms.xai.realtime.transformation import XAIRealtimeNormalizer
 from litellm.types.guardrails import GuardrailEventHooks
+from litellm.types.utils import GenericGuardrailAPIInputs
 
 
 def _make_transcript_event(text: str, item_id: str = "item_x") -> bytes:
@@ -74,6 +78,53 @@ def test_realtime_streaming_store_message():
     )
     streaming.store_message(other_msg)
     assert len(streaming.messages) == 2  # Should not store the new message
+
+
+def test_stored_messages_cap_drops_oldest_non_spend_events():
+    streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    streaming.logged_real_time_event_types = "*"
+    total = RealTimeStreaming._MAX_STORED_MESSAGES + 50
+    for i in range(total):
+        streaming.store_message(json.dumps({"type": "response.created", "event_id": f"e{i}"}))
+
+    assert len(streaming.messages) == RealTimeStreaming._MAX_STORED_MESSAGES
+    assert streaming._stored_messages_dropped == 50
+    assert streaming.messages[0]["event_id"] == "e50"
+    assert streaming.messages[-1]["event_id"] == f"e{total - 1}"
+
+
+def test_stored_messages_cap_pins_spend_critical_events():
+    streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    streaming.logged_real_time_event_types = "*"
+    for i in range(RealTimeStreaming._MAX_STORED_MESSAGES):
+        streaming.store_message(json.dumps({"type": "response.created", "event_id": f"e{i}"}))
+    for i in range(3):
+        streaming.store_message(
+            json.dumps({"type": "response.done", "event_id": f"done{i}", "response": {"output": []}})
+        )
+
+    done_ids = [m["event_id"] for m in streaming.messages if m["type"] == "response.done"]
+    assert done_ids == ["done0", "done1", "done2"]
+    assert len(streaming.messages) == RealTimeStreaming._MAX_STORED_MESSAGES
+    assert streaming._stored_messages_dropped == 3
+
+
+def test_stored_messages_under_cap_lose_nothing_for_spend():
+    streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    streaming.logged_real_time_event_types = "*"
+    for i in range(5):
+        streaming.store_message(
+            json.dumps(
+                {
+                    "type": "response.done",
+                    "event_id": f"done{i}",
+                    "response": {"output": [], "usage": {"total_tokens": 10}},
+                }
+            )
+        )
+
+    assert streaming._stored_messages_dropped == 0
+    assert len(streaming.messages) == 5
 
 
 def test_remap_beta_session_to_ga_normalizes_modalities_and_audio():
@@ -384,6 +435,111 @@ class TestXaiNativeResumptionReconnect:
 
         # Must not raise.
         streaming._observe_backend_event_for_native_resumption({"type": "conversation.created"})
+
+
+class TestReconnectOwnership:
+    """One reconnect per session: concurrent requests coalesce into a single
+    dial, and every socket a failed attempt opened is closed."""
+
+    def _make_streaming(self, send_side_effect=None):
+        client_ws = MagicMock()
+        client_ws.send_text = AsyncMock()
+        connector = MagicMock()
+        streaming = RealTimeStreaming(
+            client_ws,
+            AsyncMock(),
+            MagicMock(),
+            backend_connector=connector,
+        )
+        streaming._last_ga_session_update = json.dumps({"type": "session.update", "session": {}})
+        streaming._send_side_effect = send_side_effect
+        return streaming, connector
+
+    @pytest.mark.asyncio
+    async def test_failed_resume_send_closes_intermediate_sockets(self):
+        streaming, connector = self._make_streaming()
+        old_ws = streaming.backend_ws
+        new_sockets = [AsyncMock() for _ in range(3)]
+        for ws in new_sockets:
+            ws.send = AsyncMock(side_effect=RuntimeError("boom"))
+        connector.connect = AsyncMock(side_effect=new_sockets)
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            result = await streaming._reconnect_backend(reason="connection_closed")
+
+        assert result is False
+        assert streaming.backend_ws is old_ws
+        assert streaming._reconnecting_backend is False
+        for ws in new_sockets:
+            ws.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_reconnects_coalesce_into_one_dial(self):
+        streaming, connector = self._make_streaming()
+        release = asyncio.Event()
+        new_ws = AsyncMock()
+        new_ws.send = AsyncMock()
+
+        async def _connect_once():
+            await release.wait()
+            return new_ws
+
+        connector.connect = AsyncMock(side_effect=_connect_once)
+
+        first = asyncio.create_task(streaming._reconnect_backend(reason="connection_closed"))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(streaming._reconnect_backend(reason="client_session_update"))
+        await asyncio.sleep(0)
+        release.set()
+        assert await first is True
+        assert await second is True
+
+        assert connector.connect.await_count == 1
+        assert streaming.backend_ws is new_ws
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dial_resets_reconnect_flag(self):
+        streaming, connector = self._make_streaming()
+        connector.connect = AsyncMock(side_effect=asyncio.Event().wait)
+
+        task = asyncio.create_task(streaming._reconnect_backend(reason="connection_closed"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert streaming._reconnecting_backend is False
+
+
+class TestBackendIdleTimeout:
+    def _make_streaming(self, **kwargs):
+        async def _hang_forever(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        client_ws = MagicMock()
+        client_ws.send_text = AsyncMock()
+        backend_ws = AsyncMock()
+        backend_ws.recv = AsyncMock(side_effect=_hang_forever)
+        return RealTimeStreaming(client_ws, backend_ws, MagicMock(), **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_by_default_hung_recv_stays_pending(self):
+        streaming = self._make_streaming()
+        assert streaming.backend_idle_timeout is None
+
+        task = asyncio.create_task(streaming._recv_from_backend_reconnecting_on_drop())
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_raises_when_backend_silent(self):
+        streaming = self._make_streaming(backend_idle_timeout=0.05)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await streaming._recv_from_backend_reconnecting_on_drop()
 
 
 def test_remap_beta_session_to_ga_normalizes_nested_structures():
@@ -915,6 +1071,38 @@ def test_collect_user_input_from_session_update_instructions():
     assert streaming.input_messages[0]["content"] == "You are a helpful assistant."
 
 
+def test_repeated_session_update_keeps_only_latest_instructions():
+    streaming: Final = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    user_turn: Final = {
+        "type": "conversation.item.create",
+        "item": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+
+    streaming.store_input(json.dumps({"type": "session.update", "session": {"instructions": "v1"}}))
+    streaming.store_input(json.dumps(user_turn))
+    for version in ("v2", "v3"):
+        streaming.store_input(json.dumps({"type": "session.update", "session": {"instructions": version}}))
+
+    assert streaming.input_messages == [
+        {"role": "system", "content": "v3"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_audio_append_frames_skip_per_frame_pre_call_logging():
+    logging_obj: Final = MagicMock()
+    streaming: Final = RealTimeStreaming(MagicMock(), MagicMock(), logging_obj)
+    commit: Final = json.dumps({"type": "input_audio_buffer.commit"})
+
+    for _ in range(50):
+        streaming.store_input(json.dumps({"type": "input_audio_buffer.append", "audio": "AAAA"}))
+    streaming.store_input({"type": "input_audio_buffer.append", "audio": "AAAA"})
+    streaming.store_input(commit)
+    streaming.store_input("not json")
+
+    assert [c.kwargs["input"] for c in logging_obj.pre_call.call_args_list] == [commit, "not json"]
+
+
 def test_collect_user_input_from_transcription_event():
     """
     Test that conversation.item.input_audio_transcription.completed events
@@ -1134,14 +1322,13 @@ async def test_non_transcription_completed_event_still_triggers_response_create(
     assert any(e.get("type") == "response.create" for e in sent_to_backend)
 
 
-def test_client_session_update_marks_transcription_session():
-    """A client session.update with type=transcription flags the session."""
+def test_client_session_update_does_not_mark_transcription_session():
     streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
     assert streaming._is_transcription_session is False
     streaming._collect_user_input_from_client_event(
         json.dumps({"type": "session.update", "session": {"type": "transcription"}})
     )
-    assert streaming._is_transcription_session is True
+    assert streaming._is_transcription_session is False
 
 
 @pytest.mark.asyncio
@@ -2273,7 +2460,7 @@ async def test_provider_path_suppresses_duplicate_session_created_after_syntheti
         model="gemini-2.5-flash",
     )
     # Simulate synthetic session.created already sent by llm_http_handler.
-    streaming._session_created_sent_to_client = True
+    streaming.session_created_sent_to_client = True
 
     await streaming.backend_to_client_send_messages()
 
@@ -2325,7 +2512,7 @@ async def test_duplicate_session_created_still_triggers_guardrail_turn_detection
         model="gemini-2.5-flash",
     )
     # Synthetic session.created already sent by llm_http_handler.
-    streaming._session_created_sent_to_client = True
+    streaming.session_created_sent_to_client = True
     streaming._has_audio_transcription_guardrails = MagicMock(return_value=True)  # type: ignore[method-assign]
     streaming._send_to_backend = AsyncMock()  # type: ignore[method-assign]
 
@@ -2816,6 +3003,36 @@ async def test_deferred_setup_flush_retains_unsent_messages_after_send_failure()
 
 
 @pytest.mark.asyncio
+async def test_deferred_setup_flush_failure_reenforces_cap_with_tail_drop():
+    cap = RealTimeStreaming._MAX_BUFFERED_MESSAGES
+    client_ws = MagicMock()
+    backend_ws = MagicMock()
+    logging_obj = MagicMock()
+    streaming = RealTimeStreaming(client_ws, backend_ws, logging_obj)
+    old_messages = [json.dumps({"type": "response.create", "n": i}) for i in range(cap - 5)]
+    streaming._pending_messages_until_setup = list(old_messages)
+    streaming._sync_pending_messages_byte_total()
+
+    async def _fail_and_buffer_more(message):
+        for _ in range(10):
+            streaming._pending_messages_until_setup.append(json.dumps({"type": "response.create", "n": "new"}))
+        raise Exception("transient")
+
+    streaming._send_to_backend = AsyncMock(side_effect=_fail_and_buffer_more)  # type: ignore[method-assign]
+
+    assert await streaming._flush_pending_messages_until_setup() is False
+
+    assert len(streaming._pending_messages_until_setup) == cap
+    assert streaming._pending_messages_until_setup == old_messages + [
+        json.dumps({"type": "response.create", "n": "new"})
+    ] * 5
+    assert streaming._pending_messages_dropped == 5
+    assert streaming._pending_messages_byte_total == sum(
+        len(message.encode("utf-8")) for message in streaming._pending_messages_until_setup
+    )
+
+
+@pytest.mark.asyncio
 async def test_deferred_setup_flushes_audio_on_backend_session_created(monkeypatch):
     """Buffered audio is released when Gemini setupComplete becomes session.created."""
     monkeypatch.setattr(litellm, "gemini_live_defer_setup", True, raising=False)
@@ -3182,7 +3399,7 @@ def test_setup_folds_in_auto_response_disable_when_transcription_guardrail_activ
             }
         }
     )
-    out = json.loads(streaming._maybe_inject_guardrail_auto_response_disable(setup))
+    out = json.loads(streaming.maybe_inject_guardrail_auto_response_disable(setup))
     aad = out["setup"]["realtimeInputConfig"]["automaticActivityDetection"]
     assert aad["disabled"] is True
 
@@ -3193,7 +3410,7 @@ def test_setup_unchanged_without_transcription_guardrail(monkeypatch: pytest.Mon
     monkeypatch.setattr(litellm, "callbacks", [])
     streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
     setup = json.dumps({"setup": {"model": "x", "generationConfig": {"responseModalities": ["AUDIO"]}}})
-    out = streaming._maybe_inject_guardrail_auto_response_disable(setup)
+    out = streaming.maybe_inject_guardrail_auto_response_disable(setup)
     assert json.loads(out) == json.loads(setup)
 
 
@@ -3205,7 +3422,7 @@ def test_non_bidi_setup_left_untouched_for_followup_capable_providers(monkeypatc
     monkeypatch.setattr(litellm, "callbacks", [_transcription_guardrail()])
     streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
     msg = json.dumps({"type": "session.update", "session": {"instructions": "hi"}})
-    assert streaming._maybe_inject_guardrail_auto_response_disable(msg) == msg
+    assert streaming.maybe_inject_guardrail_auto_response_disable(msg) == msg
 
 
 @pytest.mark.asyncio
@@ -3444,6 +3661,21 @@ def test_transcript_accumulates_turns_and_interruptions():
         ("assistant", "Сейчас рас"),
         ("note", RealTimeStreaming._REPLAY_INTERRUPTED_NOTE),
     ]
+
+
+def test_transcript_chunks_cap_flushes_early_without_response_done():
+    streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    total = RealTimeStreaming._MAX_ASSISTANT_TRANSCRIPT_CHUNKS + 200
+    for i in range(total):
+        streaming._record_transcript_event(
+            {"type": "response.output_audio_transcript.delta", "delta": f"w{i} "}
+        )
+
+    assert len(streaming._assistant_transcript_chunks) <= RealTimeStreaming._MAX_ASSISTANT_TRANSCRIPT_CHUNKS
+    assert streaming._transcript_chunk_forced_flushes >= 1
+    replayed = "".join(e.text for e in streaming._transcript_entries if e.role == "assistant")
+    replayed += "".join(streaming._assistant_transcript_chunks)
+    assert replayed == "".join(f"w{i} " for i in range(total))
 
 
 @pytest.mark.asyncio
@@ -4254,6 +4486,7 @@ def _client_ws_that_never_sends() -> MagicMock:
 def _backend_ws_closing_with(*frames: bytes | Exception) -> MagicMock:
     backend_ws: Final = MagicMock()
     backend_ws.recv = AsyncMock(side_effect=list(frames))
+    backend_ws.close = AsyncMock()
     return backend_ws
 
 
@@ -4397,6 +4630,7 @@ async def test_upstream_closing_while_a_client_message_is_forwarded_still_reache
     backend_ws: Final = MagicMock()
     backend_ws.send = send_to_backend
     backend_ws.recv = recv_from_backend
+    backend_ws.close = AsyncMock()
     session: Final = _relay_session(client_ws, backend_ws)
 
     await session.run()
@@ -4413,6 +4647,7 @@ async def test_client_hanging_up_first_ends_the_session_without_a_relayed_close(
     client_ws.receive_text = AsyncMock(side_effect=RuntimeError("client went away"))
     backend_ws: Final = MagicMock()
     backend_ws.recv = AsyncMock(side_effect=_wait_forever)
+    backend_ws.close = AsyncMock()
     session: Final = _relay_session(client_ws, backend_ws)
 
     await session.run()
@@ -4428,6 +4663,7 @@ async def test_client_hanging_up_with_a_websockets_close_is_not_mistaken_for_the
     client_ws.receive_text = AsyncMock(side_effect=ConnectionClosed(None, None))
     backend_ws: Final = MagicMock()
     backend_ws.recv = AsyncMock(side_effect=_wait_forever)
+    backend_ws.close = AsyncMock()
     session: Final = _relay_session(client_ws, backend_ws)
 
     await session.run()
@@ -4619,3 +4855,464 @@ async def test_provider_bytes_are_sent_raw_after_pacing():
 
     assert [call.args[0] for call in backend_ws.send.await_args_list] == [b"\x00\x01", '{"type":"endStream"}']
     provider_config.pace_backend_send.assert_awaited_once_with(b"\x00\x01")
+
+
+@pytest.mark.asyncio
+async def test_bidirectional_forward_closes_backend_socket_opened_by_reconnect():
+    streaming, sockets, _, _ = _make_gemini_reconnect_streaming(
+        recv_sequences=[
+            [ConnectionClosed(None, None)],
+            [b'{"setupComplete": {}}', ConnectionClosed(None, None)],
+        ],
+        connector_outcomes=[1, ConnectionClosed(None, None), ConnectionClosed(None, None)],
+    )
+    streaming.websocket.receive_text = AsyncMock(side_effect=asyncio.Event().wait)
+
+    with patch.object(RealTimeStreaming, "_RECONNECT_BACKOFF_SECONDS", (0.0, 0.0, 0.0)):
+        await streaming.bidirectional_forward()
+
+    assert streaming.backend_ws is sockets[1]
+    sockets[0].close.assert_awaited()
+    sockets[1].close.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_closes_new_socket_when_resume_request_send_fails():
+    streaming, sockets, _, _ = _make_gemini_reconnect_streaming(
+        recv_sequences=[[], [], []],
+        connector_outcomes=[1, 2],
+    )
+    sockets[1].send = AsyncMock(side_effect=ConnectionClosed(None, None))
+
+    with patch.object(RealTimeStreaming, "_RECONNECT_BACKOFF_SECONDS", (0.0, 0.0)):
+        assert await streaming._reconnect_backend(reason="connection_closed") is True
+
+    sockets[1].close.assert_awaited_once()
+    sockets[2].close.assert_not_awaited()
+    assert streaming.backend_ws is sockets[2]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_closes_new_socket_when_cancelled_mid_resume():
+    streaming, sockets, _, _ = _make_gemini_reconnect_streaming(
+        recv_sequences=[[], []],
+        connector_outcomes=[1],
+    )
+    sockets[1].send = AsyncMock(side_effect=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await streaming._reconnect_backend(reason="go_away")
+
+    sockets[1].close.assert_awaited_once()
+    assert streaming.backend_ws is sockets[0]
+
+
+@pytest.mark.asyncio
+async def test_backend_relay_stops_once_client_socket_is_disconnected():
+    model_turn: Final = b'{"serverContent": {"modelTurn": {"parts": [{"text": "hi"}]}}}'
+    streaming, sockets, _, client_ws = _make_gemini_reconnect_streaming(
+        recv_sequences=[[model_turn] * 5],
+        connector_outcomes=[],
+    )
+    client_ws.application_state = SimpleNamespace(name="CONNECTED")
+
+    async def send_after_client_left(_data: str) -> None:
+        client_ws.application_state = SimpleNamespace(name="DISCONNECTED")
+        raise RuntimeError('Cannot call "send" once a close message has been sent.')
+
+    client_ws.send_text = AsyncMock(side_effect=send_after_client_left)
+
+    close: Final = await streaming.backend_to_client_send_messages()
+
+    assert close == BackendClose(code=1000, reason="client disconnected")
+    assert sockets[0].recv.await_count == 1
+    assert client_ws.send_text.await_count == 1
+
+
+def _baseline_streaming(provider_config=None):
+    client_ws = MagicMock()
+    client_ws.scope = {"headers": []}
+    client_ws.send_text = AsyncMock()
+    backend_ws = MagicMock()
+    backend_ws.send = AsyncMock()
+    logging_obj = MagicMock()
+    streaming = RealTimeStreaming(
+        client_ws, backend_ws, logging_obj, provider_config=provider_config
+    )
+    return streaming, client_ws, backend_ws
+
+
+async def test_send_to_backend_direct_path_forwards_message_verbatim_in_one_send():
+    streaming, _, backend_ws = _baseline_streaming()
+    message = json.dumps({"type": "input_audio_buffer.append", "audio": "QUJD"})
+
+    sent = await streaming._send_to_backend(message)
+
+    assert sent is True
+    assert backend_ws.send.await_count == 1
+    assert backend_ws.send.await_args.args[0] == message
+
+
+async def test_send_to_backend_delivers_transformed_messages_in_order():
+    provider_config = MagicMock()
+    frames = [
+        json.dumps({"type": "input_audio_buffer.append", "audio": "AAA"}),
+        json.dumps({"type": "input_audio_buffer.append", "audio": "BBB"}),
+        json.dumps({"type": "input_audio_buffer.commit"}),
+    ]
+    provider_config.transform_realtime_request = MagicMock(return_value=list(frames))
+    provider_config.is_setup_message = MagicMock(return_value=False)
+    provider_config.is_content_message = MagicMock(return_value=False)
+    streaming, _, backend_ws = _baseline_streaming(provider_config=provider_config)
+
+    sent = await streaming._send_to_backend(frames[0])
+
+    assert sent is True
+    assert [c.args[0] for c in backend_ws.send.await_args_list] == frames
+
+
+async def test_send_to_backend_failed_send_leaves_setup_state_untouched():
+    """Send first, mutate after: a failed send must not poison setup tracking,
+    or later session.update frames get dropped against a setup that never landed."""
+    provider_config = MagicMock()
+    message = json.dumps({"type": "input_audio_buffer.append", "audio": "QUJD"})
+    provider_config.transform_realtime_request = MagicMock(return_value=[message])
+    provider_config.is_setup_message = MagicMock(return_value=False)
+    provider_config.is_content_message = MagicMock(return_value=True)
+    streaming, _, backend_ws = _baseline_streaming(provider_config=provider_config)
+    backend_ws.send = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await streaming._send_to_backend(message)
+
+    assert streaming.session_configuration_request is None
+    assert streaming._content_sent_after_setup is False
+
+
+async def test_provider_config_message_response_created_adopts_returned_response_id():
+    provider_config = MagicMock()
+    provider_config.transform_realtime_response = MagicMock(
+        return_value={
+            "response": [{"type": "response.created", "response": {"id": "resp_123"}}],
+            "current_output_item_id": None,
+            "current_response_id": "resp_123",
+            "current_delta_chunks": [],
+            "current_conversation_id": None,
+            "current_item_chunks": [],
+            "current_delta_type": None,
+            "session_configuration_request": None,
+        }
+    )
+    streaming, client_ws, _ = _baseline_streaming(provider_config=provider_config)
+
+    await streaming._handle_provider_config_message("{}")
+
+    assert streaming.current_response_id == "resp_123"
+    assert client_ws.send_text.await_count == 1
+    sent = json.loads(client_ws.send_text.await_args.args[0])
+    assert sent["type"] == "response.created"
+
+
+async def test_provider_config_message_replaces_progress_state_wholesale():
+    """Progress state has a single owner: whatever the transform round-trip
+    returns replaces every current_* field, stale values never survive."""
+    provider_config = MagicMock()
+    provider_config.transform_realtime_response = MagicMock(
+        return_value={
+            "response": [{"type": "response.done", "response": {"id": "resp_new"}}],
+            "current_output_item_id": None,
+            "current_response_id": None,
+            "current_delta_chunks": [],
+            "current_conversation_id": None,
+            "current_item_chunks": [],
+            "current_delta_type": None,
+            "session_configuration_request": None,
+        }
+    )
+    streaming, _, _ = _baseline_streaming(provider_config=provider_config)
+    streaming.current_response_id = "resp_old"
+    streaming.current_delta_chunks = [{"type": "response.output_text.delta"}]
+    streaming.current_item_chunks = [{"type": "response.output_item.done"}]
+
+    await streaming._handle_provider_config_message("{}")
+
+    assert streaming.current_response_id is None
+    assert streaming.current_delta_chunks == []
+    assert streaming.current_item_chunks == []
+
+
+async def test_raw_backend_message_response_done_falls_through_to_store_and_forward():
+    """Without provider_config the bridge owns no turn state: response.done
+    is not consumed here, the relay loop stores and forwards it."""
+    streaming, _, _ = _baseline_streaming()
+    event = {"type": "response.done", "response": {"id": "resp_9", "status": "completed"}}
+
+    assert await streaming._handle_raw_backend_message(event, json.dumps(event)) is False
+
+
+_GA_TRANSCRIPTION_SESSION_UPDATE: Final = {
+    "type": "session.update",
+    "session": {
+        "type": "transcription",
+        "audio": {
+            "input": {
+                "format": {"type": "audio/pcm", "rate": 24000},
+                "transcription": {"model": "gpt-4o-transcribe", "language": "en"},
+            }
+        },
+    },
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_update_count", [0, 1])
+async def test_transcription_guardrail_leaves_client_transcription_session_update_untouched(
+    monkeypatch: pytest.MonkeyPatch, prior_update_count: int
+):
+    monkeypatch.setattr(litellm, "callbacks", [_transcription_guardrail()])
+    frames: Final = [json.dumps(_GA_TRANSCRIPTION_SESSION_UPDATE)] * (prior_update_count + 1)
+    client_ws: Final = _ga_client_ws()
+    client_ws.receive_text = AsyncMock(side_effect=[*frames, ConnectionClosed(None, None)])
+    backend_ws: Final = MagicMock()
+    backend_ws.send = AsyncMock()
+    streaming: Final = RealTimeStreaming(
+        client_ws, backend_ws, MagicMock(), force_transcription_model="gpt-4o-transcribe"
+    )
+
+    await streaming.client_ack_messages()
+
+    forwarded: Final = [json.loads(call.args[0]) for call in backend_ws.send.await_args_list]
+    assert forwarded == [_GA_TRANSCRIPTION_SESSION_UPDATE] * len(frames), forwarded
+
+
+@pytest.mark.asyncio
+async def test_client_declared_transcription_type_cannot_disable_guardrail_gate_on_voice_session(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(litellm, "callbacks", [_transcription_guardrail()])
+    re_enable: Final = {
+        "type": "session.update",
+        "session": {"type": "realtime", "audio": {"input": {"turn_detection": {"create_response": True}}}},
+    }
+    client_ws: Final = _ga_client_ws()
+    client_ws.receive_text = AsyncMock(
+        side_effect=[
+            json.dumps(_GA_TRANSCRIPTION_SESSION_UPDATE),
+            json.dumps(re_enable),
+            ConnectionClosed(None, None),
+        ]
+    )
+    backend_ws: Final = MagicMock()
+    backend_ws.send = AsyncMock()
+    streaming: Final = RealTimeStreaming(client_ws, backend_ws, MagicMock())
+
+    await streaming.client_ack_messages()
+
+    forwarded: Final = [json.loads(call.args[0]) for call in backend_ws.send.await_args_list]
+    assert streaming._is_transcription_session is False
+    assert forwarded[0]["session"]["audio"]["input"]["turn_detection"]["create_response"] is False, forwarded
+    assert forwarded[1]["session"]["audio"]["input"]["turn_detection"]["create_response"] is False, forwarded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uses_provider_config", [False, True])
+async def test_transcription_guardrail_sends_no_session_update_after_transcription_session_created(
+    monkeypatch: pytest.MonkeyPatch, uses_provider_config: bool
+):
+    monkeypatch.setattr(litellm, "callbacks", [_transcription_guardrail()])
+    session_created: Final = {"type": "session.created", "session": {"id": "sess_1", "object": "realtime.session"}}
+    provider_config: Final = MagicMock() if uses_provider_config else None
+    if provider_config is not None:
+        provider_config.requires_session_configuration.return_value = True
+        provider_config.transform_realtime_response.return_value = {
+            "response": session_created,
+            "current_output_item_id": None,
+            "current_response_id": None,
+            "current_delta_chunks": None,
+            "current_conversation_id": None,
+            "current_item_chunks": None,
+            "current_delta_type": None,
+            "session_configuration_request": None,
+        }
+        provider_config.transform_realtime_request.side_effect = lambda msg, model, session_config: [msg]
+    client_ws: Final = _ga_client_ws()
+    backend_ws: Final = MagicMock()
+    backend_ws.recv = AsyncMock(side_effect=[json.dumps(session_created).encode(), ConnectionClosed(None, None)])
+    backend_ws.send = AsyncMock()
+    streaming: Final = RealTimeStreaming(
+        client_ws,
+        backend_ws,
+        MagicMock(),
+        provider_config=provider_config,
+        model="gpt-4o-transcribe",
+        force_transcription_model="gpt-4o-transcribe",
+    )
+
+    await streaming.backend_to_client_send_messages()
+
+    sent_to_client: Final = [json.loads(call.args[0]) for call in client_ws.send_text.await_args_list]
+    assert [event["type"] for event in sent_to_client] == ["session.created"], sent_to_client
+    backend_ws.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_transcription_session_created_flags_session_without_intent(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(litellm, "callbacks", [_transcription_guardrail()])
+    session_created: Final = {"type": "session.created", "session": {"id": "sess_1", "type": "transcription"}}
+    provider_config: Final = MagicMock()
+    provider_config.requires_session_configuration.return_value = False
+    provider_config.transform_realtime_response.return_value = {
+        "response": session_created,
+        "current_output_item_id": None,
+        "current_response_id": None,
+        "current_delta_chunks": None,
+        "current_conversation_id": None,
+        "current_item_chunks": None,
+        "current_delta_type": None,
+        "session_configuration_request": None,
+    }
+    client_ws: Final = _ga_client_ws()
+    backend_ws: Final = MagicMock()
+    backend_ws.recv = AsyncMock(side_effect=[json.dumps(session_created).encode(), ConnectionClosed(None, None)])
+    backend_ws.send = AsyncMock()
+    streaming: Final = RealTimeStreaming(client_ws, backend_ws, MagicMock(), provider_config=provider_config, model="m")
+
+    await streaming.backend_to_client_send_messages()
+
+    assert streaming._is_transcription_session is True
+    sent_to_client: Final = [json.loads(call.args[0]) for call in client_ws.send_text.await_args_list]
+    assert [event["type"] for event in sent_to_client] == ["session.created"], sent_to_client
+    backend_ws.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transcription_guardrail_still_disables_auto_response_on_realtime_session_update(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(litellm, "callbacks", [_transcription_guardrail()])
+    client_ws: Final = _ga_client_ws()
+    client_ws.receive_text = AsyncMock(
+        side_effect=[
+            json.dumps({"type": "session.update", "session": {"type": "realtime", "instructions": "hi"}}),
+            ConnectionClosed(None, None),
+        ]
+    )
+    backend_ws: Final = MagicMock()
+    backend_ws.send = AsyncMock()
+    streaming: Final = RealTimeStreaming(client_ws, backend_ws, MagicMock())
+
+    await streaming.client_ack_messages()
+
+    forwarded: Final = json.loads(backend_ws.send.await_args.args[0])
+    assert forwarded["session"]["audio"]["input"]["turn_detection"]["create_response"] is False, forwarded
+
+
+class _ViolationSettings(TypedDict, total=False):
+    on_violation: ReadOnly[str]
+    end_session_after_n_fails: ReadOnly[int]
+
+
+def _passthrough_transcription_config() -> MagicMock:
+    def transform_response(
+        message: str | bytes,
+        model: str,
+        logging_obj: object,
+        realtime_response_transform_input: object,
+    ) -> dict[str, object]:
+        return {
+            "response": json.loads(message),
+            "current_output_item_id": None,
+            "current_response_id": None,
+            "current_delta_chunks": None,
+            "current_conversation_id": None,
+            "current_item_chunks": None,
+            "current_delta_type": None,
+            "session_configuration_request": None,
+        }
+
+    def transform_request(message: str, model: str, session_configuration_request: str | None = None) -> list[str]:
+        return [message]
+
+    provider_config: Final = MagicMock()
+    provider_config.requires_session_configuration.return_value = False
+    provider_config.transform_realtime_response.side_effect = transform_response
+    provider_config.transform_realtime_request.side_effect = transform_request
+    return provider_config
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uses_provider_config", [False, True])
+@pytest.mark.parametrize(
+    ("violation_settings", "expect_session_closed"),
+    [
+        ({}, False),
+        ({"on_violation": "end_session"}, True),
+        ({"end_session_after_n_fails": 1}, True),
+    ],
+)
+async def test_transcription_session_guardrail_block_only_reports_violation(
+    monkeypatch: pytest.MonkeyPatch,
+    uses_provider_config: bool,
+    violation_settings: _ViolationSettings,
+    expect_session_closed: bool,
+) -> None:
+    class BlockingGuardrail(CustomGuardrail):
+        async def apply_guardrail(
+            self,
+            inputs: GenericGuardrailAPIInputs,
+            request_data: Mapping[str, object],
+            input_type: Literal["request", "response"],
+            logging_obj: object | None = None,
+        ) -> GenericGuardrailAPIInputs:
+            if any("blocked" in text for text in inputs.get("texts", [])):
+                raise ValueError("blocked transcript")
+            return inputs
+
+    monkeypatch.setattr(
+        litellm,
+        "callbacks",
+        [
+            BlockingGuardrail(
+                guardrail_name="transcription-blocker",
+                event_hook=GuardrailEventHooks.realtime_input_transcription,
+                default_on=True,
+                **violation_settings,
+            )
+        ],
+    )
+    completed_type: Final = "conversation.item.input_audio_transcription.completed"
+    client_ws: Final = MagicMock()
+    client_ws.send_text = AsyncMock()
+    backend_ws: Final = MagicMock()
+    blocked_event: Final = _make_transcript_event("a blocked transcript", item_id="item_1")
+    follow_up_events: Final = (
+        () if expect_session_closed else (_make_transcript_event("a clean follow-up", item_id="item_2"),)
+    )
+    backend_ws.recv = AsyncMock(side_effect=[blocked_event, *follow_up_events, ConnectionClosed(None, None)])
+    backend_ws.send = AsyncMock()
+    backend_ws.close = AsyncMock()
+    streaming: Final = RealTimeStreaming(
+        client_ws,
+        backend_ws,
+        MagicMock(),
+        provider_config=_passthrough_transcription_config() if uses_provider_config else None,
+        model="gpt-4o-transcribe",
+        force_transcription_model="gpt-4o-transcribe",
+    )
+
+    await streaming.backend_to_client_send_messages()
+
+    sent_to_client: Final = [json.loads(call.args[0]) for call in client_ws.send_text.await_args_list]
+    expected_follow_up: Final = () if expect_session_closed else ((completed_type, "a clean follow-up"),)
+    assert [(event["type"], event.get("transcript")) for event in sent_to_client] == [
+        (completed_type, "a blocked transcript"),
+        ("error", None),
+        *expected_follow_up,
+    ], sent_to_client
+    assert sent_to_client[1]["error"]["type"] == "guardrail_violation", sent_to_client
+    assert streaming._violation_count == 1
+    sent_to_backend: Final = [call.args[0] for call in backend_ws.send.await_args_list]
+    assert sent_to_backend == [], sent_to_backend
+    assert backend_ws.close.await_count == (1 if expect_session_closed else 0)
