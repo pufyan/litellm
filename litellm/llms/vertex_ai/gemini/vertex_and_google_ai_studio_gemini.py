@@ -293,8 +293,12 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         )
         if not model_name or is_vertex_fine_tuned_model or model_name.startswith("gemma-"):
             return False
-        # Pre-Gemini 3 models: gemini-1.x, gemini-2.x, gemini-pro, gemini-flash, gemini-exp
-        if re.match(r"^gemini-(?:[12](?:\.\d+)?|exp|(?:pro|flash)(?!-(?:lite-)?latest$))(?:-|$)", model_name):
+        # Pre-Gemini 3 models: gemini-1.x, gemini-2.x, gemini-live-1.x/2.x,
+        # gemini-pro, gemini-flash, gemini-exp
+        if re.match(
+            r"^gemini-(?:[12](?:\.\d+)?|live-[12](?:\.\d+)?|exp|(?:pro|flash)(?!-(?:lite-)?latest$))(?:-|$)",
+            model_name,
+        ):
             return False
         return True
 

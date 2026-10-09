@@ -31,6 +31,7 @@ matching the granularity of the other shutdown primitives.
 import asyncio
 import os
 import signal
+import time
 from typing import TYPE_CHECKING, Callable
 
 from litellm._logging import verbose_proxy_logger
@@ -52,17 +53,21 @@ class RealtimeSessionRegistry:
     """
 
     _sessions: "frozenset[RealTimeStreaming]" = frozenset()
+    _registered_at: "dict[int, float]" = {}
+    _orphan_reaps: int = 0
     _draining: bool = False
     _prev_handlers: "dict[int, Callable[[], None]]" = {}
 
     @classmethod
     def register(cls, session: "RealTimeStreaming") -> None:
         cls._sessions = cls._sessions | {session}
+        cls._registered_at.setdefault(id(session), time.monotonic())
         verbose_proxy_logger.debug("realtime_session_registered active_sessions=%s", len(cls._sessions))
 
     @classmethod
     def unregister(cls, session: "RealTimeStreaming") -> None:
         cls._sessions = cls._sessions - {session}
+        cls._registered_at.pop(id(session), None)
         verbose_proxy_logger.debug("realtime_session_unregistered active_sessions=%s", len(cls._sessions))
 
     @classmethod
@@ -208,5 +213,32 @@ class RealtimeSessionRegistry:
     @classmethod
     def reset(cls) -> None:
         cls._sessions = frozenset()
+        cls._registered_at = {}
+        cls._orphan_reaps = 0
         cls._draining = False
         cls._prev_handlers = {}
+
+    @classmethod
+    async def reap_orphans(cls, max_age_seconds: float) -> int:
+        """Force-close sessions registered longer than `max_age_seconds`.
+
+        Opt-in safety net for pump tasks lost before `finally` runs their
+        `unregister`: with the default (never called) behaviour is unchanged.
+        Reaped sessions stay registered until their own pump exits and
+        unregisters them; only the close is forced here.
+        """
+        now = time.monotonic()
+        stale = [s for s in cls._sessions if now - cls._registered_at.get(id(s), now) > max_age_seconds]
+        if not stale:
+            return 0
+        results = await asyncio.gather(*(s.shutdown_close() for s in stale), return_exceptions=True)
+        failures = tuple(r for r in results if isinstance(r, BaseException))
+        for failure in failures:
+            verbose_proxy_logger.debug("realtime orphan-reap close failed: %s", failure)
+        cls._orphan_reaps += len(stale)
+        verbose_proxy_logger.info(
+            "realtime_orphans_reaped sessions=%s failures=%s",
+            len(stale),
+            len(failures),
+        )
+        return len(stale)

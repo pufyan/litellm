@@ -206,18 +206,26 @@ class RealTimeStreaming:
         event_normalizer: RealtimeEventNormalizer | None = None,
         backend_connector: RealtimeBackendConnector | None = None,
         logging_worker: _LoggingWorker = GLOBAL_LOGGING_WORKER,
+        backend_idle_timeout: float | None = None,
     ):
         self.websocket: _ClientWebSocket = websocket
         self.backend_ws = backend_ws
         self.backend_connector = backend_connector
+        self.backend_idle_timeout = backend_idle_timeout
         self.logging_obj = logging_obj
         self._logging_worker = logging_worker
         self.messages: list[OpenAIRealtimeEvents] = []
+        self._stored_messages_byte_total: int = 0
+        self._stored_messages_dropped: int = 0
         self._backend_sent_frames: bool = False
         self.input_message: dict = {}
         self.input_messages: list[dict[str, str]] = []
+        self._input_messages_byte_total: int = 0
+        self._input_messages_dropped: int = 0
         self.session_tools: list[dict] = []
         self.tool_calls: list[dict] = []
+        self._tool_calls_byte_total: int = 0
+        self._tool_calls_dropped: int = 0
 
         # Detect whether the client is explicitly opting into the beta protocol.
         self._client_wants_beta = self.detect_beta_header(websocket)
@@ -258,6 +266,7 @@ class RealTimeStreaming:
         self._flushing_pending_messages_until_setup: bool = False
         self._pending_messages_until_setup: list[str] = []
         self._pending_messages_byte_total: int = 0
+        self._pending_messages_dropped: int = 0
         # Gemini Live rejects a follow-up BidiGenerateContentSetup once any
         # content (realtimeInput / clientContent / toolResponse) has been sent.
         self._content_sent_after_setup: bool = False
@@ -275,6 +284,9 @@ class RealTimeStreaming:
         # are buffered while True).
         self._resumption_state: Optional[RealtimeResumptionState] = None
         self._reconnecting_backend: bool = False
+        self._reconnect_lock: asyncio.Lock = asyncio.Lock()
+        self._reconnect_generation: int = 0
+        self._reconnect_last_ok: bool = False
         self._reconnect_resumed_mode: str = "fresh"
         # Guards against a reconnect loop when the backend keeps closing the
         # *new* socket for a logical reason (e.g. an invalid `voice` in the
@@ -290,6 +302,8 @@ class RealTimeStreaming:
         # reconnect: user/assistant turns plus service notes such as barge-ins.
         self._transcript_entries: list[RealtimeTranscriptEntry] = []
         self._assistant_transcript_chunks: list[str] = []
+        self._assistant_transcript_chunk_bytes: int = 0
+        self._transcript_chunk_forced_flushes: int = 0
         self._shutting_down: bool = False
 
     @property
@@ -317,6 +331,20 @@ class RealTimeStreaming:
     _RECONNECT_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
     _MAX_CONSECUTIVE_IMMEDIATE_RECONNECT_CLOSES: int = 3
     _MAX_TRANSCRIPT_ENTRIES: int = 200
+    _MAX_ASSISTANT_TRANSCRIPT_CHUNKS: int = 1000
+    _MAX_ASSISTANT_TRANSCRIPT_CHUNK_BYTES: int = 1024 * 1024
+    _MAX_STORED_MESSAGES: int = 2000
+    _MAX_STORED_MESSAGE_BYTES: int = 20 * 1024 * 1024
+    _MAX_INPUT_MESSAGES: int = 1000
+    _MAX_INPUT_MESSAGE_BYTES: int = 5 * 1024 * 1024
+    _MAX_TOOL_CALLS: int = 500
+    _MAX_TOOL_CALL_BYTES: int = 2 * 1024 * 1024
+    _SPEND_CRITICAL_MESSAGE_TYPES = frozenset(
+        [
+            "response.done",
+            "conversation.item.input_audio_transcription.completed",
+        ]
+    )
     _REPLAY_RESTORED_NOTE = (
         "[note: the connection dropped mid-call; the voice-call transcript so far is restored below]"
     )
@@ -385,8 +413,82 @@ class RealTimeStreaming:
         except Exception as e:
             verbose_logger.debug("Error parsing message for logging: %s", e)
             self.messages.append(message_obj)
+            self._track_stored_message(message_obj)
             return
         self.messages.append(typed_obj)
+        self._track_stored_message(typed_obj)
+
+    @staticmethod
+    def _logged_event_byte_size(obj: object) -> int:
+        try:
+            return len(json.dumps(obj, default=str).encode("utf-8"))
+        except (TypeError, ValueError):
+            return len(str(obj).encode("utf-8"))
+
+    def _track_stored_message(self, obj: object) -> None:
+        self._stored_messages_byte_total += RealTimeStreaming._logged_event_byte_size(obj)
+        self._enforce_stored_messages_cap()
+
+    def _oldest_droppable_message_index(self) -> int:
+        for idx, stored in enumerate(self.messages):
+            try:
+                msg_type = stored.get("type", "")  # type: ignore[union-attr]
+            except (AttributeError, TypeError):
+                return idx
+            if msg_type not in RealTimeStreaming._SPEND_CRITICAL_MESSAGE_TYPES:
+                return idx
+        return 0
+
+    def _enforce_stored_messages_cap(self) -> None:
+        dropped_this_call = 0
+        while (
+            len(self.messages) > RealTimeStreaming._MAX_STORED_MESSAGES
+            or self._stored_messages_byte_total > RealTimeStreaming._MAX_STORED_MESSAGE_BYTES
+        ) and self.messages:
+            dropped = self.messages.pop(self._oldest_droppable_message_index())
+            self._stored_messages_byte_total -= RealTimeStreaming._logged_event_byte_size(dropped)
+            self._stored_messages_dropped += 1
+            dropped_this_call += 1
+        if dropped_this_call:
+            verbose_logger.debug(
+                "Stored realtime log over cap; dropped %d oldest non-spend event(s), retained %d",
+                dropped_this_call,
+                len(self.messages),
+            )
+
+    def _enforce_input_messages_cap(self) -> None:
+        dropped_this_call = 0
+        while (
+            len(self.input_messages) > RealTimeStreaming._MAX_INPUT_MESSAGES
+            or self._input_messages_byte_total > RealTimeStreaming._MAX_INPUT_MESSAGE_BYTES
+        ) and self.input_messages:
+            dropped = self.input_messages.pop(0)
+            self._input_messages_byte_total -= RealTimeStreaming._logged_event_byte_size(dropped)
+            self._input_messages_dropped += 1
+            dropped_this_call += 1
+        if dropped_this_call:
+            verbose_logger.debug(
+                "Stored realtime input log over cap; dropped %d oldest entrie(s), retained %d",
+                dropped_this_call,
+                len(self.input_messages),
+            )
+
+    def _enforce_tool_calls_cap(self) -> None:
+        dropped_this_call = 0
+        while (
+            len(self.tool_calls) > RealTimeStreaming._MAX_TOOL_CALLS
+            or self._tool_calls_byte_total > RealTimeStreaming._MAX_TOOL_CALL_BYTES
+        ) and self.tool_calls:
+            dropped = self.tool_calls.pop(0)
+            self._tool_calls_byte_total -= RealTimeStreaming._logged_event_byte_size(dropped)
+            self._tool_calls_dropped += 1
+            dropped_this_call += 1
+        if dropped_this_call:
+            verbose_logger.debug(
+                "Stored realtime tool calls over cap; dropped %d oldest entrie(s), retained %d",
+                dropped_this_call,
+                len(self.tool_calls),
+            )
 
     def _collect_user_input_from_client_event(self, message: str | dict) -> None:
         """Extract user text content from client WebSocket events for spend logging."""
@@ -408,7 +510,12 @@ class RealTimeStreaming:
                         if isinstance(content, dict) and content.get("type") == "input_text":
                             text = content.get("text", "")
                             if text:
-                                self.input_messages.append({"role": "user", "content": text})
+                                entry: Final = {"role": "user", "content": text}
+                                self.input_messages.append(entry)
+                                self._input_messages_byte_total += RealTimeStreaming._logged_event_byte_size(
+                                    entry
+                                )
+                                self._enforce_input_messages_cap()
             elif msg_type == "session.update":
                 session: Final = msg_obj.get("session", {})
                 instructions: Final = session.get("instructions", "")
@@ -417,6 +524,10 @@ class RealTimeStreaming:
                         {"role": "system", "content": instructions},
                         *(m for m in self.input_messages if m.get("role") != "system"),
                     ]
+                    self._input_messages_byte_total = sum(
+                        RealTimeStreaming._logged_event_byte_size(m) for m in self.input_messages
+                    )
+                    self._enforce_input_messages_cap()
                 tools: Final = session.get("tools")
                 if tools and isinstance(tools, list):
                     self.session_tools = tools
@@ -431,7 +542,12 @@ class RealTimeStreaming:
             if event_type == "conversation.item.input_audio_transcription.completed":
                 transcript: Final = cast(str, event_obj.get("transcript", ""))
                 if transcript:
-                    self.input_messages.append({"role": "user", "content": transcript})
+                    backend_entry = {"role": "user", "content": transcript}
+                    self.input_messages.append(backend_entry)
+                    self._input_messages_byte_total += RealTimeStreaming._logged_event_byte_size(
+                        backend_entry
+                    )
+                    self._enforce_input_messages_cap()
         except (AttributeError, TypeError):
             pass
 
@@ -468,15 +584,15 @@ class RealTimeStreaming:
             # logs all realtime events), don't append a second copy.
             if self._should_store_message(event_obj):
                 return
-            self.messages.append(
-                cast(
-                    OpenAIRealtimeEvents,
-                    {
-                        "type": "conversation.item.input_audio_transcription.completed",
-                        "usage": usage,
-                    },
-                )
+            usage_event = cast(
+                OpenAIRealtimeEvents,
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "usage": usage,
+                },
             )
+            self.messages.append(usage_event)
+            self._track_stored_message(usage_event)
         except (AttributeError, TypeError):
             pass
 
@@ -507,16 +623,17 @@ class RealTimeStreaming:
             item: Mapping[str, object]
             for item in response.get("output", []):
                 if item.get("type") == "function_call":
-                    self.tool_calls.append(
-                        {
-                            "id": item.get("call_id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": item.get("name", ""),
-                                "arguments": item.get("arguments", "{}"),
-                            },
-                        }
-                    )
+                    tool_entry = {
+                        "id": item.get("call_id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", "{}"),
+                        },
+                    }
+                    self.tool_calls.append(tool_entry)
+                    self._tool_calls_byte_total += RealTimeStreaming._logged_event_byte_size(tool_entry)
+                    self._enforce_tool_calls_cap()
         except (AttributeError, TypeError):
             pass
 
@@ -807,13 +924,30 @@ class RealTimeStreaming:
                 self._pending_messages_byte_total = sum(
                     len(msg.encode("utf-8")) for msg in self._pending_messages_until_setup
                 )
+                self._enforce_pending_messages_cap()
                 verbose_logger.debug(
-                    "Failed to flush buffered client message after setup: %s (%d buffered message(s) retained)",
+                    "Failed to flush buffered client message after setup: %s (%d buffered message(s) retained, %d dropped)",
                     e,
-                    len(unsent),
+                    len(self._pending_messages_until_setup),
+                    self._pending_messages_dropped,
                 )
                 return False
         return True
+
+    def _enforce_pending_messages_cap(self) -> None:
+        while (
+            len(self._pending_messages_until_setup) > RealTimeStreaming._MAX_BUFFERED_MESSAGES
+            or self._pending_messages_byte_total > RealTimeStreaming._MAX_BUFFERED_BYTES
+        ) and self._pending_messages_until_setup:
+            dropped = self._pending_messages_until_setup.pop()
+            self._pending_messages_byte_total -= len(dropped.encode("utf-8"))
+            self._pending_messages_dropped += 1
+        if self._pending_messages_dropped:
+            verbose_logger.warning(
+                "Pre-setup buffer over cap after reconnect; dropped %d newest frame(s), retained %d",
+                self._pending_messages_dropped,
+                len(self._pending_messages_until_setup),
+            )
 
     def _supports_backend_reconnect(self) -> bool:
         if self.backend_connector is None:
@@ -841,12 +975,25 @@ class RealTimeStreaming:
         buffered and flushed once the new backend acknowledges setup. Returns
         False when every attempt failed (caller should tear the session down).
         """
+        if self.backend_connector is None:
+            return False
+        if self._reconnect_lock.locked():
+            async with self._reconnect_lock:
+                if self._reconnect_generation > 0 and self._reconnect_last_ok:
+                    return True
+        async with self._reconnect_lock:
+            try:
+                return await self._reconnect_backend_locked(reason)
+            finally:
+                self._reconnect_generation += 1
+
+    async def _reconnect_backend_locked(self, reason: str) -> bool:
+        """Dial-and-resume attempts. Caller holds `_reconnect_lock`."""
         from httpx import URL
         import websockets.exceptions
 
-        if self.backend_connector is None:
-            return False
         self._reconnecting_backend = True
+        self._reconnect_last_ok = False
         await self._send_litellm_session_event({"type": "litellm.session.reconnecting", "reason": reason})
         state = self._resumption_state
         native_resume_connector: Optional[RealtimeBackendConnector] = None
@@ -866,44 +1013,55 @@ class RealTimeStreaming:
                     str(URL(self.backend_connector.url).copy_merge_params(dict(resume_params)))
                 )
         old_ws = self.backend_ws
-        for attempt, delay in enumerate(self._RECONNECT_BACKOFF_SECONDS, start=1):
-            try:
-                connector = native_resume_connector or self.backend_connector
-                new_ws = await connector.connect()
-                if resume_request is not None:
-                    verbose_logger.debug(
-                        "Realtime: sending resume/setup request on reconnected backend socket "
-                        "(reason=%s, attempt=%d): %s",
-                        reason,
-                        attempt,
-                        resume_request,
-                    )
-                    try:
+        try:
+            for attempt, delay in enumerate(self._RECONNECT_BACKOFF_SECONDS, start=1):
+                new_ws = None
+                try:
+                    connector = native_resume_connector or self.backend_connector
+                    new_ws = await connector.connect()
+                    if resume_request is not None:
+                        verbose_logger.debug(
+                            "Realtime: sending resume/setup request on reconnected backend socket "
+                            "(reason=%s, attempt=%d): %s",
+                            reason,
+                            attempt,
+                            resume_request,
+                        )
                         await new_ws.send(resume_request)
-                    except BaseException:
+                    self.backend_ws = new_ws
+                    new_ws = None
+                    if native_resume_connector is not None:
+                        self.backend_connector = native_resume_connector
+                        self._reconnect_resumed_mode = "native"
+                    else:
+                        self._reconnect_resumed_mode = (
+                            "native" if (state is not None and state.resumable) else "fresh"
+                        )
+                    await self._close_backend_socket_quietly(old_ws)
+                    verbose_logger.info(
+                        "Realtime backend reconnected (attempt %d, reason=%s, resumed=%s)",
+                        attempt,
+                        reason,
+                        self._reconnect_resumed_mode,
+                    )
+                    self._reconnect_last_ok = True
+                    return True
+                except (TimeoutError, OSError, RuntimeError, websockets.exceptions.WebSocketException) as e:
+                    verbose_logger.warning(
+                        "Realtime backend reconnect attempt %d failed (%s); retrying in %.1fs",
+                        attempt,
+                        e,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                finally:
+                    if new_ws is not None:
                         await self._close_backend_socket_quietly(new_ws)
-                        raise
-                self.backend_ws = new_ws
-                if native_resume_connector is not None:
-                    self.backend_connector = native_resume_connector
-                    self._reconnect_resumed_mode = "native"
-                else:
-                    self._reconnect_resumed_mode = "native" if (state is not None and state.resumable) else "fresh"
-                await self._close_backend_socket_quietly(old_ws)
-                verbose_logger.info(
-                    "Realtime backend reconnected (attempt %d, reason=%s, resumed=%s)",
-                    attempt,
-                    reason,
-                    self._reconnect_resumed_mode,
-                )
-                return True
-            except (TimeoutError, OSError, RuntimeError, websockets.exceptions.WebSocketException) as e:
-                verbose_logger.warning(
-                    "Realtime backend reconnect attempt %d failed (%s); retrying in %.1fs", attempt, e, delay
-                )
-                await asyncio.sleep(delay)
-        self._reconnecting_backend = False
-        return False
+            self._reconnecting_backend = False
+            return False
+        except BaseException:
+            self._reconnecting_backend = False
+            raise
 
     @staticmethod
     async def _close_backend_socket_quietly(ws: CLIENT_CONNECTION_CLASS | RealtimeBackend) -> None:
@@ -923,8 +1081,22 @@ class RealTimeStreaming:
         if self._assistant_transcript_chunks:
             self._append_transcript_entry("assistant", "".join(self._assistant_transcript_chunks))
             self._assistant_transcript_chunks = []
+            self._assistant_transcript_chunk_bytes = 0
         if interrupted:
             self._append_transcript_entry("note", self._REPLAY_INTERRUPTED_NOTE)
+
+    def _enforce_assistant_transcript_chunks_cap(self) -> None:
+        if (
+            len(self._assistant_transcript_chunks) > RealTimeStreaming._MAX_ASSISTANT_TRANSCRIPT_CHUNKS
+            or self._assistant_transcript_chunk_bytes
+            > RealTimeStreaming._MAX_ASSISTANT_TRANSCRIPT_CHUNK_BYTES
+        ):
+            self._flush_assistant_transcript()
+            self._transcript_chunk_forced_flushes += 1
+            verbose_logger.debug(
+                "Assistant transcript chunks over cap without response.done; flushed early (%d total)",
+                self._transcript_chunk_forced_flushes,
+            )
 
     def _record_transcript_event(self, event: object) -> None:
         if not isinstance(event, dict):
@@ -937,6 +1109,8 @@ class RealTimeStreaming:
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
                 self._assistant_transcript_chunks.append(delta)
+                self._assistant_transcript_chunk_bytes += len(delta.encode("utf-8"))
+                self._enforce_assistant_transcript_chunks_cap()
         elif event_type == "input_audio_buffer.speech_started":
             self._flush_assistant_transcript(interrupted=bool(self._assistant_transcript_chunks))
         elif event_type == "response.done":
@@ -1488,16 +1662,29 @@ class RealTimeStreaming:
 
         try:
             try:
-                response = await self.backend_ws.recv(decode=False)  # type: ignore[union-attr]
+                recv_coro = self.backend_ws.recv(decode=False)  # type: ignore[union-attr]
             except TypeError:
-                response = await self.backend_ws.recv()  # type: ignore[union-attr]
+                recv_coro = self.backend_ws.recv()  # type: ignore[union-attr]
+            if self.backend_idle_timeout is None:
+                response = await recv_coro
+            else:
+                response = await asyncio.wait_for(recv_coro, timeout=self.backend_idle_timeout)
             self._consecutive_immediate_reconnect_closes = 0
             return response
-        except websockets.exceptions.ConnectionClosed as e:
-            rcvd = getattr(e, "rcvd", None)
-            close_code = getattr(rcvd, "code", None) if rcvd is not None else getattr(e, "code", None)
-            close_reason = getattr(rcvd, "reason", None) if rcvd is not None else getattr(e, "reason", None)
-            verbose_logger.warning("Realtime backend closed by provider: code=%s reason=%r", close_code, close_reason)
+        except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
+            if isinstance(e, asyncio.TimeoutError):
+                verbose_logger.warning(
+                    "Realtime backend idle for %ss with no frame; treating as a drop",
+                    self.backend_idle_timeout,
+                )
+                close_code, close_reason = None, "backend idle timeout"
+            else:
+                rcvd = getattr(e, "rcvd", None)
+                close_code = getattr(rcvd, "code", None) if rcvd is not None else getattr(e, "code", None)
+                close_reason = getattr(rcvd, "reason", None) if rcvd is not None else getattr(e, "reason", None)
+                verbose_logger.warning(
+                    "Realtime backend closed by provider: code=%s reason=%r", close_code, close_reason
+                )
             verbose_logger.debug(
                 "Realtime: provider_config diagnostic state at close: turn_closed_by_interrupt=%s",
                 getattr(self.provider_config, "_turn_closed_by_interrupt", "n/a"),
@@ -1680,7 +1867,13 @@ class RealTimeStreaming:
         # the nested `audio` block and the renamed keys `output_modalities` /
         # `max_output_tokens` — are silently dropped per the contract; the
         # proxy derives the GA form itself from the canonical fields.
-        session.pop("audio", None)
+        # Exception: transcription session updates carry their model only in
+        # the nested `audio.input.transcription` block (there are no flat
+        # canonical audio fields for transcription sessions), so dropping it
+        # would forward a model-less bare update the backend rejects. Their
+        # nested audio is preserved and normalized in place instead.
+        if session.get("type") != "transcription":
+            session.pop("audio", None)
         session.pop("output_modalities", None)
         session.pop("max_output_tokens", None)
 
@@ -2251,6 +2444,8 @@ class RealTimeStreaming:
         RealtimeSessionRegistry.register(self)
         forward_task: Final = asyncio.create_task(self.backend_to_client_send_messages())
         client_task: Final = asyncio.create_task(self.client_ack_messages())
+        forward_task.add_done_callback(lambda _: RealtimeSessionRegistry.unregister(self))
+        client_task.add_done_callback(lambda _: RealtimeSessionRegistry.unregister(self))
         try:
             await asyncio.wait((forward_task, client_task), return_when=asyncio.FIRST_COMPLETED)
             if client_task.done() and client_task.result() is ClientLoopExit.CLIENT_DISCONNECTED:

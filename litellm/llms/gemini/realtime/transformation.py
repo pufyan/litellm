@@ -252,10 +252,14 @@ def _base64_decoded_byte_count(data: str) -> int:
 
 class GeminiRealtimeConfig(BaseRealtimeConfig):
     _TOOL_CALL_ID_TO_NAME_MAX = 256  # LRU cap for call_id→name mapping
+    _MAX_DELTA_CHUNKS = 2000
+    _MAX_ITEM_CHUNKS = 2000
 
     def __init__(self):
         super().__init__()
         self._tool_call_id_to_name: OrderedDict[str, str] = OrderedDict()
+        self._delta_chunks_dropped: int = 0
+        self._item_chunks_dropped: int = 0
         # Gemini Live sometimes emits usageMetadata in a standalone frame between
         # turns; buffer it here so the next response.done carries the token counts.
         self._pending_usage_metadata: Optional[dict] = None
@@ -1397,6 +1401,10 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                     if current_delta_chunks is None:
                         current_delta_chunks = []
                     current_delta_chunks.append(cast(OpenAIRealtimeResponseDelta, transformed_message))
+                    overflow = len(current_delta_chunks) - GeminiRealtimeConfig._MAX_DELTA_CHUNKS
+                    if overflow > 0:
+                        del current_delta_chunks[:overflow]
+                        self._delta_chunks_dropped += overflow
                 else:
                     current_delta_chunks = None
             return current_delta_chunks
@@ -1431,7 +1439,12 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             ]
             if not new_chunks:
                 return current_item_chunks
-            return (current_item_chunks or []) + new_chunks
+            merged = (current_item_chunks or []) + new_chunks
+            overflow = len(merged) - GeminiRealtimeConfig._MAX_ITEM_CHUNKS
+            if overflow > 0:
+                del merged[:overflow]
+                self._item_chunks_dropped += overflow
+            return merged
         except Exception as e:
             raise ValueError(f"Error updating current item chunks: {e}, got transformed_message: {transformed_message}")
 

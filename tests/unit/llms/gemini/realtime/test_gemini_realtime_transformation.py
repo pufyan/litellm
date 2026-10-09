@@ -3403,3 +3403,32 @@ def test_gemini_realtime_response_done_reports_no_grounding_when_none_ran():
 
     assert input_details.get("web_search_requests") is None
     assert input_details.get("google_maps_grounding_requests") is None
+
+
+def test_update_current_item_chunks_cap_drops_oldest():
+    config = GeminiRealtimeConfig()
+    chunks = None
+    total = GeminiRealtimeConfig._MAX_ITEM_CHUNKS + 100
+    for i in range(total):
+        chunks = config.update_current_item_chunks(
+            {"type": "response.output_item.done", "output_index": i}, chunks
+        )
+
+    assert chunks is not None
+    assert len(chunks) == GeminiRealtimeConfig._MAX_ITEM_CHUNKS
+    assert config._item_chunks_dropped == 100
+    assert chunks[0]["output_index"] == 100
+
+
+def test_update_current_delta_chunks_cap_drops_oldest():
+    config = GeminiRealtimeConfig()
+    chunks = None
+    total = GeminiRealtimeConfig._MAX_DELTA_CHUNKS + 100
+    for i in range(total):
+        chunks = config.update_current_delta_chunks(
+            {"type": "response.output_text.delta", "delta": {"text": f"t{i}"}}, chunks
+        )
+
+    assert chunks is not None
+    assert len(chunks) == GeminiRealtimeConfig._MAX_DELTA_CHUNKS
+    assert config._delta_chunks_dropped == 100

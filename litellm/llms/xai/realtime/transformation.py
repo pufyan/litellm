@@ -122,6 +122,11 @@ class XAIRealtimeNormalizer:
         # so that ``response.content_part.done`` events missing ``part`` can be
         # back-filled from earlier ``content_part.added`` / delta-done events.
         self._content_part_by_key: dict[tuple, dict[str, Any]] = {}
+        # Responses with entries still needed by in-flight parts. Terminal
+        # events evict their keys; the count cap below is only a backstop for
+        # orphan keys whose terminal event never arrives.
+        self._active_content_part_responses: set = set()
+        self._content_part_evicted: int = 0
         # Correlation-id state for real output_index/content_index tracking
         # (see litellm_core_utils.realtime_correlation) — owned here, not
         # threaded through the caller, mirroring GeminiRealtimeConfig/
@@ -405,6 +410,8 @@ class XAIRealtimeNormalizer:
     # Pass 1: content-part caching and back-fill
     # ---------------------------------------------------------------------------
 
+    _CONTENT_PART_BY_KEY_MAX = 2000
+
     @staticmethod
     def _content_part_key(event: dict) -> tuple:
         return (
@@ -417,6 +424,24 @@ class XAIRealtimeNormalizer:
         part: Final = event.get("part")
         if isinstance(part, dict):
             self._content_part_by_key[self._content_part_key(event)] = part
+            self._enforce_content_part_cap()
+
+    def _enforce_content_part_cap(self) -> None:
+        while len(self._content_part_by_key) > XAIRealtimeNormalizer._CONTENT_PART_BY_KEY_MAX:
+            oldest = next(iter(self._content_part_by_key))
+            for key in self._content_part_by_key:
+                if key[0] not in self._active_content_part_responses:
+                    oldest = key
+                    break
+            del self._content_part_by_key[oldest]
+            self._content_part_evicted += 1
+
+    def _evict_completed_response_parts(self, response_id: object) -> None:
+        if response_id is None:
+            return
+        for key in [k for k in self._content_part_by_key if k[0] == response_id]:
+            del self._content_part_by_key[key]
+        self._active_content_part_responses.discard(response_id)
 
     def _update_content_part_field(self, event: dict, *, part_type: str, field: str, value: object) -> None:
         if value is None:
@@ -432,6 +457,7 @@ class XAIRealtimeNormalizer:
                 field: value,
             }
         self._content_part_by_key[key] = updated
+        self._enforce_content_part_cap()
 
     def _resolve_content_part(self, event: dict) -> dict[str, object]:
         part: Final = event.get("part")
@@ -446,6 +472,8 @@ class XAIRealtimeNormalizer:
         event_type: Final = event.get("type")
 
         if event_type == "response.content_part.added":
+            if event.get("response_id") is not None:
+                self._active_content_part_responses.add(event.get("response_id"))
             self._remember_content_part(event)
             if not isinstance(event.get("part"), dict):
                 return {**event, "part": self._resolve_content_part(event)}
@@ -467,7 +495,14 @@ class XAIRealtimeNormalizer:
         if event_type == "response.content_part.done":
             self._remember_content_part(event)
             if not isinstance(event.get("part"), dict):
-                return {**event, "part": self._resolve_content_part(event)}
+                resolved = {**event, "part": self._resolve_content_part(event)}
+            else:
+                resolved = event
+            self._content_part_by_key.pop(self._content_part_key(event), None)
+            return resolved
+
+        if event_type == "response.done":
+            self._evict_completed_response_parts(event.get("response_id"))
             return event
 
         return event

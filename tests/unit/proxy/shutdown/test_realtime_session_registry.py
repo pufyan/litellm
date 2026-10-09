@@ -8,6 +8,7 @@ realtime sessions with an abrupt reset.
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -131,6 +132,37 @@ async def test_force_close_all_survives_a_failing_session():
 
     assert closed == 2
     assert good.closed is True
+
+
+def test_unregister_clears_registration_timestamp():
+    a = FakeSession()
+    RealtimeSessionRegistry.register(a)
+    assert id(a) in RealtimeSessionRegistry._registered_at
+    RealtimeSessionRegistry.unregister(a)
+    assert id(a) not in RealtimeSessionRegistry._registered_at
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_closes_only_stale_sessions():
+    old, young = FakeSession(), FakeSession()
+    RealtimeSessionRegistry.register(old)
+    RealtimeSessionRegistry.register(young)
+    RealtimeSessionRegistry._registered_at[id(old)] = time.monotonic() - 3600.0
+
+    reaped = await RealtimeSessionRegistry.reap_orphans(max_age_seconds=600.0)
+
+    assert reaped == 1
+    assert old.closed is True
+    assert young.closed is False
+    assert RealtimeSessionRegistry.count() == 2
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_noop_when_all_sessions_young():
+    RealtimeSessionRegistry.register(FakeSession())
+
+    assert await RealtimeSessionRegistry.reap_orphans(max_age_seconds=600.0) == 0
+    assert RealtimeSessionRegistry.count() == 1
 
 
 import signal

@@ -241,6 +241,9 @@ _Link = _RecognizeStream | str | _TurnDiscarded
 
 
 class SpeechStreamingBackend:
+    _MAX_TURN_STREAMS = 8
+    _MAX_DISCARDED_TURNS = 128
+
     def __init__(
         self,
         target: SpeechStreamingTarget,
@@ -264,6 +267,7 @@ class SpeechStreamingBackend:
         self._discarded_turns: frozenset[int] = frozenset()
         self._billed_before: float = 0.0
         self._closed: bool = False
+        self._turn_streams_dropped: int = 0
 
     async def __aenter__(self) -> Self:
         return self
@@ -322,7 +326,14 @@ class SpeechStreamingBackend:
         if self._closed:
             return
         self._closed = True
+        streams: Final = self._turn
         self._turn = ()
+        for stream in streams:
+            while True:
+                try:
+                    stream._requests.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
         pump: Final = self._pump
         if pump is not None:
             pump.cancel()
@@ -374,6 +385,10 @@ class SpeechStreamingBackend:
             await current.half_close()
         stream: Final = await self._open_stream()
         self._turn = (*self._turn, stream)
+        overflow = len(self._turn) - SpeechStreamingBackend._MAX_TURN_STREAMS
+        if overflow > 0:
+            self._turn = self._turn[overflow:]
+            self._turn_streams_dropped += overflow
         return stream
 
     def _expired(self, stream: _RecognizeStream) -> bool:
@@ -412,6 +427,8 @@ class SpeechStreamingBackend:
         turn: Final = self._turn_index
         self._turn = ()
         self._discarded_turns |= {turn}
+        if len(self._discarded_turns) > SpeechStreamingBackend._MAX_DISCARDED_TURNS:
+            self._discarded_turns = frozenset(sorted(self._discarded_turns)[-SpeechStreamingBackend._MAX_DISCARDED_TURNS:])
         self._turn_index += 1
         for stream in streams:
             stream.cancel()

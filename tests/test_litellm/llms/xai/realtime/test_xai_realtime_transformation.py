@@ -204,6 +204,74 @@ def test_conversation_item_added_role_remap_still_works():
     assert event["item"]["role"] == "assistant"
 
 
+def test_content_part_done_evicts_key_after_backfill():
+    normalizer = XAIRealtimeNormalizer()
+    normalizer.normalize(
+        {
+            "type": "response.content_part.added",
+            "response_id": "resp_1",
+            "item_id": "item_A",
+            "content_index": 0,
+            "part": {"type": "audio", "transcript": ""},
+        }
+    )
+    event = normalizer.normalize(
+        {"type": "response.content_part.done", "response_id": "resp_1", "item_id": "item_A", "content_index": 0}
+    )
+
+    assert event["part"]["type"] == "audio"
+    assert normalizer._content_part_by_key == {}
+
+
+def test_response_done_evicts_only_completed_response():
+    normalizer = XAIRealtimeNormalizer()
+    for resp in ("resp_1", "resp_2"):
+        normalizer.normalize(
+            {
+                "type": "response.content_part.added",
+                "response_id": resp,
+                "item_id": "item_A",
+                "content_index": 0,
+                "part": {"type": "audio", "transcript": ""},
+            }
+        )
+    normalizer.normalize({"type": "response.done", "response_id": "resp_1"})
+
+    assert list(normalizer._content_part_by_key) == [("resp_2", "item_A", 0)]
+    assert normalizer._active_content_part_responses == {"resp_2"}
+    fallback = normalizer.normalize(
+        {"type": "response.content_part.done", "response_id": "resp_1", "item_id": "item_A", "content_index": 0}
+    )
+    assert fallback["part"] == {"type": "audio", "transcript": ""}
+
+
+def test_content_part_cap_protects_active_responses():
+    normalizer = XAIRealtimeNormalizer()
+    normalizer.normalize(
+        {
+            "type": "response.content_part.added",
+            "response_id": "active",
+            "item_id": "item_A",
+            "content_index": 0,
+            "part": {"type": "audio", "transcript": ""},
+        }
+    )
+    for i in range(XAIRealtimeNormalizer._CONTENT_PART_BY_KEY_MAX):
+        normalizer.normalize(
+            {
+                "type": "response.output_text.done",
+                "response_id": f"orphan_{i}",
+                "item_id": "item_A",
+                "content_index": 0,
+                "text": "x",
+            }
+        )
+
+    assert len(normalizer._content_part_by_key) == XAIRealtimeNormalizer._CONTENT_PART_BY_KEY_MAX
+    assert ("active", "item_A", 0) in normalizer._content_part_by_key
+    assert normalizer._content_part_evicted >= 1
+
+
 def test_usage_normalization_still_works():
     normalizer = XAIRealtimeNormalizer()
     event = normalizer.normalize({"type": "response.done", "response": {"usage": {}}})

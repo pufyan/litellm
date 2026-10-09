@@ -80,6 +80,53 @@ def test_realtime_streaming_store_message():
     assert len(streaming.messages) == 2  # Should not store the new message
 
 
+def test_stored_messages_cap_drops_oldest_non_spend_events():
+    streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    streaming.logged_real_time_event_types = "*"
+    total = RealTimeStreaming._MAX_STORED_MESSAGES + 50
+    for i in range(total):
+        streaming.store_message(json.dumps({"type": "response.created", "event_id": f"e{i}"}))
+
+    assert len(streaming.messages) == RealTimeStreaming._MAX_STORED_MESSAGES
+    assert streaming._stored_messages_dropped == 50
+    assert streaming.messages[0]["event_id"] == "e50"
+    assert streaming.messages[-1]["event_id"] == f"e{total - 1}"
+
+
+def test_stored_messages_cap_pins_spend_critical_events():
+    streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    streaming.logged_real_time_event_types = "*"
+    for i in range(RealTimeStreaming._MAX_STORED_MESSAGES):
+        streaming.store_message(json.dumps({"type": "response.created", "event_id": f"e{i}"}))
+    for i in range(3):
+        streaming.store_message(
+            json.dumps({"type": "response.done", "event_id": f"done{i}", "response": {"output": []}})
+        )
+
+    done_ids = [m["event_id"] for m in streaming.messages if m["type"] == "response.done"]
+    assert done_ids == ["done0", "done1", "done2"]
+    assert len(streaming.messages) == RealTimeStreaming._MAX_STORED_MESSAGES
+    assert streaming._stored_messages_dropped == 3
+
+
+def test_stored_messages_under_cap_lose_nothing_for_spend():
+    streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    streaming.logged_real_time_event_types = "*"
+    for i in range(5):
+        streaming.store_message(
+            json.dumps(
+                {
+                    "type": "response.done",
+                    "event_id": f"done{i}",
+                    "response": {"output": [], "usage": {"total_tokens": 10}},
+                }
+            )
+        )
+
+    assert streaming._stored_messages_dropped == 0
+    assert len(streaming.messages) == 5
+
+
 def test_remap_beta_session_to_ga_normalizes_modalities_and_audio():
     out = RealTimeStreaming._remap_beta_session_to_ga({"modalities": ["audio", "text"], "voice": "alloy"})
     assert out["type"] == "realtime"
@@ -388,6 +435,111 @@ class TestXaiNativeResumptionReconnect:
 
         # Must not raise.
         streaming._observe_backend_event_for_native_resumption({"type": "conversation.created"})
+
+
+class TestReconnectOwnership:
+    """One reconnect per session: concurrent requests coalesce into a single
+    dial, and every socket a failed attempt opened is closed."""
+
+    def _make_streaming(self, send_side_effect=None):
+        client_ws = MagicMock()
+        client_ws.send_text = AsyncMock()
+        connector = MagicMock()
+        streaming = RealTimeStreaming(
+            client_ws,
+            AsyncMock(),
+            MagicMock(),
+            backend_connector=connector,
+        )
+        streaming._last_ga_session_update = json.dumps({"type": "session.update", "session": {}})
+        streaming._send_side_effect = send_side_effect
+        return streaming, connector
+
+    @pytest.mark.asyncio
+    async def test_failed_resume_send_closes_intermediate_sockets(self):
+        streaming, connector = self._make_streaming()
+        old_ws = streaming.backend_ws
+        new_sockets = [AsyncMock() for _ in range(3)]
+        for ws in new_sockets:
+            ws.send = AsyncMock(side_effect=RuntimeError("boom"))
+        connector.connect = AsyncMock(side_effect=new_sockets)
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            result = await streaming._reconnect_backend(reason="connection_closed")
+
+        assert result is False
+        assert streaming.backend_ws is old_ws
+        assert streaming._reconnecting_backend is False
+        for ws in new_sockets:
+            ws.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_reconnects_coalesce_into_one_dial(self):
+        streaming, connector = self._make_streaming()
+        release = asyncio.Event()
+        new_ws = AsyncMock()
+        new_ws.send = AsyncMock()
+
+        async def _connect_once():
+            await release.wait()
+            return new_ws
+
+        connector.connect = AsyncMock(side_effect=_connect_once)
+
+        first = asyncio.create_task(streaming._reconnect_backend(reason="connection_closed"))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(streaming._reconnect_backend(reason="client_session_update"))
+        await asyncio.sleep(0)
+        release.set()
+        assert await first is True
+        assert await second is True
+
+        assert connector.connect.await_count == 1
+        assert streaming.backend_ws is new_ws
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dial_resets_reconnect_flag(self):
+        streaming, connector = self._make_streaming()
+        connector.connect = AsyncMock(side_effect=asyncio.Event().wait)
+
+        task = asyncio.create_task(streaming._reconnect_backend(reason="connection_closed"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert streaming._reconnecting_backend is False
+
+
+class TestBackendIdleTimeout:
+    def _make_streaming(self, **kwargs):
+        async def _hang_forever(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        client_ws = MagicMock()
+        client_ws.send_text = AsyncMock()
+        backend_ws = AsyncMock()
+        backend_ws.recv = AsyncMock(side_effect=_hang_forever)
+        return RealTimeStreaming(client_ws, backend_ws, MagicMock(), **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_by_default_hung_recv_stays_pending(self):
+        streaming = self._make_streaming()
+        assert streaming.backend_idle_timeout is None
+
+        task = asyncio.create_task(streaming._recv_from_backend_reconnecting_on_drop())
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_raises_when_backend_silent(self):
+        streaming = self._make_streaming(backend_idle_timeout=0.05)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await streaming._recv_from_backend_reconnecting_on_drop()
 
 
 def test_remap_beta_session_to_ga_normalizes_nested_structures():
@@ -2851,6 +3003,36 @@ async def test_deferred_setup_flush_retains_unsent_messages_after_send_failure()
 
 
 @pytest.mark.asyncio
+async def test_deferred_setup_flush_failure_reenforces_cap_with_tail_drop():
+    cap = RealTimeStreaming._MAX_BUFFERED_MESSAGES
+    client_ws = MagicMock()
+    backend_ws = MagicMock()
+    logging_obj = MagicMock()
+    streaming = RealTimeStreaming(client_ws, backend_ws, logging_obj)
+    old_messages = [json.dumps({"type": "response.create", "n": i}) for i in range(cap - 5)]
+    streaming._pending_messages_until_setup = list(old_messages)
+    streaming._sync_pending_messages_byte_total()
+
+    async def _fail_and_buffer_more(message):
+        for _ in range(10):
+            streaming._pending_messages_until_setup.append(json.dumps({"type": "response.create", "n": "new"}))
+        raise Exception("transient")
+
+    streaming._send_to_backend = AsyncMock(side_effect=_fail_and_buffer_more)  # type: ignore[method-assign]
+
+    assert await streaming._flush_pending_messages_until_setup() is False
+
+    assert len(streaming._pending_messages_until_setup) == cap
+    assert streaming._pending_messages_until_setup == old_messages + [
+        json.dumps({"type": "response.create", "n": "new"})
+    ] * 5
+    assert streaming._pending_messages_dropped == 5
+    assert streaming._pending_messages_byte_total == sum(
+        len(message.encode("utf-8")) for message in streaming._pending_messages_until_setup
+    )
+
+
+@pytest.mark.asyncio
 async def test_deferred_setup_flushes_audio_on_backend_session_created(monkeypatch):
     """Buffered audio is released when Gemini setupComplete becomes session.created."""
     monkeypatch.setattr(litellm, "gemini_live_defer_setup", True, raising=False)
@@ -3479,6 +3661,21 @@ def test_transcript_accumulates_turns_and_interruptions():
         ("assistant", "Сейчас рас"),
         ("note", RealTimeStreaming._REPLAY_INTERRUPTED_NOTE),
     ]
+
+
+def test_transcript_chunks_cap_flushes_early_without_response_done():
+    streaming = RealTimeStreaming(MagicMock(), MagicMock(), MagicMock())
+    total = RealTimeStreaming._MAX_ASSISTANT_TRANSCRIPT_CHUNKS + 200
+    for i in range(total):
+        streaming._record_transcript_event(
+            {"type": "response.output_audio_transcript.delta", "delta": f"w{i} "}
+        )
+
+    assert len(streaming._assistant_transcript_chunks) <= RealTimeStreaming._MAX_ASSISTANT_TRANSCRIPT_CHUNKS
+    assert streaming._transcript_chunk_forced_flushes >= 1
+    replayed = "".join(e.text for e in streaming._transcript_entries if e.role == "assistant")
+    replayed += "".join(streaming._assistant_transcript_chunks)
+    assert replayed == "".join(f"w{i} " for i in range(total))
 
 
 @pytest.mark.asyncio
