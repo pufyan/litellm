@@ -23,12 +23,24 @@ from litellm.types.utils import LlmProviders
 from .authenticator import get_access_token, get_access_token_async
 
 # Simple in-memory cache for file IDs
+_FILE_CACHE_MAX_ENTRIES = 1000
 _file_cache: Final[dict[str, str]] = {}
+_file_cache_evicted: int = 0
 
 
 def _get_url_hash(url: str) -> str:
     """Generate hash for URL to use as cache key."""
     return hashlib.sha256(url.encode()).hexdigest()
+
+
+def _store_file_id(url_hash: str, file_id: str) -> None:
+    """Insert into the file cache, evicting oldest entries past the cap."""
+    global _file_cache_evicted
+    _file_cache[url_hash] = file_id
+    overflow = len(_file_cache) - _FILE_CACHE_MAX_ENTRIES
+    for _ in range(max(overflow, 0)):
+        _file_cache.pop(next(iter(_file_cache)))
+        _file_cache_evicted += 1
 
 
 def _parse_data_url(data_url: str) -> tuple[bytes, str, str] | None:
@@ -141,7 +153,7 @@ def upload_file_sync(
 
         file_id: Final = result.get("id")
         if file_id:
-            _file_cache[url_hash] = file_id
+            _store_file_id(url_hash, file_id)
             verbose_logger.debug("File uploaded successfully, file_id: %s", file_id)
 
         return file_id
@@ -210,7 +222,7 @@ async def upload_file_async(
 
         file_id: Final = result.get("id")
         if file_id:
-            _file_cache[url_hash] = file_id
+            _store_file_id(url_hash, file_id)
             verbose_logger.debug("File uploaded successfully, file_id: %s", file_id)
 
         return file_id

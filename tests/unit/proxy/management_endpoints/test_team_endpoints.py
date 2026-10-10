@@ -10831,6 +10831,9 @@ async def test_list_team_v1_batches_key_queries():
         async def filtered_find_many(**kwargs):
             where = kwargs.get("where", {})
             tid = where.get("team_id")
+            if isinstance(tid, dict) and "in" in tid:
+                wanted = set(tid["in"])
+                return [k for k in (key1, key2, key3) if k.team_id in wanted]
             if tid == "team-1":
                 return [key1, key2]
             elif tid == "team-2":
@@ -10844,6 +10847,8 @@ async def test_list_team_v1_batches_key_queries():
         result = await list_team(
             http_request=mock_request,
             user_api_key_dict=mock_user_api_key_dict,
+            page=1,
+            page_size=None,
         )
 
         # Verify keys are correctly distributed
@@ -16852,3 +16857,80 @@ def test_aggregated_date_range_error_accepts_canonical_dates_and_keeps_range_che
     assert aggregated_date_range_error("2026-09-24", "2026-09-26") is None
     assert aggregated_date_range_error("2026-09-26", "2026-09-24") == "end_date must be on or after start_date"
     assert aggregated_date_range_error("2020-01-01", "2026-12-31") == "Date range must be at most 400 days"
+
+
+class TestTeamListPagination:
+    """GET /team/list: legacy flat shape by default, bounded envelope on demand."""
+
+    def _team(self, team_id, alias):
+        team = MagicMock()
+        team.team_id = team_id
+        team.team_alias = alias
+        team.organization_id = None
+        team.model_dump.return_value = {"team_id": team_id, "team_alias": alias, "organization_id": None}
+        return team
+
+    def _setup_list_team(self, teams, keys_by_team, monkeypatch):
+        from litellm.proxy.management_endpoints import team_endpoints
+
+        find_many_calls = []
+
+        async def _find_many(**kwargs):
+            find_many_calls.append(kwargs)
+            team_filter = kwargs.get("where", {}).get("team_id")
+            if isinstance(team_filter, dict) and "in" in team_filter:
+                wanted = set(team_filter["in"])
+                return [k for t, ks in keys_by_team.items() if t in wanted for k in ks]
+            return list(keys_by_team.get(team_filter, []))
+
+        monkeypatch.setattr(team_endpoints, "_authorize_and_filter_teams", AsyncMock(return_value=teams))
+        monkeypatch.setattr(team_endpoints, "get_all_team_memberships", AsyncMock(return_value=[]))
+        tokens_db = MagicMock()
+        tokens_db.find_many = AsyncMock(side_effect=_find_many)
+        monkeypatch.setattr(team_endpoints, "_tokens_db", MagicMock(return_value=tokens_db))
+        monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", MagicMock())
+        return find_many_calls
+
+    @pytest.mark.asyncio
+    async def test_legacy_shape_without_page_size(self, monkeypatch):
+        from litellm.proxy.management_endpoints.team_endpoints import list_team
+
+        teams = [self._team("t1", "b"), self._team("t2", "a")]
+        find_many_calls = self._setup_list_team(
+            teams, {"t1": [{"team_id": "t1", "token": "sk-1"}], "t2": []}, monkeypatch
+        )
+
+        result = await list_team(
+            http_request=MagicMock(),
+            user_id=None,
+            organization_id=None,
+            page=1,
+            page_size=None,
+            user_api_key_dict=MagicMock(),
+        )
+
+        assert isinstance(result, list)
+        assert [t.team_id for t in result] == ["t2", "t1"]
+        assert result[1].keys == [{"team_id": "t1", "token": "sk-1"}]
+        assert len(find_many_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_envelope_shape_with_page_size(self, monkeypatch):
+        from litellm.proxy.management_endpoints.team_endpoints import list_team
+
+        teams = [self._team(f"t{i}", f"alias-{i:02d}") for i in range(5)]
+        self._setup_list_team(teams, {}, monkeypatch)
+
+        result = await list_team(
+            http_request=MagicMock(),
+            user_id=None,
+            organization_id=None,
+            page=2,
+            page_size=2,
+            user_api_key_dict=MagicMock(),
+        )
+
+        assert result["total"] == 5
+        assert result["page"] == 2
+        assert result["total_pages"] == 3
+        assert [t.team_id for t in result["teams"]] == ["t2", "t3"]

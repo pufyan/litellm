@@ -10,6 +10,7 @@ export interface TeamFilterOptions {
 
 const FILTER_OPTIONS_PAGE_SIZE = 100; // API max per page
 const MAX_PAGES = 10; // Cap at 1000 keys; filter completeness beyond ~500 has diminishing returns
+const TEAM_LIST_PAGE_SIZE = 100; // Bounded team/list pages for fetch-all loops
 
 const processKeysIntoOptions = (
   keys: Array<Record<string, unknown>>,
@@ -130,14 +131,31 @@ export const fetchAllTeams = async (
     let currentPage = 1;
     let hasMorePages = true;
 
-    while (hasMorePages) {
-      const response = await teamListCall(accessToken, organizationId || null, userID ?? null);
+    // Safety bound: a corrupt total_pages must not page forever.
+    const MAX_TEAM_PAGES = 100;
+    let fetchedPages = 0;
+
+    while (hasMorePages && fetchedPages < MAX_TEAM_PAGES) {
+      const response = await teamListCall(
+        accessToken,
+        organizationId || null,
+        userID ?? null,
+        null,
+        null,
+        currentPage,
+        TEAM_LIST_PAGE_SIZE,
+      );
+      fetchedPages++;
+
+      // Legacy shape (flat list) means a single page; envelope shape pages on.
+      const pageTeams: Team[] = Array.isArray(response) ? response : (response?.teams ?? []);
+      const totalPages: number = Array.isArray(response) ? 1 : (response?.total_pages ?? 1);
 
       // Add teams from this page
-      allTeams = [...allTeams, ...response];
+      allTeams = [...allTeams, ...pageTeams];
 
       // Check if there are more pages
-      if (currentPage < response.total_pages) {
+      if (!Array.isArray(response) && currentPage < totalPages) {
         currentPage++;
       } else {
         hasMorePages = false;

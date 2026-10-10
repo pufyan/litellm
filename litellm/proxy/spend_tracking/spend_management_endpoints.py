@@ -84,6 +84,7 @@ else:
 router: Final = APIRouter()
 
 SPEND_LOGS_PAGINATION_COUNT_CAP: Final = 10000
+LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE: Final = 1000
 
 _SESSION_KEY_EXPR: Final = "COALESCE(NULLIF(session_id, ''), request_id)"
 _SESSION_GROUP_KEY_SQL: Final = f"{_SESSION_KEY_EXPR}, api_key"
@@ -360,9 +361,10 @@ async def _find_spend_logs(
     order: Mapping[str, str],
     take: int,
     http_response: Response,
+    skip: int = 0,
 ) -> Sequence[_SupportsModelDump]:
     """Read spend log rows as Prisma model instances, capped at ``take`` rows."""
-    rows: Final = await _spend_logs_table(prisma_client).find_many(where=where, order=order, take=take)
+    rows: Final = await _spend_logs_table(prisma_client).find_many(where=where, order=order, take=take, skip=skip)
     if len(rows) == take:
         http_response.headers["x-litellm-spend-logs-truncated"] = "true"
         verbose_proxy_logger.warning(
@@ -3492,13 +3494,24 @@ async def view_spend_logs(
         default=True,
         description="When start_date and end_date are provided, summarize=true returns aggregated data by date (legacy behavior), summarize=false returns filtered individual logs",
     ),
+    page: int = fastapi.Query(
+        default=1,
+        ge=1,
+        description="Page number (1-based) for individual log entries",
+    ),
+    page_size: int | None = fastapi.Query(
+        default=None,
+        ge=1,
+        le=10000,
+        description="Rows per page. Defaults to 1000; use /spend/logs/v2 for larger scans",
+    ),
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
     """
     [DEPRECATED] This endpoint is not paginated and can cause performance issues.
     Please use `/spend/logs/v2` instead for paginated access to spend logs.
 
-    Row results are capped at 10,000 most recent entries per response.
+    Row results are capped at 1,000 most recent entries per response by default.
 
     View all spend logs, if request_id is provided, only logs for that request_id will be returned
 
@@ -3586,11 +3599,13 @@ async def view_spend_logs(
             # Check if user wants unsummarized data
             if not summarize:
                 # Return filtered individual log entries (similar to UI endpoint)
+                page_take: Final = page_size or LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE
                 data = await _find_spend_logs(
                     prisma_client,
                     where=filter_query,
                     order={"startTime": "desc"},
-                    take=SPEND_LOGS_PAGINATION_COUNT_CAP,
+                    take=page_take,
+                    skip=(page - 1) * page_take,
                     http_response=fastapi_response,
                 )
                 return data
@@ -3643,7 +3658,8 @@ async def view_spend_logs(
                 prisma_client,
                 where=scoped_filter,
                 order={"startTime": "desc"},
-                take=SPEND_LOGS_PAGINATION_COUNT_CAP,
+                take=page_size or LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE,
+                skip=(page - 1) * (page_size or LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE),
                 http_response=fastapi_response,
             )
             return data

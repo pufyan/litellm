@@ -109,3 +109,13 @@ async def test_a_funnel_flush_renders_one_postgres_upsert_span_per_job(
     await flush_shadow_eval_funnel(prisma)
 
     assert await postgres_span_names() == ("postgres.upsert LiteLLM_ShadowEvalFunnel",) * 2
+
+
+def test_queue_capped_at_max_job_ids():
+    total = shadow_eval_funnel._PENDING_MAX_JOB_IDS + 100
+    for i in range(total):
+        record_shadow_eval_funnel_event(f"job-{i}", "not_sampled")
+
+    assert len(shadow_eval_funnel._pending) == shadow_eval_funnel._PENDING_MAX_JOB_IDS
+    assert "job-0" not in shadow_eval_funnel._pending
+    assert f"job-{total - 1}" in shadow_eval_funnel._pending
