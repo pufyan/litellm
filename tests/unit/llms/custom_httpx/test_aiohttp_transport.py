@@ -1273,3 +1273,15 @@ async def test_refused_connection_maps_to_httpx_connect_error(
     assert isinstance(cause, aiohttp_aiohttp_handler.ClientConnectorError)
     assert cause.ssl is expected_ssl
     assert (cause.host, cause.port) == ("127.0.0.1", port)
+
+
+def test_proxy_cache_capped_at_max_hosts():
+    transport = LiteLLMAiohttpTransport(client=object())
+    total = AiohttpTransport._PROXY_CACHE_MAX_HOSTS + 50
+    for i in range(total):
+        transport._proxy_from_env(httpx.URL(f"http://host-{i}.example.com/"))
+
+    assert len(transport.proxy_cache) == AiohttpTransport._PROXY_CACHE_MAX_HOSTS
+    assert "host-0.example.com" not in transport.proxy_cache
+    assert f"host-{total - 1}.example.com" in transport.proxy_cache
+    assert transport._proxy_cache_dropped == 50

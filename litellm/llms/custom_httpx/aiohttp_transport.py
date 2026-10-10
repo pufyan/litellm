@@ -146,6 +146,8 @@ class AiohttpResponseStream(httpx.AsyncByteStream):
 
 
 class AiohttpTransport(httpx.AsyncBaseTransport):
+    _PROXY_CACHE_MAX_HOSTS = 512
+
     def __init__(
         self,
         client: ClientSession | Callable[[], ClientSession],
@@ -158,6 +160,7 @@ class AiohttpTransport(httpx.AsyncBaseTransport):
         # Class variables for proxy settings
         #########################################################
         self.proxy_cache: dict[str, str | None] = {}
+        self._proxy_cache_dropped: int = 0
 
     async def aclose(self) -> None:
         if self._owns_session and isinstance(self.client, ClientSession):
@@ -498,5 +501,9 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
             proxy_url = proxy
 
         self.proxy_cache[proxy_cache_key] = proxy_url
+        overflow = len(self.proxy_cache) - AiohttpTransport._PROXY_CACHE_MAX_HOSTS
+        for _ in range(max(overflow, 0)):
+            self.proxy_cache.pop(next(iter(self.proxy_cache)))
+            self._proxy_cache_dropped += 1
 
         return proxy_url

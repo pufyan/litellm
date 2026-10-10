@@ -14,9 +14,11 @@ import pytest
 
 from litellm.llms.gigachat import file_handler
 from litellm.llms.gigachat.file_handler import (
+    _FILE_CACHE_MAX_ENTRIES,
     _file_cache,
     _get_url_hash,
     _parse_data_url,
+    _store_file_id,
     upload_file_async,
     upload_file_sync,
 )
@@ -464,3 +466,22 @@ class TestUploadFileAsync:
         )
 
         assert result is None
+
+
+class TestFileCacheCap:
+    def test_insert_beyond_cap_evicts_oldest(self):
+        total = _FILE_CACHE_MAX_ENTRIES + 50
+        for i in range(total):
+            _store_file_id(f"hash{i}", f"file{i}")
+
+        assert len(_file_cache) == _FILE_CACHE_MAX_ENTRIES
+        assert "hash0" not in _file_cache
+        assert _file_cache[f"hash{total - 1}"] == f"file{total - 1}"
+        assert file_handler._file_cache_evicted == 50
+
+    def test_reinsert_existing_key_does_not_grow(self):
+        _store_file_id("same", "file1")
+        _store_file_id("same", "file2")
+
+        assert len(_file_cache) == 1
+        assert _file_cache["same"] == "file2"

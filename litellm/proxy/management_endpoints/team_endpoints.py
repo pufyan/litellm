@@ -5891,6 +5891,13 @@ async def list_team(
     http_request: Request,
     user_id: str | None = fastapi.Query(default=None, description="Only return teams which this 'user_id' belongs to"),
     organization_id: str | None = None,
+    page: int = fastapi.Query(default=1, ge=1, description="Page number (1-based), used with page_size"),
+    page_size: int | None = fastapi.Query(
+        default=None,
+        ge=1,
+        le=1000,
+        description="Teams per page. When omitted the full list is returned as before",
+    ),
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
     """
@@ -5902,6 +5909,9 @@ async def list_team(
     Parameters:
     - user_id: str - Optional. If passed will only return teams that the user_id is a member of.
     - organization_id: str - Optional. If passed will only return teams that belong to the organization_id. Pass 'default_organization' to get all teams without organization_id.
+    - page: int - Optional. Page number, used together with page_size.
+    - page_size: int - Optional. When set, returns a `{teams, total, page, total_pages}` envelope
+      with a single page sliced after sorting. When omitted, returns the flat list as before.
     """
     from litellm.proxy.proxy_server import (
         prisma_client,
@@ -5926,6 +5936,14 @@ async def list_team(
     _team_ids: Final = [team.team_id for team in filtered_response]
     returned_tm: Final = await get_all_team_memberships(prisma_client, _team_ids, user_id=user_id)
 
+    # One batched keys lookup instead of a find_many per team.
+    keys_by_team: dict[str, list] = {}
+    if _team_ids:
+        for key in _as_list(await _tokens_db(prisma_client).find_many(where={"team_id": {"in": _team_ids}})):
+            team_id = key.get("team_id") if isinstance(key, dict) else getattr(key, "team_id", None)
+            if team_id is not None:
+                keys_by_team.setdefault(team_id, []).append(key)
+
     returned_responses: list[TeamListResponseObject] = []
     for team in filtered_response:
         _team_memberships: list[LiteLLM_TeamMembership] = []
@@ -5934,7 +5952,7 @@ async def list_team(
                 _team_memberships.append(tm)
 
         # add all keys that belong to the team
-        keys = _as_list(await _tokens_db(prisma_client).find_many(where={"team_id": team.team_id}))
+        keys = keys_by_team.get(team.team_id, [])
 
         try:
             returned_responses.append(
@@ -5959,7 +5977,18 @@ async def list_team(
         else:
             returned_responses = [team for team in returned_responses if team.organization_id == organization_id]
 
-    return returned_responses
+    if page_size is None:
+        return returned_responses
+
+    total: Final = len(returned_responses)
+    total_pages: Final = max(math.ceil(total / page_size), 1)
+    start: Final = (page - 1) * page_size
+    return {
+        "teams": returned_responses[start : start + page_size],
+        "total": total,
+        "page": page,
+        "total_pages": total_pages,
+    }
 
 
 async def get_paginated_teams(

@@ -21,6 +21,8 @@ ShadowEvalFunnelStage = Literal["not_sampled", "unjudgeable", "shed", "withheld"
 FUNNEL_STAGES: Final[tuple[ShadowEvalFunnelStage, ...]] = ("not_sampled", "unjudgeable", "shed", "withheld")
 
 _pending: dict[str, dict[ShadowEvalFunnelStage, int]] = {}  # mutable-ok: module-level queue, single event loop
+_PENDING_MAX_JOB_IDS = 10000
+_pending_dropped: int = 0
 
 _FUNNEL_PLACEHOLDERS: Final = ", ".join(f"${n + 2}" for n in range(len(FUNNEL_STAGES)))
 
@@ -41,8 +43,14 @@ def pending_shadow_eval_funnel_events() -> int:
 def record_shadow_eval_funnel_event(job_id: str, stage: ShadowEvalFunnelStage) -> None:
     """Count one skipped request for one job leg; synchronous so the hook's read-modify-
     write cannot interleave with the flush's snapshot on the shared event loop."""
+    global _pending_dropped
     counters: Final = _pending.setdefault(job_id, dict.fromkeys(FUNNEL_STAGES, 0))
     counters[stage] += 1
+    overflow = len(_pending) - _PENDING_MAX_JOB_IDS
+    for _ in range(max(overflow, 0)):
+        _pending.pop(next(iter(_pending)))
+        _pending_dropped += 1
+        verbose_proxy_logger.debug("Shadow-eval funnel queue over cap; dropped oldest job (%d total)", _pending_dropped)
 
 
 async def flush_shadow_eval_funnel(prisma_client: "PrismaClient") -> None:

@@ -154,3 +154,6 @@ coverage-rust.xml
 
 # make lens-dev worker token, generated config and logs
 .lens-dev/
+
+# archived OpenSpec changes (history, not active work)
+openspec/changes/archive/

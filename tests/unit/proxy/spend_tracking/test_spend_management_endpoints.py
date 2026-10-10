@@ -4035,7 +4035,7 @@ async def test_view_spend_logs_summarize_parameter(client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_view_spend_logs_bounds_row_count(client, monkeypatch):
-    """Every /spend/logs read path must send take=SPEND_LOGS_PAGINATION_COUNT_CAP to Prisma (LIT-6284)."""
+    """Every /spend/logs read path must bound take: 1000 by default, explicit page_size honored (LIT-6284)."""
     captured_find_many_kwargs = []
 
     class MockDB:
@@ -4065,7 +4065,7 @@ async def test_view_spend_logs_bounds_row_count(client, monkeypatch):
             headers={"Authorization": "Bearer sk-test"},
         )
         assert response.status_code == 200
-        assert captured_find_many_kwargs[-1].get("take") == spend_management_endpoints.SPEND_LOGS_PAGINATION_COUNT_CAP
+        assert captured_find_many_kwargs[-1].get("take") == spend_management_endpoints.LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE
         assert "x-litellm-spend-logs-truncated" not in response.headers
 
         response = client.get(
@@ -4075,7 +4075,7 @@ async def test_view_spend_logs_bounds_row_count(client, monkeypatch):
         )
         assert response.status_code == 200
         assert captured_find_many_kwargs[-1].get("where") == {"user": "test-user"}
-        assert captured_find_many_kwargs[-1].get("take") == spend_management_endpoints.SPEND_LOGS_PAGINATION_COUNT_CAP
+        assert captured_find_many_kwargs[-1].get("take") == spend_management_endpoints.LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE
 
         response = client.get(
             "/spend/logs",
@@ -4088,15 +4088,23 @@ async def test_view_spend_logs_bounds_row_count(client, monkeypatch):
         )
         assert response.status_code == 200
         assert "startTime" in captured_find_many_kwargs[-1].get("where", {})
+        assert captured_find_many_kwargs[-1].get("take") == spend_management_endpoints.LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE
+
+        response = client.get(
+            "/spend/logs",
+            params={"page_size": spend_management_endpoints.SPEND_LOGS_PAGINATION_COUNT_CAP},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert response.status_code == 200
         assert captured_find_many_kwargs[-1].get("take") == spend_management_endpoints.SPEND_LOGS_PAGINATION_COUNT_CAP
 
-        mock_prisma_client.db.available_rows = spend_management_endpoints.SPEND_LOGS_PAGINATION_COUNT_CAP
+        mock_prisma_client.db.available_rows = spend_management_endpoints.LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE
         response = client.get(
             "/spend/logs",
             headers={"Authorization": "Bearer sk-test"},
         )
         assert response.status_code == 200
-        assert len(response.json()) == spend_management_endpoints.SPEND_LOGS_PAGINATION_COUNT_CAP
+        assert len(response.json()) == spend_management_endpoints.LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE
         assert response.headers["x-litellm-spend-logs-truncated"] == "true"
     finally:
         app.dependency_overrides.pop(ps.user_api_key_auth, None)
@@ -7889,3 +7897,76 @@ async def test_management_team_lookup_without_memberships_keeps_own_user_scope()
     scope = await resolve_owned_read_scope(auth.user_id, lookup)
     assert scope == OwnedRows("caller")
     assert team_reads == []
+
+
+class TestLegacySpendLogsCap:
+    """Legacy /spend/logs defaults to 1000 rows with page/page_size, same record shape."""
+
+    def _setup(self, rows, monkeypatch):
+        from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+
+        async def _find_many(where=None, order=None, take=0, skip=0):
+            return rows[skip : skip + take]
+
+        table = MagicMock()
+        table.find_many = AsyncMock(side_effect=_find_many)
+        monkeypatch.setattr(
+            "litellm.proxy.spend_tracking.spend_management_endpoints._spend_logs_table",
+            MagicMock(return_value=table),
+        )
+        monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", MagicMock())
+        return UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin_user")
+
+    @pytest.mark.asyncio
+    async def test_default_caps_at_1000(self, monkeypatch):
+        from fastapi import Response
+
+        from litellm.proxy.spend_tracking.spend_management_endpoints import (
+            LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE,
+            view_spend_logs,
+        )
+
+        rows = [{"request_id": f"r{i}"} for i in range(1500)]
+        auth = self._setup(rows, monkeypatch)
+
+        result = await view_spend_logs(
+            fastapi_response=Response(),
+            api_key=None,
+            user_id=None,
+            request_id=None,
+            start_date=None,
+            end_date=None,
+            summarize=False,
+            page=1,
+            page_size=None,
+            user_api_key_dict=auth,
+        )
+
+        assert len(result) == LEGACY_SPEND_LOGS_DEFAULT_PAGE_SIZE
+        assert result[0] == {"request_id": "r0"}
+
+    @pytest.mark.asyncio
+    async def test_second_page_continues_where_first_ended(self, monkeypatch):
+        from fastapi import Response
+
+        from litellm.proxy.spend_tracking.spend_management_endpoints import view_spend_logs
+
+        rows = [{"request_id": f"r{i}"} for i in range(30)]
+        auth = self._setup(rows, monkeypatch)
+
+        async def _page(page):
+            return await view_spend_logs(
+                fastapi_response=Response(),
+                api_key=None,
+                user_id=None,
+                request_id=None,
+                start_date=None,
+                end_date=None,
+                summarize=False,
+                page=page,
+                page_size=10,
+                user_api_key_dict=auth,
+            )
+
+        assert [r["request_id"] for r in await _page(1)] == [f"r{i}" for i in range(10)]
+        assert [r["request_id"] for r in await _page(2)] == [f"r{i}" for i in range(10, 20)]

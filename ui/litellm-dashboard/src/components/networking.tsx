@@ -1138,6 +1138,8 @@ export const teamListCall = async (
   userID: string | null = null,
   teamID: string | null = null,
   team_alias: string | null = null,
+  page: number | null = null,
+  pageSize: number | null = null,
 ) => {
   /**
    * Get all available teams on proxy
@@ -1150,6 +1152,8 @@ export const teamListCall = async (
         organization_id: organizationID || undefined,
         team_id: teamID || undefined,
         team_alias: team_alias || undefined,
+        page: page || undefined,
+        page_size: pageSize || undefined,
       },
     });
   } catch (error) {
