@@ -412,16 +412,17 @@ class TestXaiTranscriptionLanguage:
 
 
 class TestXaiSampleRateValidation:
-    """xAI sessions run at pcm 16k in both directions.
+    """xAI sessions run at pcm 16k in / pcm 24k out.
 
     The bridge is byte-transparent (no resampling), so the upstream rate and
     the rate the client reads from the session setup must agree. Both are
-    pinned to {"type": "audio/pcm", "rate": 16000} here: outgoing
+    pinned here like other providers (Gemini/Bedrock pattern): outgoing
     ``session.update`` in ``patch_outgoing_session`` and incoming
     ``session.created`` / ``session.updated`` in ``normalize``.
     """
 
-    _FORCED_FORMAT = {"type": "audio/pcm", "rate": 16000}
+    _FORCED_INPUT_FORMAT = {"type": "audio/pcm", "rate": 16000}
+    _FORCED_OUTPUT_FORMAT = {"type": "audio/pcm", "rate": 24000}
 
     @staticmethod
     def _patched_audio(canonical: dict) -> dict:
@@ -439,12 +440,18 @@ class TestXaiSampleRateValidation:
     def test_any_pcm_rate_is_forced_to_16000_upstream(self, rate: int):
         audio = self._patched_audio({"input_audio_format": {"type": "audio/pcm", "rate": rate}})
 
-        assert audio["input"]["format"] == self._FORCED_FORMAT
+        assert audio["input"]["format"] == self._FORCED_INPUT_FORMAT
+
+    @pytest.mark.parametrize("rate", [8000, 16000, 22050, 24000, 32000, 44100, 48000])
+    def test_any_pcm_rate_is_forced_to_24000_upstream_output(self, rate: int):
+        audio = self._patched_audio({"output_audio_format": {"type": "audio/pcm", "rate": rate}})
+
+        assert audio["output"]["format"] == self._FORCED_OUTPUT_FORMAT
 
     def test_undocumented_pcm_rate_is_forced_to_16000_upstream(self):
         audio = self._patched_audio({"input_audio_format": {"type": "audio/pcm", "rate": 12345}})
 
-        assert audio["input"]["format"] == self._FORCED_FORMAT
+        assert audio["input"]["format"] == self._FORCED_INPUT_FORMAT
 
     def test_input_and_output_are_forced_independently_upstream(self):
         audio = self._patched_audio(
@@ -454,28 +461,28 @@ class TestXaiSampleRateValidation:
             }
         )
 
-        assert audio["input"]["format"] == self._FORCED_FORMAT
-        assert audio["output"]["format"] == self._FORCED_FORMAT
+        assert audio["input"]["format"] == self._FORCED_INPUT_FORMAT
+        assert audio["output"]["format"] == self._FORCED_OUTPUT_FORMAT
 
     def test_non_pcm_codec_is_forced_to_pcm_16000_upstream(self):
         audio = self._patched_audio({"input_audio_format": {"type": "audio/opus", "rate": 24000}})
 
-        assert audio["input"]["format"] == self._FORCED_FORMAT
+        assert audio["input"]["format"] == self._FORCED_INPUT_FORMAT
 
     def test_string_codec_alias_is_forced_to_pcm_16000_upstream(self):
         audio = self._patched_audio({"input_audio_format": "pcm16"})
 
-        assert audio["input"]["format"] == self._FORCED_FORMAT
+        assert audio["input"]["format"] == self._FORCED_INPUT_FORMAT
 
     def test_missing_rate_is_forced_to_pcm_16000_upstream(self):
         audio = self._patched_audio({"input_audio_format": {"type": "audio/pcm"}})
 
-        assert audio["input"]["format"] == self._FORCED_FORMAT
+        assert audio["input"]["format"] == self._FORCED_INPUT_FORMAT
 
     def test_unknown_format_type_is_forced_to_pcm_16000_upstream(self):
         audio = self._patched_audio({"input_audio_format": {"type": "audio/mystery", "rate": 999}})
 
-        assert audio["input"]["format"] == self._FORCED_FORMAT
+        assert audio["input"]["format"] == self._FORCED_INPUT_FORMAT
 
     def test_sibling_keys_survive_the_upstream_force(self):
         audio = self._patched_audio(
@@ -490,13 +497,13 @@ class TestXaiSampleRateValidation:
         assert audio["output"]["voice"] == "eve"
         assert audio["output"]["speed"] == 1.2
         assert audio["input"]["turn_detection"]["threshold"] == 0.5
-        assert audio["output"]["format"] == self._FORCED_FORMAT
+        assert audio["output"]["format"] == self._FORCED_OUTPUT_FORMAT
 
     def test_beta_path_without_canonical_session_is_forced_upstream(self):
         patched = XAIRealtimeNormalizer().patch_outgoing_session({"turn_detection": {"type": "server_vad"}})
 
-        assert patched["audio"]["input"]["format"] == self._FORCED_FORMAT
-        assert patched["audio"]["output"]["format"] == self._FORCED_FORMAT
+        assert patched["audio"]["input"]["format"] == self._FORCED_INPUT_FORMAT
+        assert patched["audio"]["output"]["format"] == self._FORCED_OUTPUT_FORMAT
 
     def test_session_created_is_forced_to_pcm_16000_downstream(self):
         session = self._normalized_session(
@@ -506,21 +513,21 @@ class TestXaiSampleRateValidation:
                     "id": "sess_1",
                     "audio": {
                         "input": {"format": {"type": "audio/pcm", "rate": 24000}},
-                        "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "eve"},
+                        "output": {"format": {"type": "audio/pcm", "rate": 16000}, "voice": "eve"},
                     },
                 },
             }
         )
 
-        assert session["audio"]["input"]["format"] == self._FORCED_FORMAT
-        assert session["audio"]["output"]["format"] == self._FORCED_FORMAT
+        assert session["audio"]["input"]["format"] == self._FORCED_INPUT_FORMAT
+        assert session["audio"]["output"]["format"] == self._FORCED_OUTPUT_FORMAT
         assert session["audio"]["output"]["voice"] == "eve"
 
     def test_session_updated_without_audio_gains_pcm_16000_downstream(self):
         session = self._normalized_session({"type": "session.updated", "session": {"id": "sess_1"}})
 
-        assert session["audio"]["input"]["format"] == self._FORCED_FORMAT
-        assert session["audio"]["output"]["format"] == self._FORCED_FORMAT
+        assert session["audio"]["input"]["format"] == self._FORCED_INPUT_FORMAT
+        assert session["audio"]["output"]["format"] == self._FORCED_OUTPUT_FORMAT
 
     def test_non_session_event_is_untouched_downstream(self):
         event = {"type": "response.done", "response": {}}
@@ -532,7 +539,7 @@ class TestXaiSampleRateValidation:
         )
 
         assert session["input_audio_format"] == "pcm16"
-        assert session["audio"]["input"]["format"] == self._FORCED_FORMAT
+        assert session["audio"]["input"]["format"] == self._FORCED_INPUT_FORMAT
 
 
 class TestXaiKeyterms:

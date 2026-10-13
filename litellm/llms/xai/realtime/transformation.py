@@ -55,7 +55,8 @@ _XAI_SUPPORTED_SAMPLE_RATES: Mapping[str, FrozenSet[int]] = {
 _XAI_DEFAULT_SAMPLE_RATE = 24000
 
 _XAI_FORCED_AUDIO_TYPE = "audio/pcm"
-_XAI_FORCED_SAMPLE_RATE = 16000
+_XAI_FORCED_INPUT_SAMPLE_RATE = 16000
+_XAI_FORCED_OUTPUT_SAMPLE_RATE = 24000
 
 
 def _derive_ga_server_event_types() -> Optional[FrozenSet[str]]:
@@ -180,7 +181,7 @@ class XAIRealtimeNormalizer:
 
     @staticmethod
     def _force_session_audio_rate(event: "dict[str, Any]", event_type: str) -> "dict[str, Any]":
-        """Pin the session setup the client reads to pcm 16k.
+        """Pin the session setup the client reads to pcm 16k in / 24k out.
 
         Only ``session.created`` / ``session.updated`` carry a session; every
         other event passes through untouched. Beta flat format strings carry
@@ -218,8 +219,8 @@ class XAIRealtimeNormalizer:
         # when this field is absent, so it cannot be left unset - this must run
         # even when there is no canonical_session to restore other fields from.
         session["reasoning"] = {"effort": "none"}
-        # Audio runs at pcm 16k in both directions so the byte stream and the
-        # client's playback clock always agree. Unconditional (the beta path
+        # Audio runs at pcm 16k in / 24k out so the byte stream and the
+        # client's clocks always agree. Unconditional (the beta path
         # passes no canonical_session) and ahead of _apply_xai_only_fields so
         # the rate snap below sees the forced value and stays a no-op.
         XAIRealtimeNormalizer._force_pcm_16k(session, "session.update")
@@ -376,18 +377,20 @@ class XAIRealtimeNormalizer:
 
     @staticmethod
     def _force_pcm_16k(session: dict, source: str) -> None:
-        """Pin both audio directions to pcm 16k, keeping sibling keys.
+        """Pin audio directions like other providers, keeping sibling keys.
 
-        ``source`` names the event being rewritten and only appears in the
-        override warning. Missing blocks are created; a string ``format`` is
-        replaced outright since it cannot express a rate.
+        Input runs at pcm 16k, output at pcm 24k (Gemini/Bedrock pattern);
+        xAI supports both natively so no resampling is needed.
         """
         audio: Final = session.get("audio")
         blocks: Final = dict(audio) if isinstance(audio, dict) else {}
         for direction in ("input", "output"):
             block: Final = blocks.get(direction)
             current: Final = dict(block) if isinstance(block, dict) else {}
-            forced: Final = {"type": _XAI_FORCED_AUDIO_TYPE, "rate": _XAI_FORCED_SAMPLE_RATE}
+            rate: Final = (
+                _XAI_FORCED_INPUT_SAMPLE_RATE if direction == "input" else _XAI_FORCED_OUTPUT_SAMPLE_RATE
+            )
+            forced: Final = {"type": _XAI_FORCED_AUDIO_TYPE, "rate": rate}
             if current.get("format") is not None and current.get("format") != forced:
                 verbose_logger.warning(
                     "realtime %s: audio.%s.format=%r overridden (forced_audio_format): using %r",
