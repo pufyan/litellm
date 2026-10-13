@@ -404,20 +404,24 @@ class TestXaiTranscriptionLanguage:
         assert audio["output"]["speed"] == 1.2
         assert audio["input"]["turn_detection"]["idle_timeout_ms"] == 5000
 
-    def test_empty_language_is_ignored(self):
+    def test_empty_language_adds_no_transcription(self):
         audio = self._audio({"language": ""})
 
-        assert audio == {}
+        assert audio["input"].get("transcription") is None
+        assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 16000}
 
 
 class TestXaiSampleRateValidation:
-    """xAI documents a closed, per-format set of accepted sample rates
-    (https://docs.x.ai/developers/model-capabilities/audio/voice-agent):
-    audio/pcm accepts {8000, 16000, 22050, 24000, 32000, 44100, 48000},
-    audio/pcmu and audio/pcma only 8000, audio/opus only 24000. xAI rejects
-    the whole session.update on an unsupported rate, so an out-of-set value
-    must be substituted rather than forwarded as-is.
+    """xAI sessions run at pcm 16k in both directions.
+
+    The bridge is byte-transparent (no resampling), so the upstream rate and
+    the rate the client reads from the session setup must agree. Both are
+    pinned to {"type": "audio/pcm", "rate": 16000} here: outgoing
+    ``session.update`` in ``patch_outgoing_session`` and incoming
+    ``session.created`` / ``session.updated`` in ``normalize``.
     """
+
+    _FORCED_FORMAT = {"type": "audio/pcm", "rate": 16000}
 
     @staticmethod
     def _patched_audio(canonical: dict) -> dict:
@@ -427,61 +431,108 @@ class TestXaiSampleRateValidation:
         ga_session = RealTimeStreaming._remap_beta_session_to_ga(dict(canonical))
         return normalizer.patch_outgoing_session(ga_session, dict(canonical)).get("audio", {})
 
+    @staticmethod
+    def _normalized_session(event: dict) -> dict:
+        return XAIRealtimeNormalizer().normalize(dict(event))["session"]
+
     @pytest.mark.parametrize("rate", [8000, 16000, 22050, 24000, 32000, 44100, 48000])
-    def test_documented_pcm_rate_passes_through_unchanged(self, rate: int):
+    def test_any_pcm_rate_is_forced_to_16000_upstream(self, rate: int):
         audio = self._patched_audio({"input_audio_format": {"type": "audio/pcm", "rate": rate}})
 
-        assert audio["input"]["format"]["rate"] == rate
+        assert audio["input"]["format"] == self._FORCED_FORMAT
 
-    def test_undocumented_pcm_rate_falls_back_to_24000(self):
+    def test_undocumented_pcm_rate_is_forced_to_16000_upstream(self):
         audio = self._patched_audio({"input_audio_format": {"type": "audio/pcm", "rate": 12345}})
 
-        assert audio["input"]["format"]["rate"] == 24000
+        assert audio["input"]["format"] == self._FORCED_FORMAT
 
-    def test_output_rate_is_validated_independently_of_input(self):
+    def test_input_and_output_are_forced_independently_upstream(self):
         audio = self._patched_audio(
             {
-                "input_audio_format": {"type": "audio/pcm", "rate": 16000},
-                "output_audio_format": {"type": "audio/pcm", "rate": 999},
+                "input_audio_format": {"type": "audio/pcmu", "rate": 8000},
+                "output_audio_format": {"type": "audio/pcm", "rate": 24000},
             }
         )
 
-        assert audio["input"]["format"]["rate"] == 16000
-        assert audio["output"]["format"]["rate"] == 24000
+        assert audio["input"]["format"] == self._FORCED_FORMAT
+        assert audio["output"]["format"] == self._FORCED_FORMAT
 
-    def test_pcmu_only_accepts_8000(self):
-        audio = self._patched_audio({"input_audio_format": {"type": "audio/pcmu", "rate": 16000}})
+    def test_non_pcm_codec_is_forced_to_pcm_16000_upstream(self):
+        audio = self._patched_audio({"input_audio_format": {"type": "audio/opus", "rate": 24000}})
 
-        assert audio["input"]["format"]["rate"] == 8000
+        assert audio["input"]["format"] == self._FORCED_FORMAT
 
-    def test_pcmu_at_8000_passes_through(self):
-        audio = self._patched_audio({"input_audio_format": {"type": "audio/pcmu", "rate": 8000}})
-
-        assert audio["input"]["format"]["rate"] == 8000
-
-    def test_opus_only_accepts_24000(self):
-        audio = self._patched_audio({"input_audio_format": {"type": "audio/opus", "rate": 16000}})
-
-        assert audio["input"]["format"]["rate"] == 24000
-
-    def test_string_codec_alias_has_no_format_object_to_validate(self):
-        """A plain "pcm16" string never reaches this validator: the shared GA
-        remap already expands it to {"type": "audio/pcm", "rate": 24000} via
-        its own codec-name map before xAI's patch runs, so this only confirms
-        that path still yields a passing rate untouched by the new check."""
+    def test_string_codec_alias_is_forced_to_pcm_16000_upstream(self):
         audio = self._patched_audio({"input_audio_format": "pcm16"})
 
-        assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+        assert audio["input"]["format"] == self._FORCED_FORMAT
 
-    def test_missing_rate_is_left_alone(self):
+    def test_missing_rate_is_forced_to_pcm_16000_upstream(self):
         audio = self._patched_audio({"input_audio_format": {"type": "audio/pcm"}})
 
-        assert "rate" not in audio["input"]["format"]
+        assert audio["input"]["format"] == self._FORCED_FORMAT
 
-    def test_unknown_format_type_is_left_alone(self):
+    def test_unknown_format_type_is_forced_to_pcm_16000_upstream(self):
         audio = self._patched_audio({"input_audio_format": {"type": "audio/mystery", "rate": 999}})
 
-        assert audio["input"]["format"]["rate"] == 999
+        assert audio["input"]["format"] == self._FORCED_FORMAT
+
+    def test_sibling_keys_survive_the_upstream_force(self):
+        audio = self._patched_audio(
+            {
+                "voice": "eve",
+                "output_audio_speed": 1.2,
+                "turn_detection": {"type": "server_vad", "threshold": 0.5},
+                "output_audio_format": {"type": "audio/pcm", "rate": 24000},
+            }
+        )
+
+        assert audio["output"]["voice"] == "eve"
+        assert audio["output"]["speed"] == 1.2
+        assert audio["input"]["turn_detection"]["threshold"] == 0.5
+        assert audio["output"]["format"] == self._FORCED_FORMAT
+
+    def test_beta_path_without_canonical_session_is_forced_upstream(self):
+        patched = XAIRealtimeNormalizer().patch_outgoing_session({"turn_detection": {"type": "server_vad"}})
+
+        assert patched["audio"]["input"]["format"] == self._FORCED_FORMAT
+        assert patched["audio"]["output"]["format"] == self._FORCED_FORMAT
+
+    def test_session_created_is_forced_to_pcm_16000_downstream(self):
+        session = self._normalized_session(
+            {
+                "type": "session.created",
+                "session": {
+                    "id": "sess_1",
+                    "audio": {
+                        "input": {"format": {"type": "audio/pcm", "rate": 24000}},
+                        "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "eve"},
+                    },
+                },
+            }
+        )
+
+        assert session["audio"]["input"]["format"] == self._FORCED_FORMAT
+        assert session["audio"]["output"]["format"] == self._FORCED_FORMAT
+        assert session["audio"]["output"]["voice"] == "eve"
+
+    def test_session_updated_without_audio_gains_pcm_16000_downstream(self):
+        session = self._normalized_session({"type": "session.updated", "session": {"id": "sess_1"}})
+
+        assert session["audio"]["input"]["format"] == self._FORCED_FORMAT
+        assert session["audio"]["output"]["format"] == self._FORCED_FORMAT
+
+    def test_non_session_event_is_untouched_downstream(self):
+        event = {"type": "response.done", "response": {}}
+        assert XAIRealtimeNormalizer().normalize(dict(event)) == event
+
+    def test_beta_flat_format_keys_are_preserved_downstream(self):
+        session = self._normalized_session(
+            {"type": "session.created", "session": {"id": "sess_1", "input_audio_format": "pcm16"}}
+        )
+
+        assert session["input_audio_format"] == "pcm16"
+        assert session["audio"]["input"]["format"] == self._FORCED_FORMAT
 
 
 class TestXaiKeyterms:
@@ -533,14 +584,16 @@ class TestXaiKeyterms:
 
         assert transcription["keyterms"] == ["Grok"]
 
-    def test_empty_keyterms_add_nothing(self):
+    def test_empty_keyterms_add_no_transcription(self):
         from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
 
         normalizer = XAIRealtimeNormalizer()
         canonical = {"transcription_keyterms": []}
         ga_session = RealTimeStreaming._remap_beta_session_to_ga(dict(canonical))
+        patched = normalizer.patch_outgoing_session(ga_session, canonical)
 
-        assert "audio" not in normalizer.patch_outgoing_session(ga_session, canonical)
+        assert patched["audio"]["input"].get("transcription") is None
+        assert patched["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 16000}
 
     def test_language_alone_still_works(self):
         """Guard for the shared code path: adding keyterms must not disturb the
