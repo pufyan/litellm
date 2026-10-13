@@ -360,10 +360,29 @@ class RealTimeStreaming:
         ]
     )
     _CLIENT_AUDIO_BUFFER_COMMIT_TYPES = frozenset(["input_audio_buffer.commit", "input_audio_buffer.end"])
+    # Flat canonical fields consumed by the audio rebuild in
+    # _remap_beta_session_to_ga (steps 2, 4-8 plus language/keyterms folding).
+    # A nested client block is dropped only when at least one of these is
+    # present to rebuild from; otherwise there is nothing to derive and the
+    # client block is preserved (voice-audio-preserve D1).
+    _FLAT_AUDIO_FIELDS = frozenset(
+        [
+            "voice",
+            "modalities",
+            "input_audio_format",
+            "output_audio_format",
+            "turn_detection",
+            "input_audio_transcription",
+            "input_audio_noise_reduction",
+            "output_audio_speed",
+            "language",
+            "transcription_keyterms",
+        ]
+    )
     _AUDIO_FORMAT_MAP: dict[str, dict[str, str | int]] = {
         "pcm16": {"type": "audio/pcm", "rate": 24000},
-        "g711_ulaw": {"type": "audio/G711-ulaw", "rate": 8000},
-        "g711_alaw": {"type": "audio/G711-alaw", "rate": 8000},
+        "g711_ulaw": {"type": "audio/pcmu", "rate": 8000},
+        "g711_alaw": {"type": "audio/pcma", "rate": 8000},
     }
     # GA name → beta name (when client WebSocket includes OpenAI-Beta: realtime=v1)
     _GA_TO_BETA_EVENT_TYPES: dict[str, str] = {
@@ -1872,8 +1891,14 @@ class RealTimeStreaming:
         # canonical audio fields for transcription sessions), so dropping it
         # would forward a model-less bare update the backend rejects. Their
         # nested audio is preserved and normalized in place instead.
+        # Same for voice sessions whose update carries no flat audio fields
+        # at all: with nothing to rebuild from, dropping the nested block
+        # destroys the client's voice/formats (voice-audio-preserve D1).
         if session.get("type") != "transcription":
-            session.pop("audio", None)
+            nested_audio = session.get("audio")
+            has_flat_audio = any(key in session for key in RealTimeStreaming._FLAT_AUDIO_FIELDS)
+            if not isinstance(nested_audio, dict) or not nested_audio or has_flat_audio:
+                session.pop("audio", None)
         session.pop("output_modalities", None)
         session.pop("max_output_tokens", None)
 

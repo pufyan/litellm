@@ -572,8 +572,39 @@ def test_remap_beta_session_to_ga_drops_client_provided_nested_audio_block():
     assert out["audio"] == {"output": {"voice": "marin"}}
 
 
-def test_remap_beta_session_to_ga_without_flat_audio_fields_has_no_audio_block():
-    out = RealTimeStreaming._remap_beta_session_to_ga({"instructions": "hi", "audio": {"output": {"voice": "cedar"}}})
+def test_remap_beta_session_to_ga_preserves_nested_audio_without_flat_fields():
+    """No flat replacements: the client-sent nested audio block survives."""
+    out = RealTimeStreaming._remap_beta_session_to_ga(
+        {
+            "instructions": "hi",
+            "audio": {
+                "input": {"format": {"type": "audio/pcm", "rate": 8000}},
+                "output": {"voice": "cedar", "format": {"type": "audio/pcm", "rate": 8000}},
+            },
+        }
+    )
+    assert out["audio"]["output"]["voice"] == "cedar"
+    assert out["audio"]["output"]["format"] == {"type": "audio/pcm", "rate": 8000}
+    assert out["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 8000}
+    assert out["instructions"] == "hi"
+
+
+def test_remap_beta_session_to_ga_flat_fields_win_over_nested_audio_block():
+    """Mixed form: flat canonical fields rebuild audio, nested block is dropped."""
+    out = RealTimeStreaming._remap_beta_session_to_ga(
+        {
+            "voice": "marin",
+            "audio": {
+                "input": {"turn_detection": {"type": "server_vad", "threshold": 0.9}},
+                "output": {"voice": "cedar"},
+            },
+        }
+    )
+    assert out["audio"] == {"output": {"voice": "marin"}}
+
+
+def test_remap_beta_session_to_ga_drops_empty_nested_audio_block():
+    out = RealTimeStreaming._remap_beta_session_to_ga({"instructions": "hi", "audio": {}})
     assert "audio" not in out
     assert out["instructions"] == "hi"
 
@@ -591,6 +622,18 @@ def test_remap_beta_session_to_ga_preserves_ga_audio_format_dicts():
 
     assert out["audio"]["input"]["format"] == input_format
     assert out["audio"]["output"]["format"] == output_format
+
+
+def test_remap_beta_session_to_ga_maps_flat_g711_strings_to_canonical_types():
+    out = RealTimeStreaming._remap_beta_session_to_ga(
+        {
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_alaw",
+        }
+    )
+
+    assert out["audio"]["input"]["format"] == {"type": "audio/pcmu", "rate": 8000}
+    assert out["audio"]["output"]["format"] == {"type": "audio/pcma", "rate": 8000}
 
 
 def test_make_disable_auto_response_message_produces_ga_shape():
