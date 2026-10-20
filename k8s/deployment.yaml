@@ -45,12 +45,15 @@ spec:
         - "4000"
         - "--num_workers"
         - "1"
-        # Страховка от постепенного роста памяти: воркер перерождается после
-        # 10000 запросов (документированный ответ апстрима на системное
-        # удержание). Открытые соединения добиваются своим ходом.
-        - "--max_requests_before_restart"
-        - "10000"
+        # Память: страховые капы кэшей (openspec proxy и realtime resource-bounds)
+        # плюс аллокаторный слой, добавленный в образ (Dockerfile, runtime-стадия):
+        # glibc держит освобождённые арены в RSS вечно, jemalloc их возвращает.
+        # --max_requests_before_restart убрали: при --num_workers 1 он
+        # завершал весь процесс (PID 1 контейнера) без дренажа WS, роняя звонки.
         - "--use_v2_migration_resolver"
+        env:
+        - name: MALLOC_ARENA_MAX
+          value: "2"
         ports:
         - containerPort: 4000
           name: http
