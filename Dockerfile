@@ -139,8 +139,12 @@ USER root
 # https://github.com/BerriAI/litellm/issues/33518
 RUN echo "https://packages.wolfi.dev/os" >> /etc/apk/repositories
 
-# node (without npm) is required by the prisma CLI at runtime
-RUN apk add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile libevent
+# node (without npm) is required by the prisma CLI at runtime. jemalloc is
+# preloaded because glibc never returns freed arenas to the OS, so RSS only
+# ever climbs (Wolfi is glibc-based; Heroku, Presto, PyTorch and BetterUp all
+# document the same creep and the same fix: arena caps and/or jemalloc).
+RUN apk add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile libevent jemalloc \
+    && test -f /usr/lib/libjemalloc.so.2
 COPY --from=pgbouncer-builder /usr/local/bin/pgbouncer /usr/local/bin/pgbouncer
 
 WORKDIR /app
@@ -148,7 +152,11 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     PRISMA_BINARY_CACHE_DIR=/opt/prisma/binaries \
     PRISMA_CLI_PATH=/opt/prisma/binaries/node_modules/.bin/prisma \
     PRISMA_CLI_QUERY_ENGINE_TYPE=binary \
-    PRISMA_OFFLINE_MODE=true
+    PRISMA_OFFLINE_MODE=true \
+    # jemalloc returns freed pages to the OS in the background; glibc arenas
+    # never shrink. Inherited through envp by the Prisma engine and pgbouncer.
+    LD_PRELOAD=/usr/lib/libjemalloc.so.2 \
+    MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000
 
 # Copy only what runtime needs. The application is installed inside the venv;
 # the rest of the builder's /app is source and build metadata that must not
