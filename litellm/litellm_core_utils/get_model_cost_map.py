@@ -406,7 +406,7 @@ async def refetch_model_cost_map(
     _cost_map_source_info.url = url
     _cost_map_source_info.is_env_forced = False
     _cost_map_source_info.fallback_reason = None
-    return _finalize_loaded_model_cost_map(result)
+    return _finalize_remote_model_cost_map(result)
 
 
 class ModelCostMapSourceInfo:
@@ -566,6 +566,29 @@ def _finalize_loaded_model_cost_map(loaded: ModelCostMapReloaded) -> ModelCostMa
     return replace(loaded, model_cost_map=finalized)
 
 
+def _provider_of(entry: object) -> object:
+    return entry.get("litellm_provider") if isinstance(entry, dict) else None
+
+
+def _restore_providers_dropped_upstream(fetched: dict) -> dict:  # mutable-ok: same cost-map contract as above
+    bundled: Final = GetModelCostMap.load_local_model_cost_map()
+    fetched_providers: Final = frozenset(_provider_of(entry) for entry in fetched.values())
+    restored: Final = {
+        key: entry
+        for key, entry in bundled.items()
+        if key != FALLBACK_GENERALIZATIONS_KEY and _provider_of(entry) not in fetched_providers
+    }
+    return {**restored, **fetched}
+
+
+def _finalize_remote_model_cost_map(loaded: ModelCostMapReloaded) -> ModelCostMapReloaded:
+    """Finalize a fetched map, keeping bundled entries of providers the remote map no longer lists at all
+    (the upstream file dropped ``openrouter``, which would leave its model dropdown empty)."""
+    return _finalize_loaded_model_cost_map(
+        replace(loaded, model_cost_map=_restore_providers_dropped_upstream(loaded.model_cost_map))
+    )
+
+
 def adopt_model_cost_map(
     new_model_cost_map: dict,  # mutable-ok: public API preserves the mutable cost-map contract
 ) -> int:
@@ -619,7 +642,7 @@ def _retry_remote_fetch_in_background(
                 url,
             )
             return
-        finalized: Final = _finalize_loaded_model_cost_map(result).model_cost_map
+        finalized: Final = _finalize_remote_model_cost_map(result).model_cost_map
         _cost_map_source_info.source = "remote"
         _cost_map_source_info.fallback_reason = None
         _cost_map_source_info.loaded_at = datetime.now(timezone.utc)
@@ -707,4 +730,4 @@ def get_model_cost_map(
 
     _cost_map_source_info.source = "remote"
     _cost_map_source_info.fallback_reason = None
-    return _finalize_loaded_model_cost_map(outcome).model_cost_map
+    return _finalize_remote_model_cost_map(outcome).model_cost_map

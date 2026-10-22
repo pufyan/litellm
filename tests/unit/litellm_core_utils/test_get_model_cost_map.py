@@ -1194,3 +1194,36 @@ def test_parse_model_catalog_refresh_hours(raw, expected):
     from litellm.litellm_core_utils.get_model_cost_map import parse_model_catalog_refresh_hours
 
     assert parse_model_catalog_refresh_hours(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_refetch_keeps_bundled_entries_of_a_provider_missing_from_the_remote_map():
+    bundled = _load_root_cost_map()
+    dropped_provider = next(
+        entry["litellm_provider"]
+        for entry in bundled.values()
+        if isinstance(entry, dict) and entry.get("litellm_provider") not in (None, "openai")
+    )
+    kept_key = next(
+        key
+        for key, entry in bundled.items()
+        if isinstance(entry, dict) and entry.get("litellm_provider") == "openai"
+    )
+    remote = {
+        key: entry
+        for key, entry in bundled.items()
+        if not (isinstance(entry, dict) and entry.get("litellm_provider") == dropped_provider)
+    }
+    remote[kept_key] = {**bundled[kept_key], "input_cost_per_token": 123.0}
+    client, _ = _mock_client([httpx.Response(200, content=json.dumps(remote).encode())])
+
+    result = await refetch_model_cost_map(url=_URL, sleep=_SleepRecorder(), rng=random.Random(0), client=client)
+
+    assert isinstance(result, ModelCostMapReloaded)
+    dropped_keys = {
+        key
+        for key, entry in bundled.items()
+        if isinstance(entry, dict) and entry.get("litellm_provider") == dropped_provider
+    }
+    assert dropped_keys <= result.model_cost_map.keys()
+    assert result.model_cost_map[kept_key]["input_cost_per_token"] == 123.0

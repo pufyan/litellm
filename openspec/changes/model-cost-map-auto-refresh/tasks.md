@@ -4,6 +4,8 @@
 - [x] 1.2 Переписать под новую семантику три теста, которые пинят локальный short-circuit в `test_get_model_cost_map.py`: `test_refetch_respects_local_env_override`, `test_refetch_local_override_reports_the_bundled_blob_id_without_an_etag`, `test_refetch_stamps_loaded_at_on_remote_and_local_reloads` (последний вызывает `refetch_model_cost_map` без `client`, после правки ушёл бы в реальную сеть, поэтому передавать мок-клиент); тест стартовой загрузки с флагом оставить. Проверка: файл тестов целиком зелёный, мутация «вернуть short-circuit» даёт красный.
 - [x] 1.3 Проверить эндпоинт ручного релоада: при недоступном источнике 502 и текущая карта цела. Проверка: `tests/unit/proxy/proxy_server/test_routes_model_cost_map.py` зелёный, сценарий ошибки фетча покрыт.
 
+- [x] 1.4 Сохранять вшитые записи провайдеров, которых нет в полученной карте (апстрим убрал `openrouter`, выпадашка «Add Model» становилась пустой): `_restore_providers_dropped_upstream` в `_finalize_remote_model_cost_map` для релоада и стартовой удалённой загрузки. Проверка: `test_refetch_keeps_bundled_entries_of_a_provider_missing_from_the_remote_map`, мутация «вернуть карту как есть» даёт красный.
+
 ## 2. Автообновление на существующем опросе
 
 - [x] 2.1 Добавить в `litellm/constants.py` разбор `MODEL_CATALOG_REFRESH_HOURS` (дефолт 12, `0` и отрицательные выключают, нечисловое значение даёт дефолт и предупреждение), задержку первой попытки 60 с и паузу после неудачи 1 час. Проверка: юнит-тесты на все четыре значения переменной.
