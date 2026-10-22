@@ -57,6 +57,7 @@ export default function AddModelPanel() {
       selectedProvider={selectedProvider}
       setSelectedProvider={setSelectedProvider}
       providerModels={providerModels}
+      modelCostMap={modelCostMapData}
       setProviderModelsFn={(provider) =>
         setProviderModels(provider === null ? [] : getProviderModels(provider, modelCostMapData))
       }

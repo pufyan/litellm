@@ -40,6 +40,7 @@ HOST_ONLY_ENVIRONMENT: Final = frozenset(
 
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+os.environ["LITELLM_OPENROUTER_MODELS_URL"] = ""
 
 import litellm  # noqa: E402  # litellm reads LITELLM_LOCAL_MODEL_COST_MAP at import
 import litellm.router as litellm_router_module  # noqa: E402  # same import-time dependency

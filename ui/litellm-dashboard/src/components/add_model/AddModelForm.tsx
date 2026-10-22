@@ -36,6 +36,7 @@ import LiteLLMModelNameField from "./litellm_model_name";
 import ConnectionErrorDisplay from "./model_connection_test";
 import ProviderSpecificFields from "./provider_specific_fields";
 import { TEST_MODES } from "./add_model_modes";
+import { filterModelsByMode, findModeMismatches, type ModelCatalog } from "./model_mode_filter";
 import useAuthorized from "@/app/(dashboard)/hooks/useAuthorized";
 import { credentialsKeys } from "@/app/(dashboard)/hooks/credentials/useCredentials";
 import { extractProxyErrorMessage } from "@/lib/http/client";
@@ -52,6 +53,7 @@ interface AddModelFormProps {
   selectedProvider: string | null;
   setSelectedProvider: (provider: string | null) => void;
   providerModels: string[];
+  modelCostMap?: ModelCatalog;
   setProviderModelsFn: (provider: string | null) => void;
   getPlaceholder: (provider: string) => string;
   showAdvancedSettings: boolean;
@@ -76,6 +78,7 @@ const AddModelForm: React.FC<AddModelFormProps> = ({
   selectedProvider,
   setSelectedProvider,
   providerModels,
+  modelCostMap,
   setProviderModelsFn,
   getPlaceholder,
   showAdvancedSettings,
@@ -99,6 +102,22 @@ const AddModelForm: React.FC<AddModelFormProps> = ({
   const guardrailsList = guardrailsData?.guardrails.map((g) => g.guardrail_name);
   const { data: tagsList } = useTags();
   const selectedCredentialName = useWatch({ control: form.control, name: "litellm_credential_name" });
+  const watchedMode = useWatch({ control: form.control, name: "mode" });
+  const watchedModels = useWatch({ control: form.control, name: "model" });
+  const selectedMode = typeof watchedMode === "string" ? watchedMode : undefined;
+  const visibleProviderModels = useMemo(
+    () => filterModelsByMode(providerModels, modelCostMap, selectedMode),
+    [providerModels, modelCostMap, selectedMode],
+  );
+  const modeMismatches = useMemo(
+    () =>
+      findModeMismatches(
+        Array.isArray(watchedModels) ? watchedModels.filter((m): m is string => typeof m === "string") : [],
+        modelCostMap,
+        selectedMode,
+      ),
+    [watchedModels, modelCostMap, selectedMode],
+  );
   const queryClient = useQueryClient();
   const [isFederatedCredentialModalOpen, setIsFederatedCredentialModalOpen] = useState(false);
   const canCreateFederatedCredential = isProxyAdminRole(userRole ?? "") && isAnthropicProvider(selectedProvider);
@@ -261,7 +280,7 @@ const AddModelForm: React.FC<AddModelFormProps> = ({
                       </MountedFormField>
                       <LiteLLMModelNameField
                         selectedProvider={selectedProvider}
-                        providerModels={providerModels}
+                        providerModels={visibleProviderModels}
                         getPlaceholder={getPlaceholder}
                       />
 
@@ -292,6 +311,17 @@ const AddModelForm: React.FC<AddModelFormProps> = ({
                           </Select>
                         )}
                       </MountedFormField>
+                      {modeMismatches.length > 0 && (
+                        <p role="alert" className="text-sm text-amber-600 mb-3" data-testid="mode-mismatch-warning">
+                          {modeMismatches
+                            .map(
+                              ({ model, catalogMode, selectedMode: mode }) =>
+                                `${model} is listed as "${catalogMode}" in the model catalog, but the selected mode is "${mode}".`,
+                            )
+                            .join(" ")}{" "}
+                          You can still save it.
+                        </p>
+                      )}
                       <div className="grid grid-cols-12">
                         <div className="col-span-5" />
                         <div className="col-span-5">

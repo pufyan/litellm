@@ -1,7 +1,8 @@
 """
 Pulls the cost + context window + provider route for known models from https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json
 
-This can be disabled by setting the LITELLM_LOCAL_MODEL_COST_MAP environment variable to True.
+The initial load can be pinned to the bundled map by setting the LITELLM_LOCAL_MODEL_COST_MAP environment
+variable to True. That flag only governs the startup load: runtime reloads always fetch from the configured URL.
 The ``lite`` and ``litellm-proxy`` CLI entry points also use the bundled map without fetching.
 
 ```
@@ -31,11 +32,21 @@ from typing_extensions import ReadOnly, TypedDict
 
 from litellm import verbose_logger
 from litellm.constants import (
+    MODEL_CATALOG_REFRESH_HOURS_DEFAULT,
     MODEL_COST_MAP_MAX_SHRINK_RATIO,
     MODEL_COST_MAP_MIN_MODEL_COUNT,
+    OPENROUTER_CATALOG_FETCH_TIMEOUT_SECONDS,
+    OPENROUTER_CATALOG_MAX_RESPONSE_BYTES,
+    OPENROUTER_CATALOG_MIN_MODEL_COUNT,
 )
 from litellm.litellm_core_utils.fallback_generalizations import (
     set_fallback_generalizations,
+)
+from litellm.litellm_core_utils.openrouter_catalog import (
+    OPENROUTER_PROVIDER,
+    CatalogEntry,
+    build_openrouter_entries,
+    entries_digest,
 )
 
 FALLBACK_GENERALIZATIONS_KEY: Final = "fallback_generalizations"
@@ -371,23 +382,18 @@ async def refetch_model_cost_map(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: random.Random | None = None,
     client: "_AsyncGetClient | None" = None,
+    openrouter_url: str | None = None,
+    openrouter_client: "_AsyncGetClient | None" = None,
 ) -> ModelCostMapReloadResult:
     """
     Re-fetch the model cost map for a runtime reload, retrying transient HTTP
-    errors (429/5xx/transport) with Retry-After-aware backoff.
+    errors (429/5xx/transport) with Retry-After-aware backoff. The OpenRouter model
+    list is fetched once more and replaces the ``openrouter`` entries when it checks out.
 
     Unlike ``get_model_cost_map`` this never falls back to the packaged backup:
     on failure it returns ``ModelCostMapReloadUnavailable`` so callers keep the
     map they already have.
     """
-    if os.getenv("LITELLM_LOCAL_MODEL_COST_MAP", "").lower() == "true":
-        _cost_map_source_info.loaded_at = datetime.now(timezone.utc)
-        _cost_map_source_info.source = "local"
-        _cost_map_source_info.url = None
-        _cost_map_source_info.is_env_forced = True
-        _cost_map_source_info.fallback_reason = None
-        return _finalize_loaded_model_cost_map(GetModelCostMap.load_local_model_cost_map_with_revision())
-
     result: Final = await _fetch_remote_model_cost_map_with_retry(
         url=url,
         timeout=timeout,
@@ -407,12 +413,19 @@ async def refetch_model_cost_map(
         backup_model_count=GetModelCostMap.get_backup_model_count(),
     ):
         return ModelCostMapReloadUnavailable(reason=f"model cost map from {url} failed integrity validation")
+    import litellm
+
+    overlaid: Final = await _overlay_openrouter_catalog(
+        result,
+        url=openrouter_url if openrouter_url is not None else litellm.openrouter_models_url,
+        client=openrouter_client if openrouter_client is not None else _default_reload_client(),
+    )
     _cost_map_source_info.loaded_at = datetime.now(timezone.utc)
     _cost_map_source_info.source = "remote"
     _cost_map_source_info.url = url
     _cost_map_source_info.is_env_forced = False
     _cost_map_source_info.fallback_reason = None
-    return _finalize_loaded_model_cost_map(result)
+    return _finalize_remote_model_cost_map(overlaid)
 
 
 class ModelCostMapSourceInfo:
@@ -479,6 +492,22 @@ def get_model_cost_map_source_info() -> CostMapSourceInfo:
 def get_model_cost_map_loaded_at() -> "datetime | None":
     """When this process last loaded its cost map, stamped at the start of every load"""
     return _cost_map_source_info.loaded_at
+
+
+def parse_model_catalog_refresh_hours(raw: str | None) -> int:
+    """Hours between background catalog refreshes; 0 disables them."""
+    if raw is None or raw.strip() == "":
+        return MODEL_CATALOG_REFRESH_HOURS_DEFAULT
+    try:
+        parsed: Final = int(raw)
+    except ValueError:
+        verbose_logger.warning(
+            "LiteLLM: MODEL_CATALOG_REFRESH_HOURS=%r is not an integer; using %s hours",
+            raw,
+            MODEL_CATALOG_REFRESH_HOURS_DEFAULT,
+        )
+        return MODEL_CATALOG_REFRESH_HOURS_DEFAULT
+    return max(parsed, 0)
 
 
 def _expand_model_aliases(model_cost: dict) -> dict:
@@ -556,6 +585,77 @@ def _finalize_loaded_model_cost_map(loaded: ModelCostMapReloaded) -> ModelCostMa
     return replace(loaded, model_cost_map=finalized)
 
 
+def _is_openrouter_entry(entry: object) -> bool:
+    return isinstance(entry, dict) and entry.get("litellm_provider") == OPENROUTER_PROVIDER
+
+
+async def _fetch_openrouter_entries(
+    url: str, client: _AsyncGetClient
+) -> dict[str, CatalogEntry] | None:  # mutable-ok: merged into the catalog
+    if not url:
+        return None
+    try:
+        response: Final = await client.get(url, timeout=OPENROUTER_CATALOG_FETCH_TIMEOUT_SECONDS)
+        if response.is_error:
+            raise ValueError(f"HTTP {response.status_code}")
+        if len(response.content) > OPENROUTER_CATALOG_MAX_RESPONSE_BYTES:
+            raise ValueError(f"response larger than {OPENROUTER_CATALOG_MAX_RESPONSE_BYTES} bytes")
+        return build_openrouter_entries(response.json(), url)
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
+        verbose_logger.warning("LiteLLM: OpenRouter model list fetch from %s failed: %s", url, e)
+        return None
+
+
+def _openrouter_entries_are_plausible(entries: Mapping[str, CatalogEntry]) -> bool:
+    bundled_count: Final = sum(
+        1 for entry in GetModelCostMap.load_local_model_cost_map().values() if _is_openrouter_entry(entry)
+    )
+    return len(entries) >= max(OPENROUTER_CATALOG_MIN_MODEL_COUNT, bundled_count // 2)
+
+
+async def _overlay_openrouter_catalog(
+    loaded: ModelCostMapReloaded, url: str, client: _AsyncGetClient
+) -> ModelCostMapReloaded:
+    entries: Final = await _fetch_openrouter_entries(url, client)
+    if entries is None:
+        return loaded
+    if not _openrouter_entries_are_plausible(entries):
+        verbose_logger.warning(
+            "LiteLLM: OpenRouter model list from %s has only %d usable models; keeping the bundled entries",
+            url,
+            len(entries),
+        )
+        return loaded
+    without_openrouter: Final = {
+        key: entry for key, entry in loaded.model_cost_map.items() if not _is_openrouter_entry(entry)
+    }
+    revision: Final = f"{loaded.revision}+{OPENROUTER_PROVIDER}:{entries_digest(entries)}"
+    return replace(loaded, model_cost_map={**without_openrouter, **entries}, revision=revision)
+
+
+def _provider_of(entry: object) -> object:
+    return entry.get("litellm_provider") if isinstance(entry, dict) else None
+
+
+def _restore_providers_dropped_upstream(fetched: dict) -> dict:  # mutable-ok: same cost-map contract as above
+    bundled: Final = GetModelCostMap.load_local_model_cost_map()
+    fetched_providers: Final = frozenset(_provider_of(entry) for entry in fetched.values())
+    restored: Final = {
+        key: entry
+        for key, entry in bundled.items()
+        if key != FALLBACK_GENERALIZATIONS_KEY and _provider_of(entry) not in fetched_providers
+    }
+    return {**restored, **fetched}
+
+
+def _finalize_remote_model_cost_map(loaded: ModelCostMapReloaded) -> ModelCostMapReloaded:
+    """Finalize a fetched map, keeping bundled entries of providers the remote map no longer lists at all
+    (the upstream file dropped ``openrouter``, which would leave its model dropdown empty)."""
+    return _finalize_loaded_model_cost_map(
+        replace(loaded, model_cost_map=_restore_providers_dropped_upstream(loaded.model_cost_map))
+    )
+
+
 def adopt_model_cost_map(
     new_model_cost_map: dict,  # mutable-ok: public API preserves the mutable cost-map contract
 ) -> int:
@@ -609,7 +709,7 @@ def _retry_remote_fetch_in_background(
                 url,
             )
             return
-        finalized: Final = _finalize_loaded_model_cost_map(result).model_cost_map
+        finalized: Final = _finalize_remote_model_cost_map(result).model_cost_map
         _cost_map_source_info.source = "remote"
         _cost_map_source_info.fallback_reason = None
         _cost_map_source_info.loaded_at = datetime.now(timezone.utc)
@@ -697,4 +797,4 @@ def get_model_cost_map(
 
     _cost_map_source_info.source = "remote"
     _cost_map_source_info.fallback_reason = None
-    return _finalize_loaded_model_cost_map(outcome).model_cost_map
+    return _finalize_remote_model_cost_map(outcome).model_cost_map
