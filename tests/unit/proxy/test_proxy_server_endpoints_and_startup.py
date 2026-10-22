@@ -30,7 +30,7 @@ import litellm.proxy.proxy_server as proxy_server_module
 from litellm._internal_context import current_service_target
 from litellm.caching.caching import RedisCache
 from litellm.caching.redis_cluster_cache import RedisClusterCache
-from litellm.litellm_core_utils.get_model_cost_map import ModelCostMapReloaded
+from litellm.litellm_core_utils.get_model_cost_map import ModelCostMapReloaded, ModelCostMapReloadUnavailable
 from litellm.caching.dual_cache import DualCache
 from litellm.proxy._types import (
     LitellmUserRoles,
@@ -4613,6 +4613,127 @@ def _reload_schedule_row(
         reload_revision=reload_revision,
         last_run_at=last_run_at,
     )
+
+
+class TestModelCatalogDefaultRefresh:
+    NOW = datetime(2024, 1, 1, 7, 0, tzinfo=timezone.utc)
+    NEW_MAP = {"gpt-4": {"input_cost_per_token": 0.001}}
+
+    @staticmethod
+    def _prisma(row):
+        mock_prisma = MagicMock()
+        mock_prisma.db.litellm_config.find_unique = AsyncMock(return_value=row)
+        mock_prisma.db.litellm_config.update_many = AsyncMock(return_value=None)
+        mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=_reload_schedule_row({}, reload_revision=7))
+        return mock_prisma
+
+    def _pod(self, *, interval_hours=12, due=True):
+        from litellm.proxy.proxy_server import ProxyConfig
+
+        pod = ProxyConfig()
+        pod.model_cost_map_default_interval_hours = interval_hours
+        pod.model_cost_map_default_refresh_at = self.NOW - timedelta(seconds=1) if due else self.NOW + timedelta(hours=1)
+        pod.model_cost_map_loaded_at = self.NOW - timedelta(hours=30)
+        return pod
+
+    def _poll(self, pod, mock_prisma, *, result=None, revisions=("old", "old"), polls=1):
+        original_model_cost = litellm.model_cost.copy()
+        try:
+            with (
+                patch(
+                    "litellm.litellm_core_utils.get_model_cost_map.refetch_model_cost_map", new_callable=AsyncMock
+                ) as mock_refetch,
+                patch(
+                    "litellm.litellm_core_utils.get_model_cost_map.get_model_cost_map_provenance",
+                    side_effect=[{"source_revision": r, "etag": None} for r in revisions * polls],
+                ),
+                patch("litellm.proxy.proxy_server.utc_now", return_value=self.NOW),
+            ):
+                mock_refetch.return_value = result or ModelCostMapReloaded(model_cost_map=self.NEW_MAP)
+                for _ in range(polls):
+                    asyncio.run(pod._check_and_reload_model_cost_map(mock_prisma))
+                return mock_refetch.call_count
+        finally:
+            litellm.model_cost = original_model_cost
+            _invalidate_model_cost_lowercase_map()
+
+    def test_no_schedule_row_refreshes_once_then_waits_the_interval(self):
+        pod = self._pod()
+        assert self._poll(pod, self._prisma(None), polls=2) == 1
+        assert pod.model_cost_map_loaded_at == self.NOW
+        assert pod.model_cost_map_default_refresh_at == self.NOW + timedelta(hours=12)
+
+    def test_not_due_does_not_fetch(self):
+        assert self._poll(self._pod(due=False), self._prisma(None)) == 0
+
+    def test_disabled_interval_never_fetches(self):
+        assert self._poll(self._pod(interval_hours=0), self._prisma(None)) == 0
+
+    def test_failed_fetch_keeps_map_and_retries_after_the_retry_pause(self):
+        from litellm.constants import MODEL_CATALOG_REFRESH_RETRY_SECONDS
+
+        pod = self._pod()
+        before = pod.model_cost_map_loaded_at
+        calls = self._poll(pod, self._prisma(None), result=ModelCostMapReloadUnavailable(reason="down"), polls=2)
+        assert calls == 1
+        assert pod.model_cost_map_loaded_at == before
+        assert pod.model_cost_map_default_refresh_at == self.NOW + timedelta(seconds=MODEL_CATALOG_REFRESH_RETRY_SECONDS)
+
+    def test_fetch_exception_does_not_retry_on_every_poll(self):
+        pod = self._pod()
+        original_model_cost = litellm.model_cost.copy()
+        try:
+            with (
+                patch(
+                    "litellm.litellm_core_utils.get_model_cost_map.refetch_model_cost_map",
+                    new_callable=AsyncMock,
+                    side_effect=RuntimeError("boom"),
+                ) as mock_refetch,
+                patch("litellm.proxy.proxy_server.utc_now", return_value=self.NOW),
+            ):
+                for _ in range(3):
+                    asyncio.run(pod._check_and_reload_model_cost_map(self._prisma(None)))
+                assert mock_refetch.call_count == 1
+        finally:
+            litellm.model_cost = original_model_cost
+
+    def test_admin_interval_takes_priority_over_the_default(self):
+        pod = self._pod()
+        row = _reload_schedule_row({"interval_hours": 24}, last_run_at=self.NOW - timedelta(hours=1))
+        pod.model_cost_map_loaded_at = self.NOW - timedelta(hours=1)
+        assert self._poll(pod, self._prisma(row)) == 0
+
+    def test_changed_catalog_publishes_one_revision_and_adopts_it(self):
+        pod = self._pod()
+        mock_prisma = self._prisma(None)
+        self._poll(pod, mock_prisma, revisions=("old", "new"))
+        mock_prisma.db.litellm_config.upsert.assert_called_once()
+        assert mock_prisma.db.litellm_config.upsert.call_args[1]["data"]["update"]["reload_revision"] == {
+            "increment": 1
+        }
+        assert pod.model_cost_map_applied_revision == 7
+
+    def test_unchanged_catalog_publishes_nothing(self):
+        pod = self._pod()
+        mock_prisma = self._prisma(None)
+        self._poll(pod, mock_prisma, revisions=("same", "same"))
+        mock_prisma.db.litellm_config.upsert.assert_not_called()
+        assert pod.model_cost_map_applied_revision == 0
+
+    def test_failed_publish_does_not_refetch_on_the_next_poll(self):
+        pod = self._pod()
+        mock_prisma = self._prisma(None)
+        mock_prisma.db.litellm_config.upsert = AsyncMock(side_effect=RuntimeError("db down"))
+        assert self._poll(pod, mock_prisma, revisions=("old", "new", "new", "new"), polls=2) == 1
+
+    def test_pod_catching_up_on_a_published_revision_does_not_publish_or_refetch_again(self):
+        pod = self._pod()
+        mock_prisma = self._prisma(_reload_schedule_row({}, reload_revision=5))
+        calls = self._poll(pod, mock_prisma, revisions=("old", "new"), polls=2)
+        assert calls == 1
+        mock_prisma.db.litellm_config.upsert.assert_not_called()
+        assert pod.model_cost_map_applied_revision == 5
+        assert pod.model_cost_map_default_refresh_at == self.NOW + timedelta(hours=12)
 
 
 class TestPriceDataReloadAPI:
@@ -15757,3 +15878,22 @@ async def test_update_cache_reads_and_writes_declare_the_auth_objects_key_family
     assert seen, "update_cache must touch the cache for a priced user request"
     assert {target for _, target in seen} == {"auth_objects"}
     assert current_service_target() is None
+
+
+@pytest.mark.parametrize(
+    "local_flag, interval_hours, expect_logged",
+    [("True", 12, True), ("True", 0, True), ("", 12, False)],
+)
+def test_model_catalog_refresh_policy_is_logged_only_in_local_mode(
+    monkeypatch, local_flag, interval_hours, expect_logged
+):
+    from litellm.proxy.proxy_server import _log_model_catalog_refresh_policy
+
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", local_flag)
+    monkeypatch.setenv("MODEL_CATALOG_REFRESH_HOURS", str(interval_hours))
+    with patch.object(proxy_server_module.verbose_proxy_logger, "info") as mock_info:
+        _log_model_catalog_refresh_policy()
+
+    assert mock_info.called is expect_logged
+    if expect_logged and interval_hours > 0:
+        assert interval_hours in mock_info.call_args.args

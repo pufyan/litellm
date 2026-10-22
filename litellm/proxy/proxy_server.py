@@ -73,6 +73,8 @@ from litellm.constants import (
     LITELLM_SETTINGS_SAFE_DB_OVERRIDES,
     LITELLM_UI_ALLOW_HEADERS,
     LITELLM_UI_SESSION_DURATION,
+    MODEL_CATALOG_FIRST_REFRESH_DELAY_SECONDS,
+    MODEL_CATALOG_REFRESH_RETRY_SECONDS,
     RUNTIME_UPDATABLE_ROUTER_SETTINGS,
 )
 from litellm.litellm_core_utils.asyncify import asyncify
@@ -5379,6 +5381,26 @@ def resolve_classifier_plugin(
     return resolved
 
 
+def _log_model_catalog_refresh_policy() -> None:
+    from litellm.litellm_core_utils.get_model_cost_map import parse_model_catalog_refresh_hours
+
+    interval_hours: Final = parse_model_catalog_refresh_hours(os.getenv("MODEL_CATALOG_REFRESH_HOURS"))
+    if os.getenv("LITELLM_LOCAL_MODEL_COST_MAP", "").lower() != "true":
+        return
+    if interval_hours <= 0:
+        verbose_proxy_logger.info(
+            "LITELLM_LOCAL_MODEL_COST_MAP=True: the bundled model catalog is used at startup only and "
+            "background refresh is disabled (MODEL_CATALOG_REFRESH_HOURS=0)"
+        )
+        return
+    verbose_proxy_logger.info(
+        "LITELLM_LOCAL_MODEL_COST_MAP=True: the bundled model catalog is used at startup only; background "
+        "refresh from %s runs every %s hours (set MODEL_CATALOG_REFRESH_HOURS=0 to disable)",
+        litellm.model_cost_map_url,
+        interval_hours,
+    )
+
+
 def _swap_in_model_cost_map(new_model_cost_map: dict) -> int:
     from litellm.litellm_core_utils.get_model_cost_map import adopt_model_cost_map
 
@@ -5631,9 +5653,16 @@ class ProxyConfig:
         self.auth_cache_invalidation_subscriber: AuthCacheInvalidationSubscriber | None = None
         from litellm.litellm_core_utils.get_model_cost_map import (
             get_model_cost_map_loaded_at,
+            parse_model_catalog_refresh_hours,
         )
 
         self.model_cost_map_loaded_at: datetime = get_model_cost_map_loaded_at() or utc_now()
+        self.model_cost_map_default_interval_hours: int = parse_model_catalog_refresh_hours(
+            os.getenv("MODEL_CATALOG_REFRESH_HOURS")
+        )
+        self.model_cost_map_default_refresh_at: datetime = utc_now() + timedelta(
+            seconds=MODEL_CATALOG_FIRST_REFRESH_DELAY_SECONDS
+        )
         # Starts unapplied rather than adopting the published revision: this pod cannot tell
         # whether an existing request predates the prices it just fetched, and re-serving one
         # costs a single fetch where skipping one leaves it priced wrong indefinitely
@@ -8850,25 +8879,35 @@ class ProxyConfig:
         """
         try:
             schedule = await read_reload_schedule(prisma_client, MODEL_COST_MAP_RELOAD_PARAM_NAME)
-            if schedule is None:
-                return
 
             current_time = utc_now()
-            is_due = pod_reload_is_due(
+            is_due = schedule is not None and pod_reload_is_due(
                 schedule=schedule,
                 pod_applied_revision=self.model_cost_map_applied_revision,
                 pod_data_loaded_at=self.model_cost_map_loaded_at,
                 current_time=current_time,
                 description="Model cost map",
             )
-            if not is_due:
+            is_default_due = (
+                not is_due
+                and (schedule is None or schedule.interval_hours is None)
+                and self.model_cost_map_default_interval_hours > 0
+                and current_time >= self.model_cost_map_default_refresh_at
+            )
+            if not is_due and not is_default_due:
                 return
 
             from litellm.litellm_core_utils.get_model_cost_map import (
                 ModelCostMapReloadUnavailable,
+                get_model_cost_map_provenance,
                 refetch_model_cost_map,
             )
 
+            if is_default_due:
+                self.model_cost_map_default_refresh_at = current_time + timedelta(
+                    seconds=MODEL_CATALOG_REFRESH_RETRY_SECONDS
+                )
+            revision_before: Final = get_model_cost_map_provenance()["source_revision"]
             reload_result = await refetch_model_cost_map(url=litellm.model_cost_map_url)
             if isinstance(reload_result, ModelCostMapReloadUnavailable):
                 verbose_proxy_logger.warning(
@@ -8880,11 +8919,19 @@ class ProxyConfig:
 
             models_count = _swap_in_model_cost_map(reload_result.model_cost_map)
             self.model_cost_map_loaded_at = current_time
-            await record_reload_run(prisma_client, MODEL_COST_MAP_RELOAD_PARAM_NAME, current_time)
-            # Adopted last, so neither a failed fetch nor a failed status write is recorded
-            # as served; either way the next poll retries instead of leaving the card
-            # reporting a run that never landed
-            self.model_cost_map_applied_revision = schedule.reload_revision
+            self.model_cost_map_default_refresh_at = current_time + timedelta(
+                hours=self.model_cost_map_default_interval_hours
+            )
+            if schedule is not None and is_due:
+                await record_reload_run(prisma_client, MODEL_COST_MAP_RELOAD_PARAM_NAME, current_time)
+                # Adopted last, so neither a failed fetch nor a failed status write is recorded
+                # as served; either way the next poll retries instead of leaving the card
+                # reporting a run that never landed
+                self.model_cost_map_applied_revision = schedule.reload_revision
+            elif get_model_cost_map_provenance()["source_revision"] != revision_before:
+                self.model_cost_map_applied_revision = await record_manual_reload(
+                    prisma_client, MODEL_COST_MAP_RELOAD_PARAM_NAME, current_time
+                )
 
             verbose_proxy_logger.info("Model cost map reloaded successfully. Models count: %s", models_count)
 
@@ -11022,6 +11069,8 @@ class ProxyStartupEvent:
                 config_reload_interval_seconds,
             )
             config_reload_interval_seconds = 30
+
+        _log_model_catalog_refresh_policy()
 
         ### PERIODIC RELOADS (model cost map, anthropic beta headers) ###
         scheduler.add_job(

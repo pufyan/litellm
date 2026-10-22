@@ -417,21 +417,16 @@ async def test_refetch_shrunk_map_fails_integrity_not_swapped_in():
 
 
 @pytest.mark.asyncio
-async def test_refetch_respects_local_env_override(monkeypatch):
-    """LITELLM_LOCAL_MODEL_COST_MAP=True short-circuits to the bundled backup, zero HTTP."""
+async def test_refetch_ignores_local_env_flag_and_fetches_remote(monkeypatch):
+    """LITELLM_LOCAL_MODEL_COST_MAP=True only governs startup; a reload still goes to the network."""
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    client, calls = _mock_client([httpx.Response(200, content=_real_map_bytes())])
 
-    def _fail(request):
-        raise AssertionError("no HTTP request should be made when local map is forced")
+    result = await refetch_model_cost_map(url=_URL, sleep=_SleepRecorder(), rng=random.Random(0), client=client)
 
-    result = await refetch_model_cost_map(
-        url=_URL,
-        sleep=_SleepRecorder(),
-        rng=random.Random(0),
-        client=httpx.AsyncClient(transport=httpx.MockTransport(_fail)),
-    )
     assert isinstance(result, ModelCostMapReloaded)
-    assert len(result.model_cost_map) > 100
+    assert calls["count"] == 1
+    assert result.revision == git_blob_id(_real_map_bytes())
 
 
 @pytest.mark.asyncio
@@ -481,16 +476,18 @@ async def test_refetch_revision_follows_the_bytes_not_the_url():
 
 
 @pytest.mark.asyncio
-async def test_refetch_local_override_reports_the_bundled_blob_id_without_an_etag(monkeypatch):
+async def test_refetch_with_local_env_flag_and_failing_source_keeps_provenance(monkeypatch):
     remote, _ = _mock_client([httpx.Response(200, headers={"ETag": 'W/"remote"'}, content=_real_map_bytes())])
     await refetch_model_cost_map(url=_URL, sleep=_SleepRecorder(), rng=random.Random(0), client=remote)
+    provenance_before = get_model_cost_map_provenance()
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    failing, _ = _mock_client([httpx.Response(404)])
 
-    result = await refetch_model_cost_map(url=_URL, sleep=_SleepRecorder(), rng=random.Random(0))
+    result = await refetch_model_cost_map(url=_URL, sleep=_SleepRecorder(), rng=random.Random(0), client=failing)
 
-    assert isinstance(result, ModelCostMapReloaded)
-    assert result.revision == _bundled_blob_id()
-    assert get_model_cost_map_provenance() == {"source_revision": _bundled_blob_id(), "etag": None}
+    assert isinstance(result, ModelCostMapReloadUnavailable)
+    assert get_model_cost_map_provenance() == provenance_before
+    assert provenance_before["etag"] == 'W/"remote"'
 
 
 @pytest.mark.asyncio
@@ -505,11 +502,15 @@ async def test_refetch_stamps_loaded_at_on_remote_and_local_reloads(monkeypatch)
     assert before_remote <= remote_loaded_at <= datetime.now(timezone.utc)
 
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-    before_local = datetime.now(timezone.utc)
-    await refetch_model_cost_map(url=_URL, sleep=_SleepRecorder(), rng=random.Random(0))
-    local_loaded_at = module.get_model_cost_map_loaded_at()
-    assert local_loaded_at is not None
-    assert before_local <= local_loaded_at <= datetime.now(timezone.utc)
+    flagged_client, _ = _mock_client([httpx.Response(200, content=_real_map_bytes())])
+    before_flagged = datetime.now(timezone.utc)
+    await refetch_model_cost_map(url=_URL, sleep=_SleepRecorder(), rng=random.Random(0), client=flagged_client)
+    flagged_loaded_at = module.get_model_cost_map_loaded_at()
+    assert flagged_loaded_at is not None
+    assert before_flagged <= flagged_loaded_at <= datetime.now(timezone.utc)
+    source = module.get_model_cost_map_source_info()
+    assert source["source"] == "remote"
+    assert source["is_env_forced"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1183,3 +1184,13 @@ def test_get_backup_model_cost_map():
         print("inside backup")
         content = json.load(f)
         print("content", content)
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [(None, 12), ("", 12), ("6", 6), ("0", 0), ("-3", 0), ("abc", 12), ("1.5", 12)],
+)
+def test_parse_model_catalog_refresh_hours(raw, expected):
+    from litellm.litellm_core_utils.get_model_cost_map import parse_model_catalog_refresh_hours
+
+    assert parse_model_catalog_refresh_hours(raw) == expected

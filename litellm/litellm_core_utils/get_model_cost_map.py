@@ -1,7 +1,8 @@
 """
 Pulls the cost + context window + provider route for known models from https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json
 
-This can be disabled by setting the LITELLM_LOCAL_MODEL_COST_MAP environment variable to True.
+The initial load can be pinned to the bundled map by setting the LITELLM_LOCAL_MODEL_COST_MAP environment
+variable to True. That flag only governs the startup load: runtime reloads always fetch from the configured URL.
 The ``lite`` and ``litellm-proxy`` CLI entry points also use the bundled map without fetching.
 
 ```
@@ -31,6 +32,7 @@ from typing_extensions import ReadOnly, TypedDict
 
 from litellm import verbose_logger
 from litellm.constants import (
+    MODEL_CATALOG_REFRESH_HOURS_DEFAULT,
     MODEL_COST_MAP_MAX_SHRINK_RATIO,
     MODEL_COST_MAP_MIN_MODEL_COUNT,
 )
@@ -380,14 +382,6 @@ async def refetch_model_cost_map(
     on failure it returns ``ModelCostMapReloadUnavailable`` so callers keep the
     map they already have.
     """
-    if os.getenv("LITELLM_LOCAL_MODEL_COST_MAP", "").lower() == "true":
-        _cost_map_source_info.loaded_at = datetime.now(timezone.utc)
-        _cost_map_source_info.source = "local"
-        _cost_map_source_info.url = None
-        _cost_map_source_info.is_env_forced = True
-        _cost_map_source_info.fallback_reason = None
-        return _finalize_loaded_model_cost_map(GetModelCostMap.load_local_model_cost_map_with_revision())
-
     result: Final = await _fetch_remote_model_cost_map_with_retry(
         url=url,
         timeout=timeout,
@@ -479,6 +473,22 @@ def get_model_cost_map_source_info() -> CostMapSourceInfo:
 def get_model_cost_map_loaded_at() -> "datetime | None":
     """When this process last loaded its cost map, stamped at the start of every load"""
     return _cost_map_source_info.loaded_at
+
+
+def parse_model_catalog_refresh_hours(raw: str | None) -> int:
+    """Hours between background catalog refreshes; 0 disables them."""
+    if raw is None or raw.strip() == "":
+        return MODEL_CATALOG_REFRESH_HOURS_DEFAULT
+    try:
+        parsed: Final = int(raw)
+    except ValueError:
+        verbose_logger.warning(
+            "LiteLLM: MODEL_CATALOG_REFRESH_HOURS=%r is not an integer; using %s hours",
+            raw,
+            MODEL_CATALOG_REFRESH_HOURS_DEFAULT,
+        )
+        return MODEL_CATALOG_REFRESH_HOURS_DEFAULT
+    return max(parsed, 0)
 
 
 def _expand_model_aliases(model_cost: dict) -> dict:
