@@ -35,9 +35,18 @@ from litellm.constants import (
     MODEL_CATALOG_REFRESH_HOURS_DEFAULT,
     MODEL_COST_MAP_MAX_SHRINK_RATIO,
     MODEL_COST_MAP_MIN_MODEL_COUNT,
+    OPENROUTER_CATALOG_FETCH_TIMEOUT_SECONDS,
+    OPENROUTER_CATALOG_MAX_RESPONSE_BYTES,
+    OPENROUTER_CATALOG_MIN_MODEL_COUNT,
 )
 from litellm.litellm_core_utils.fallback_generalizations import (
     set_fallback_generalizations,
+)
+from litellm.litellm_core_utils.openrouter_catalog import (
+    OPENROUTER_PROVIDER,
+    CatalogEntry,
+    build_openrouter_entries,
+    entries_digest,
 )
 
 FALLBACK_GENERALIZATIONS_KEY: Final = "fallback_generalizations"
@@ -373,10 +382,13 @@ async def refetch_model_cost_map(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: random.Random | None = None,
     client: "_AsyncGetClient | None" = None,
+    openrouter_url: str | None = None,
+    openrouter_client: "_AsyncGetClient | None" = None,
 ) -> ModelCostMapReloadResult:
     """
     Re-fetch the model cost map for a runtime reload, retrying transient HTTP
-    errors (429/5xx/transport) with Retry-After-aware backoff.
+    errors (429/5xx/transport) with Retry-After-aware backoff. The OpenRouter model
+    list is fetched once more and replaces the ``openrouter`` entries when it checks out.
 
     Unlike ``get_model_cost_map`` this never falls back to the packaged backup:
     on failure it returns ``ModelCostMapReloadUnavailable`` so callers keep the
@@ -401,12 +413,19 @@ async def refetch_model_cost_map(
         backup_model_count=GetModelCostMap.get_backup_model_count(),
     ):
         return ModelCostMapReloadUnavailable(reason=f"model cost map from {url} failed integrity validation")
+    import litellm
+
+    overlaid: Final = await _overlay_openrouter_catalog(
+        result,
+        url=openrouter_url if openrouter_url is not None else litellm.openrouter_models_url,
+        client=openrouter_client if openrouter_client is not None else _default_reload_client(),
+    )
     _cost_map_source_info.loaded_at = datetime.now(timezone.utc)
     _cost_map_source_info.source = "remote"
     _cost_map_source_info.url = url
     _cost_map_source_info.is_env_forced = False
     _cost_map_source_info.fallback_reason = None
-    return _finalize_remote_model_cost_map(result)
+    return _finalize_remote_model_cost_map(overlaid)
 
 
 class ModelCostMapSourceInfo:
@@ -564,6 +583,54 @@ def _finalize_loaded_model_cost_map(loaded: ModelCostMapReloaded) -> ModelCostMa
     finalized: Final = _finalize_model_cost_map(loaded.model_cost_map)
     GetModelCostMap._snapshot_loaded_catalog(finalized)  # pyright: ignore[reportPrivateUsage]  # same module
     return replace(loaded, model_cost_map=finalized)
+
+
+def _is_openrouter_entry(entry: object) -> bool:
+    return isinstance(entry, dict) and entry.get("litellm_provider") == OPENROUTER_PROVIDER
+
+
+async def _fetch_openrouter_entries(
+    url: str, client: _AsyncGetClient
+) -> dict[str, CatalogEntry] | None:  # mutable-ok: merged into the catalog
+    if not url:
+        return None
+    try:
+        response: Final = await client.get(url, timeout=OPENROUTER_CATALOG_FETCH_TIMEOUT_SECONDS)
+        if response.is_error:
+            raise ValueError(f"HTTP {response.status_code}")
+        if len(response.content) > OPENROUTER_CATALOG_MAX_RESPONSE_BYTES:
+            raise ValueError(f"response larger than {OPENROUTER_CATALOG_MAX_RESPONSE_BYTES} bytes")
+        return build_openrouter_entries(response.json(), url)
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
+        verbose_logger.warning("LiteLLM: OpenRouter model list fetch from %s failed: %s", url, e)
+        return None
+
+
+def _openrouter_entries_are_plausible(entries: Mapping[str, CatalogEntry]) -> bool:
+    bundled_count: Final = sum(
+        1 for entry in GetModelCostMap.load_local_model_cost_map().values() if _is_openrouter_entry(entry)
+    )
+    return len(entries) >= max(OPENROUTER_CATALOG_MIN_MODEL_COUNT, bundled_count // 2)
+
+
+async def _overlay_openrouter_catalog(
+    loaded: ModelCostMapReloaded, url: str, client: _AsyncGetClient
+) -> ModelCostMapReloaded:
+    entries: Final = await _fetch_openrouter_entries(url, client)
+    if entries is None:
+        return loaded
+    if not _openrouter_entries_are_plausible(entries):
+        verbose_logger.warning(
+            "LiteLLM: OpenRouter model list from %s has only %d usable models; keeping the bundled entries",
+            url,
+            len(entries),
+        )
+        return loaded
+    without_openrouter: Final = {
+        key: entry for key, entry in loaded.model_cost_map.items() if not _is_openrouter_entry(entry)
+    }
+    revision: Final = f"{loaded.revision}+{OPENROUTER_PROVIDER}:{entries_digest(entries)}"
+    return replace(loaded, model_cost_map={**without_openrouter, **entries}, revision=revision)
 
 
 def _provider_of(entry: object) -> object:

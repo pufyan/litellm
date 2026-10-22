@@ -19941,7 +19941,8 @@ async def get_model_cost_map_source(
     - is_env_forced: true if LITELLM_LOCAL_MODEL_COST_MAP=True forced local usage
     - fallback_reason: human-readable reason why remote failed (null on success)
     - loaded_at: when this pod last loaded the map
-    - source_revision: git blob id of the loaded file, what git rev-parse <commit>:<path> prints for it
+    - source_revision: git blob id of the loaded file, what git rev-parse <commit>:<path> prints for it;
+      carries a "+openrouter:<digest>" suffix when the OpenRouter model list was merged in
     - etag: the ETag of the remote fetch (null for the bundled backup)
     - model_count: number of models in the currently loaded cost map
     """

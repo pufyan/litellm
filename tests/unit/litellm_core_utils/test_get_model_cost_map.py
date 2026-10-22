@@ -747,6 +747,7 @@ def _vcr_outcome_gate(request, vcr):
     yield
     record_vcr_outcome(request, vcr)
 
+
 @pytest.fixture(scope="session")
 def event_loop():
     try:
@@ -755,6 +756,7 @@ def event_loop():
         loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
 
 @pytest.fixture(scope="function")
 def setup_and_teardown(event_loop):
@@ -789,6 +791,7 @@ def setup_and_teardown(event_loop):
     if pending:
         event_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
+
 _SCALAR_DEFAULTS = {
     "num_retries": getattr(litellm, "num_retries", None),
     "set_verbose": getattr(litellm, "set_verbose", False),
@@ -802,6 +805,7 @@ _SCALAR_DEFAULTS = {
     "api_key": getattr(litellm, "api_key", None),
     "cohere_key": getattr(litellm, "cohere_key", None),
 }
+
 
 @pytest.mark.usefixtures("_vcr_outcome_gate", "setup_and_teardown")
 class TestCheckIsValidDict:
@@ -826,6 +830,7 @@ class TestCheckIsValidDict:
     def test_should_accept_non_empty_dict(self):
         """Non-empty dict should pass."""
         assert GetModelCostMap._check_is_valid_dict({"model": {}}) is True
+
 
 @pytest.mark.usefixtures("_vcr_outcome_gate", "setup_and_teardown")
 class TestCheckModelCountNotReduced:
@@ -853,7 +858,7 @@ class TestCheckModelCountNotReduced:
 
     def test_should_accept_when_above_threshold(self):
         """Fetched map at 60% of backup (above 50% threshold) should pass."""
-        fetched = {f"model-{i}": {} for i in range(60)}
+        fetched = {f"model-{i}": {} for i in range(_enough_openrouter_models())}
         assert (
             GetModelCostMap._check_model_count_not_reduced(
                 fetched_map=fetched, backup_model_count=100, min_model_count=10
@@ -880,6 +885,7 @@ class TestCheckModelCountNotReduced:
             )
             is True
         )
+
 
 @pytest.mark.usefixtures("_vcr_outcome_gate", "setup_and_teardown")
 class TestValidateModelCostMap:
@@ -916,6 +922,7 @@ class TestValidateModelCostMap:
             GetModelCostMap.validate_model_cost_map(fetched_map=fetched, backup_model_count=100, min_model_count=10)
             is True
         )
+
 
 def _fetch_with_single_outcome(monkeypatch, outcome):
     from litellm.litellm_core_utils import get_model_cost_map as module
@@ -984,6 +991,7 @@ class TestGetModelCostMapFallback:
         assert isinstance(result, dict)
         assert len(result) > 0
 
+
 @pytest.mark.usefixtures("_vcr_outcome_gate", "setup_and_teardown")
 class TestBackupModelCostMapExists:
     """Validates the local backup file is always present and valid."""
@@ -998,6 +1006,7 @@ class TestBackupModelCostMapExists:
         """The backup must contain a reasonable number of models."""
         backup = GetModelCostMap.load_local_model_cost_map()
         assert len(backup) > 100, f"Backup has only {len(backup)} models, expected > 100"
+
 
 @pytest.mark.usefixtures("_vcr_outcome_gate", "setup_and_teardown")
 class TestBadHostedModelCostMap:
@@ -1063,11 +1072,13 @@ class TestBadHostedModelCostMap:
         finally:
             litellm.model_cost = original
 
+
 @pytest.fixture()
 def _vcr_outcome_gate_local_testing(request, vcr):
     install_live_call_probe(request, vcr)
     yield
     record_vcr_outcome(request, vcr)
+
 
 @pytest.fixture(scope="function")
 def isolate_litellm_state():
@@ -1121,6 +1132,7 @@ def isolate_litellm_state():
             setattr(litellm, attr, original_value)
     _invalidate_model_cost_lowercase_map()
 
+
 _SCALAR_DEFAULTS_local_testing = {
     "num_retries": getattr(litellm, "num_retries", None),
     "num_retries_per_request": getattr(litellm, "num_retries_per_request", None),
@@ -1140,6 +1152,7 @@ _SCALAR_DEFAULTS_local_testing = {
     "api_base": getattr(litellm, "api_base", None),
     "api_key": getattr(litellm, "api_key", None),
 }
+
 
 @pytest.fixture(scope="module")
 def setup_and_teardown_local_testing():
@@ -1163,6 +1176,7 @@ def setup_and_teardown_local_testing():
             litellm.in_memory_llm_clients_cache.flush_cache()
     yield
 
+
 @pytest.mark.usefixtures(
     "_vcr_outcome_gate_local_testing",
     "isolate_litellm_state",
@@ -1173,6 +1187,7 @@ def test_get_model_cost_map():
         print(litellm.get_model_cost_map(url="fake-url"))
     except Exception as e:
         pytest.fail(f"An exception occurred: {e}")
+
 
 @pytest.mark.usefixtures(
     "_vcr_outcome_gate_local_testing",
@@ -1205,9 +1220,7 @@ async def test_refetch_keeps_bundled_entries_of_a_provider_missing_from_the_remo
         if isinstance(entry, dict) and entry.get("litellm_provider") not in (None, "openai")
     )
     kept_key = next(
-        key
-        for key, entry in bundled.items()
-        if isinstance(entry, dict) and entry.get("litellm_provider") == "openai"
+        key for key, entry in bundled.items() if isinstance(entry, dict) and entry.get("litellm_provider") == "openai"
     )
     remote = {
         key: entry
@@ -1227,3 +1240,128 @@ async def test_refetch_keeps_bundled_entries_of_a_provider_missing_from_the_remo
     }
     assert dropped_keys <= result.model_cost_map.keys()
     assert result.model_cost_map[kept_key]["input_cost_per_token"] == 123.0
+
+
+_OPENROUTER_URL = "https://example.invalid/openrouter-models"
+
+
+def _enough_openrouter_models():
+    from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+
+    return sum(
+        1
+        for entry in GetModelCostMap.load_local_model_cost_map().values()
+        if isinstance(entry, dict) and entry.get("litellm_provider") == "openrouter"
+    )
+
+
+def _openrouter_payload(count, price="0.000001"):
+    return {
+        "data": [
+            {
+                "id": f"vendor/model-{i}",
+                "context_length": 1000,
+                "pricing": {"prompt": price, "completion": price},
+            }
+            for i in range(count)
+        ]
+    }
+
+
+def _json_response(payload):
+    return httpx.Response(200, content=json.dumps(payload).encode())
+
+
+async def _reload_with_openrouter(outcomes, main_outcomes=None, url=_OPENROUTER_URL):
+    main, _ = _mock_client(main_outcomes or [httpx.Response(200, content=_real_map_bytes())])
+    openrouter, calls = _mock_client(outcomes)
+    result = await refetch_model_cost_map(
+        url=_URL,
+        sleep=_SleepRecorder(),
+        rng=random.Random(0),
+        client=main,
+        openrouter_url=url,
+        openrouter_client=openrouter,
+    )
+    return result, calls
+
+
+def _openrouter_keys(result):
+    return {
+        key
+        for key, entry in result.model_cost_map.items()
+        if isinstance(entry, dict) and entry.get("litellm_provider") == "openrouter"
+    }
+
+
+@pytest.mark.asyncio
+async def test_refetch_replaces_openrouter_entries_with_the_fetched_list():
+    result, calls = await _reload_with_openrouter([_json_response(_openrouter_payload(_enough_openrouter_models()))])
+
+    assert isinstance(result, ModelCostMapReloaded)
+    assert calls["count"] == 1
+    assert _openrouter_keys(result) == {f"openrouter/vendor/model-{i}" for i in range(_enough_openrouter_models())}
+
+
+@pytest.mark.asyncio
+async def test_refetch_keeps_other_providers_untouched_when_openrouter_is_replaced():
+    result, _ = await _reload_with_openrouter([_json_response(_openrouter_payload(_enough_openrouter_models()))])
+
+    expected = {
+        key
+        for key, entry in _load_root_cost_map().items()
+        if isinstance(entry, dict) and entry.get("litellm_provider") not in (None, "openrouter")
+    }
+    assert expected <= result.model_cost_map.keys()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcomes",
+    [
+        [httpx.ConnectError("down")],
+        [httpx.Response(500)],
+        [httpx.Response(200, content=b"not json")],
+        [_json_response(_openrouter_payload(3))],
+        [httpx.Response(200, content=b"{" + b" " * (10 * 1024 * 1024 + 1) + b"}")],
+    ],
+    ids=["unreachable", "http_error", "invalid_json", "truncated_list", "oversized"],
+)
+async def test_refetch_keeps_bundled_openrouter_entries_when_the_list_is_unusable(outcomes):
+    from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+
+    bundled_keys = {
+        key
+        for key, entry in GetModelCostMap.load_local_model_cost_map().items()
+        if isinstance(entry, dict) and entry.get("litellm_provider") == "openrouter"
+    }
+
+    result, _ = await _reload_with_openrouter(outcomes)
+
+    assert isinstance(result, ModelCostMapReloaded)
+    assert _openrouter_keys(result) == bundled_keys
+    assert result.revision == git_blob_id(_real_map_bytes())
+
+
+@pytest.mark.asyncio
+async def test_refetch_with_empty_openrouter_url_makes_no_openrouter_request():
+    result, calls = await _reload_with_openrouter(
+        [_json_response(_openrouter_payload(_enough_openrouter_models()))], url=""
+    )
+
+    assert isinstance(result, ModelCostMapReloaded)
+    assert calls["count"] == 0
+    assert "openrouter/vendor/model-0" not in result.model_cost_map
+
+
+@pytest.mark.asyncio
+async def test_refetch_revision_changes_when_only_the_openrouter_list_changes():
+    first, _ = await _reload_with_openrouter([_json_response(_openrouter_payload(_enough_openrouter_models()))])
+    same, _ = await _reload_with_openrouter([_json_response(_openrouter_payload(_enough_openrouter_models()))])
+    repriced, _ = await _reload_with_openrouter(
+        [_json_response(_openrouter_payload(_enough_openrouter_models(), price="0.5"))]
+    )
+
+    assert first.revision == same.revision
+    assert first.revision != repriced.revision
+    assert first.revision.startswith(git_blob_id(_real_map_bytes()))

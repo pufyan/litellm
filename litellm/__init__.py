@@ -427,6 +427,10 @@ model_cost_map_url: str = os.getenv(
     "LITELLM_MODEL_COST_MAP_URL",
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
 )
+openrouter_models_url: str = os.getenv(
+    "LITELLM_OPENROUTER_MODELS_URL",
+    "https://openrouter.ai/api/v1/models",
+)
 blog_posts_url: str = os.getenv(
     "LITELLM_BLOG_POSTS_URL",
     "https://docs.litellm.ai/blog/rss.xml",

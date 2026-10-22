@@ -1,4 +1,4 @@
-import { fireEvent, renderHook, screen, waitFor, within, renderWithProviders } from "../../../tests/test-utils";
+import { act, fireEvent, renderHook, screen, waitFor, within, renderWithProviders } from "../../../tests/test-utils";
 import userEvent, { PointerEventsCheckLevel } from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { Team } from "../key_team_helpers/key_list";
@@ -499,5 +499,61 @@ describe("AddModelForm", () => {
       expect(values.cache_control).toBe(false);
       expect(values).not.toHaveProperty("cache_control_injection_points");
     });
+  });
+});
+
+describe("AddModelForm mode check", () => {
+  const modelCostMap = {
+    "tts-1": { litellm_provider: "openai", mode: "audio_speech" },
+    "gpt-4": { litellm_provider: "openai", mode: "chat" },
+  };
+
+  const renderForm = async () => {
+    const mockUseAuthorized = vi.mocked(await import("@/app/(dashboard)/hooks/useAuthorized"));
+    mockUseAuthorized.default.mockReturnValue(mockAuthorizedUser("proxy_admin", "user-1", true));
+    const props = createTestProps();
+    renderWithProviders(<AddModelForm {...props} providerModels={["tts-1", "gpt-4"]} modelCostMap={modelCostMap} />);
+    await screen.findByRole("heading", { name: "Add Model" });
+    return props;
+  };
+
+  it("warns, without blocking, when the selected model's catalog mode does not fit the chosen mode", async () => {
+    const props = await renderForm();
+
+    act(() => {
+      props.form.setValue("model", ["gpt-4"]);
+      props.form.setValue("mode", "audio_speech");
+    });
+
+    const warning = await screen.findByTestId("mode-mismatch-warning");
+    expect(warning).toHaveTextContent('gpt-4 is listed as "chat"');
+    expect(warning).toHaveTextContent('selected mode is "audio_speech"');
+    expect(screen.getByRole("button", { name: /add model/i })).toBeEnabled();
+  });
+
+  it("does not warn when the mode fits or is not chosen", async () => {
+    const props = await renderForm();
+
+    act(() => {
+      props.form.setValue("model", ["gpt-4"]);
+    });
+    expect(screen.queryByTestId("mode-mismatch-warning")).not.toBeInTheDocument();
+
+    act(() => {
+      props.form.setValue("mode", "chat");
+    });
+    expect(screen.queryByTestId("mode-mismatch-warning")).not.toBeInTheDocument();
+  });
+
+  it("narrows the model list to the chosen mode", async () => {
+    const props = await renderForm();
+    act(() => {
+      props.form.setValue("mode", "audio_speech");
+    });
+
+    await userEvent.click(await screen.findByPlaceholderText("Select models"));
+
+    expect(await screen.findByText("tts-1")).toBeInTheDocument();
+    expect(screen.queryByText("gpt-4")).not.toBeInTheDocument();
   });
 });
