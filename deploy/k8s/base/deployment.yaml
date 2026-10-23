@@ -1,0 +1,95 @@
+# LITELLM: OpenAI-совместимый шлюз к провайдерам моделей (OpenRouter, по желанию Anthropic напрямую), виртуальные
+# ключи, бюджеты и журнал трат в своей базе.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  labels: { app: litellm }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: litellm }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app: litellm }
+    spec:
+      # Журнал трат пишется пачками раз в 60 с (proxy_batch_write_at): начатые вызовы модели доходят, а строки
+      # журнала последней минуты у убитой без срока копии теряются — деньги у провайдера списаны, у нас не видны.
+      terminationGracePeriodSeconds: 90
+      # ПРОФИЛЬ `restricted`: образ собран от root, но всё нужное (venv, Prisma в /opt/prisma) читается любым
+      # пользователем — работаем от 10001, корень только на чтение, HOME и кэш Prisma — в /tmp.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app: litellm } }
+      containers:
+        - name: litellm
+          image: litellm
+          args: ["--config", "/app/config/$(LITELLM_CONFIG)", "--port", "4000", "--num_workers", "1"]
+          ports:
+            - { name: http, containerPort: 4000 }
+          envFrom:
+            - configMapRef: { name: litellm-env }
+            - secretRef: { name: litellm-keys }
+          env:
+            # Владелец базы, напрямую в Postgres по TLS (не пул). Пароль — из Secret кластера.
+            - name: PG_PASSWORD
+              valueFrom: { secretKeyRef: { name: pg-litellm, key: password } }
+            - name: DATABASE_URL
+              value: postgresql://litellm:$(PG_PASSWORD)@pg-rw:5432/litellm?sslmode=require
+          lifecycle:
+            preStop: { exec: { command: [sleep, "5"] } }
+          # /health/liveliness и /health/readiness — без вызова моделей. НЕ /health: он зовёт каждую модель и тратит деньги.
+          startupProbe:
+            httpGet: { path: /health/liveliness, port: 4000 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /health/readiness, port: 4000 }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health/liveliness, port: 4000 }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          # ПАМЯТЬ — ПО ЗАМЕРУ 22.10: пик на старте 2072 МиБ (загрузка и Prisma), в покое ~1,1 ГиБ (1.96.0 на стенде);
+          # прод в compose — 0,7 ГиБ. С потолком 1,5 ГиБ копию убивало (OOMKilled) на 12-й секунде старта, без строки
+          # в журнале. Кластер (2026-10-23): потолок 2.5Gi (пик старта + запас), CPU — явно: квота namespace считает
+          # limits, без своего — 1 CPU из LimitRange.
+          resources:
+            requests: { cpu: 200m, memory: 1Gi, ephemeral-storage: 128Mi }
+            limits: { cpu: "2", memory: 2560Mi, ephemeral-storage: 1Gi }
+          volumeMounts:
+            - { name: config, mountPath: /app/config, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: litellm-config }
+        - name: tmp
+          emptyDir: { sizeLimit: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  labels: { app: litellm }
+spec:
+  selector: { app: litellm }
+  ports:
+    - { name: http, port: 4000, targetPort: http }

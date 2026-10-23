@@ -1,0 +1,32 @@
+# БАЗА МАНИФЕСТОВ LITELLM — шлюза моделей, единственной двери продукта к моделям: CRM (`Crm__Ai__Url=http://litellm:4000`)
+# и по желанию rag. В том же namespace, что crm: `aitomaton-stage` / `aitomaton-prod` (оверлеи). Выкладка —
+# `.gitea/workflows/deploy-k8s.yml`. Старый прод (namespace production) по-прежнему — `k8s/` и `.gitea/workflows/deploy.yml`.
+#
+# Конфиг прокси — `proxy-config.yaml` (из crm/deploy/litellm, всё → openrouter/*; модели сверх него, ключи, бюджеты —
+# в базе через админку). Файлы называются proxy-config*: апстримный .gitignore глушит любой config.yaml; в ConfigMap
+# ключи — config.yaml и config-anthropic.yaml (выбор — LITELLM_CONFIG в common.env / оверлее).
+#
+# От кластера (заводит репозиторий infra): база `litellm`, владелец `litellm` (Secret `pg-litellm`) — напрямую в
+# `pg-rw` по TLS, не через пул (Prisma за пулом транзакций требует ?pgbouncer=true); схему шлюз ставит сам при старте
+# (Prisma migrate под замком базы), Job миграции нет. Строка подключения собирается в env из пароля Secret.
+#
+# Secret `litellm-keys` (руками, CI не трогает; см. README.md рядом):
+#   LITELLM_MASTER_KEY  вход в админку и выдача ключей (prod — проще перенести с прода).
+#   LITELLM_SALT_KEY    ПРОД — ПЕРЕНОСИТСЯ С ПРОДА ТОЧНО: им зашифрованы ключи провайдеров в базе; не менять никогда.
+#   UI_PASSWORD         пароль админки (пользователь — UI_USERNAME в common.env).
+#   OPENROUTER_API_KEY  ключ провайдера (stage — свой, с малым лимитом).
+#   ANTHROPIC_API_KEY   необязательный; задан — LITELLM_CONFIG=config-anthropic.yaml в оверлее.
+#
+# Метрик (/metrics) в этом конфиге нет — VMPodScrape добавить вместе с callbacks: ["prometheus"].
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - pdb.yaml
+configMapGenerator:
+  - name: litellm-env
+    envs: [common.env]
+  - name: litellm-config
+    files:
+      - config.yaml=proxy-config.yaml
+      - config-anthropic.yaml=proxy-config-anthropic.yaml
