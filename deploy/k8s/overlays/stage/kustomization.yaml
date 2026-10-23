@@ -1,0 +1,16 @@
+# STAGE: тот же набор, другие значения — только в этом файле и в litellm.env.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: aitomaton-stage
+resources:
+  - ../../base
+replicas:
+  - name: litellm
+    count: 1
+configMapGenerator:
+  - name: litellm-env
+    behavior: merge
+    envs: [litellm.env]
+# Тег — полный хеш коммита (как у старого деплоя: образ, собранный им, не пересобирается); ставит workflow.
+images:
+  - { name: litellm, newName: git.aitomaton.online/aitomaton/litellm, newTag: set-by-ci }
