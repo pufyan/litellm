@@ -27,6 +27,10 @@ from typing_extensions import Protocol, ReadOnly, Required, TypedDict, runtime_c
 from litellm._logging import verbose_logger
 from litellm._uuid import uuid
 from litellm.litellm_core_utils.core_helpers import normalize_drop_params
+from litellm.litellm_core_utils.no_retry_on_errors import (
+    normalize_no_retry_on_errors,
+    sorted_no_retry_entries,
+)
 from litellm.litellm_core_utils.provider_affinity import validate_provider_affinity_header_name
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.router_weights import RouterWeights
@@ -172,6 +176,7 @@ class UpdateRouterConfig(LiteLLMBaseModel):
     routing_groups: list[RoutingGroup] | None = None
     retry_policy: RetryPolicy | None = None
     model_group_retry_policy: dict[str, RetryPolicy] | None = None
+    no_retry_on_errors: list[str | int] | None = None
     model_group_affinity_config: dict[str, list[str]] | None = None
     allowed_fails: int | None = None
     cooldown_time: float | None = None
@@ -188,6 +193,13 @@ class UpdateRouterConfig(LiteLLMBaseModel):
     optional_pre_call_checks: OptionalPreCallChecks | None = None
 
     model_config = ConfigDict(protected_namespaces=())
+
+    @field_validator("no_retry_on_errors")
+    @classmethod
+    def _validate_no_retry_on_errors(cls, value: list[str | int] | None) -> list[str | int] | None:
+        if value is None:
+            return None
+        return sorted_no_retry_entries(normalize_no_retry_on_errors(value))
 
 
 def _as_utc(value: datetime.datetime | None) -> datetime.datetime | None:

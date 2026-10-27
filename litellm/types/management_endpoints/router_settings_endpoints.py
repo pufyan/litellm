@@ -128,6 +128,17 @@ ROUTER_SETTINGS_FIELDS: Final[list[RouterSettingsField]] = [
         ui_field_name="Number of Retries",
     ),
     RouterSettingsField(
+        field_name="no_retry_on_errors",
+        field_type="List",
+        field_value=None,
+        field_description=(
+            "Exception class names (e.g. RateLimitError) or HTTP status codes (e.g. 429) that are never retried. "
+            "Fallbacks still run."
+        ),
+        field_default=[],
+        ui_field_name="Never Retry On",
+    ),
+    RouterSettingsField(
         field_name="timeout",
         field_type="Float",
         field_value=None,

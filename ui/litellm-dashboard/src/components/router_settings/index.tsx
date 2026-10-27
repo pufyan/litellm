@@ -88,6 +88,7 @@ const RouterSettings: React.FC<RouterSettingsProps> = ({ accessToken, userRole, 
 
     const numberKeys = new Set(["allowed_fails", "cooldown_time", "num_retries", "timeout", "retry_after"]);
     const jsonKeys = new Set(["model_group_alias"]);
+    const jsonListKeys = new Set(["no_retry_on_errors"]);
     // retry_policy and model_group_retry_policy are owned by the Model Retry Settings tab;
     // routing_groups is owned by the Routing Groups tab. This page must not read or write them.
     const tabOwnedKeys = new Set(["retry_policy", "model_group_retry_policy", "routing_groups"]);
@@ -102,6 +103,21 @@ const RouterSettings: React.FC<RouterSettingsProps> = ({ accessToken, userRole, 
       if (numberKeys.has(key)) {
         const n = Number(v);
         return Number.isNaN(n) ? fallback : n;
+      }
+
+      if (jsonListKeys.has(key)) {
+        if (v === "") return [];
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(v);
+        } catch {
+          // A refusal the operator can read beats silently saving the previous list.
+          throw new Error(`${key} must be valid JSON`);
+        }
+        if (!Array.isArray(parsed)) {
+          throw new Error(`${key} must be a JSON list, like ["RateLimitError", 429]`);
+        }
+        return parsed;
       }
 
       if (jsonKeys.has(key)) {
@@ -125,42 +141,48 @@ const RouterSettings: React.FC<RouterSettingsProps> = ({ accessToken, userRole, 
       enable_tag_filtering: formValue.enableTagFiltering,
     };
 
-    const updatedVariables = Object.fromEntries(
-      Object.entries(settingsToUpdate)
-        .map(([key, value]) => {
-          if (tabOwnedKeys.has(key)) {
+    let updatedVariables: Record<string, unknown>;
+    try {
+      updatedVariables = Object.fromEntries(
+        Object.entries(settingsToUpdate)
+          .map(([key, value]) => {
+            if (tabOwnedKeys.has(key)) {
+              return null;
+            }
+            if (key !== "routing_strategy_args" && key !== "routing_strategy" && key !== "enable_tag_filtering") {
+              const inputEl = document.querySelector(`input[name="${key}"]`) as HTMLInputElement | null;
+              const parsed = parseInputValue(key, inputEl?.value, value);
+              return [key, parsed];
+            } else if (key === "routing_strategy") {
+              return [key, formValue.selectedStrategy];
+            } else if (key === "enable_tag_filtering") {
+              return [key, formValue.enableTagFiltering];
+            } else if (key === "routing_strategy_args" && formValue.selectedStrategy === "latency-based-routing") {
+              let setRoutingStrategyArgs: routingStrategyArgs = {};
+
+              const lowestLatencyBufferElement = document.querySelector(
+                `input[name="lowest_latency_buffer"]`,
+              ) as HTMLInputElement;
+              const ttlElement = document.querySelector(`input[name="ttl"]`) as HTMLInputElement;
+
+              if (lowestLatencyBufferElement?.value) {
+                setRoutingStrategyArgs["lowest_latency_buffer"] = Number(lowestLatencyBufferElement.value);
+              }
+
+              if (ttlElement?.value) {
+                setRoutingStrategyArgs["ttl"] = Number(ttlElement.value);
+              }
+
+              return ["routing_strategy_args", setRoutingStrategyArgs];
+            }
             return null;
-          }
-          if (key !== "routing_strategy_args" && key !== "routing_strategy" && key !== "enable_tag_filtering") {
-            const inputEl = document.querySelector(`input[name="${key}"]`) as HTMLInputElement | null;
-            const parsed = parseInputValue(key, inputEl?.value, value);
-            return [key, parsed];
-          } else if (key === "routing_strategy") {
-            return [key, formValue.selectedStrategy];
-          } else if (key === "enable_tag_filtering") {
-            return [key, formValue.enableTagFiltering];
-          } else if (key === "routing_strategy_args" && formValue.selectedStrategy === "latency-based-routing") {
-            let setRoutingStrategyArgs: routingStrategyArgs = {};
-
-            const lowestLatencyBufferElement = document.querySelector(
-              `input[name="lowest_latency_buffer"]`,
-            ) as HTMLInputElement;
-            const ttlElement = document.querySelector(`input[name="ttl"]`) as HTMLInputElement;
-
-            if (lowestLatencyBufferElement?.value) {
-              setRoutingStrategyArgs["lowest_latency_buffer"] = Number(lowestLatencyBufferElement.value);
-            }
-
-            if (ttlElement?.value) {
-              setRoutingStrategyArgs["ttl"] = Number(ttlElement.value);
-            }
-
-            return ["routing_strategy_args", setRoutingStrategyArgs];
-          }
-          return null;
-        })
-        .filter((entry) => entry !== null && entry !== undefined) as Iterable<[string, unknown]>,
-    );
+          })
+          .filter((entry) => entry !== null && entry !== undefined) as Iterable<[string, unknown]>,
+      );
+    } catch (error) {
+      toast.fromError(error instanceof Error ? error.message : String(error));
+      return;
+    }
 
     const payload = {
       router_settings: updatedVariables,

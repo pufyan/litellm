@@ -16,6 +16,10 @@ from fastapi import APIRouter, Depends
 from pydantic import Field
 
 from litellm._logging import verbose_proxy_logger
+from litellm.litellm_core_utils.no_retry_on_errors import (
+    normalize_no_retry_on_errors,
+    sorted_no_retry_entries,
+)
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.config_resolvers import FieldSource, SettingsStore, source_for
@@ -134,6 +138,20 @@ async def get_router_settings(
 
         # Merge with config values (config takes precedence)
         current_values.update(router_settings_from_config)
+        if "no_retry_on_errors" in current_values:
+            # The router holds a frozenset and config holds whatever YAML said;
+            # the response exposes one sorted list for both, so the Admin UI and
+            # JSON clients see the same value the retry path would apply.
+            raw_entries: Final = current_values["no_retry_on_errors"]
+            try:
+                normalized: Final = (
+                    raw_entries if isinstance(raw_entries, frozenset) else normalize_no_retry_on_errors(raw_entries)
+                )
+                current_values["no_retry_on_errors"] = sorted_no_retry_entries(normalized)
+            except ValueError:
+                verbose_proxy_logger.warning(
+                    "Malformed no_retry_on_errors in router config, showing it as configured: %r", raw_entries
+                )
 
         for field in router_fields:
             if field.field_name in current_values:

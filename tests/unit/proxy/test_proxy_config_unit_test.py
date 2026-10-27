@@ -287,6 +287,37 @@ async def test_json_logs_calls_turn_on_json():
         litellm.json_logs = False
 
 
+@pytest.mark.asyncio
+async def test_router_settings_no_retry_on_errors_reaches_the_built_router():
+    """A `router_settings.no_retry_on_errors` key in config.yaml must reach the
+    Router built by the proxy, not be dropped by the valid-args filter."""
+    import tempfile
+
+    import yaml
+
+    config_content = {
+        "model_list": [
+            {
+                "model_name": "test-model",
+                "litellm_params": {"model": "openai/gpt-4", "api_key": "test-key"},
+            }
+        ],
+        "router_settings": {"no_retry_on_errors": ["RateLimitError", 429]},
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as temp_file:
+        yaml.dump(config_content, temp_file)
+        temp_file_path = temp_file.name
+
+    try:
+        router, _, _ = await ProxyConfig().load_config(router=None, config_file_path=temp_file_path)
+
+        assert router.no_retry_on_errors == frozenset({"RateLimitError", 429})
+        assert router.get_settings()["no_retry_on_errors"] == [429, "RateLimitError"]
+    finally:
+        os.unlink(temp_file_path)
+
+
 class TestYamlStorePromptsDbOverride:
     @pytest.mark.asyncio
     async def test_yaml_value_takes_precedence_over_db(self):

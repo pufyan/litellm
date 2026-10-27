@@ -10278,7 +10278,8 @@ export interface paths {
          *     - is_env_forced: true if LITELLM_LOCAL_MODEL_COST_MAP=True forced local usage
          *     - fallback_reason: human-readable reason why remote failed (null on success)
          *     - loaded_at: when this pod last loaded the map
-         *     - source_revision: git blob id of the loaded file, what git rev-parse <commit>:<path> prints for it
+         *     - source_revision: git blob id of the loaded file, what git rev-parse <commit>:<path> prints for it;
+         *       carries a "+openrouter:<digest>" suffix when the OpenRouter model list was merged in
          *     - etag: the ETag of the remote fetch (null for the bundled backup)
          *     - model_count: number of models in the currently loaded cost map
          */
@@ -15859,7 +15860,7 @@ export interface paths {
          * @description [DEPRECATED] This endpoint is not paginated and can cause performance issues.
          *     Please use `/spend/logs/v2` instead for paginated access to spend logs.
          *
-         *     Row results are capped at 10,000 most recent entries per response.
+         *     Row results are capped at 1,000 most recent entries per response by default.
          *
          *     View all spend logs, if request_id is provided, only logs for that request_id will be returned
          *
@@ -17143,6 +17144,9 @@ export interface paths {
          *     Parameters:
          *     - user_id: str - Optional. If passed will only return teams that the user_id is a member of.
          *     - organization_id: str - Optional. If passed will only return teams that belong to the organization_id. Pass 'default_organization' to get all teams without organization_id.
+         *     - page: int - Optional. Page number, used together with page_size.
+         *     - page_size: int - Optional. When set, returns a `{teams, total, page, total_pages}` envelope
+         *       with a single page sliced after sorting. When omitted, returns the flat list as before.
          */
         get: operations["list_team_team_list_get"];
         put?: never;
@@ -49237,6 +49241,8 @@ export interface components {
             model_group_retry_policy?: {
                 [key: string]: components["schemas"]["RetryPolicy"];
             } | null;
+            /** No Retry On Errors */
+            no_retry_on_errors?: (string | number)[] | null;
             /** Num Retries */
             num_retries?: number | null;
             /** Optional Pre Call Checks */
@@ -72730,6 +72736,10 @@ export interface operations {
                 end_date?: string | null;
                 /** @description When start_date and end_date are provided, summarize=true returns aggregated data by date (legacy behavior), summarize=false returns filtered individual logs */
                 summarize?: boolean;
+                /** @description Page number (1-based) for individual log entries */
+                page?: number;
+                /** @description Rows per page. Defaults to 1000; use /spend/logs/v2 for larger scans */
+                page_size?: number | null;
             };
             header?: never;
             path?: never;
@@ -74465,6 +74475,10 @@ export interface operations {
                 /** @description Only return teams which this 'user_id' belongs to */
                 user_id?: string | null;
                 organization_id?: string | null;
+                /** @description Page number (1-based), used with page_size */
+                page?: number;
+                /** @description Teams per page. When omitted the full list is returned as before */
+                page_size?: number | null;
             };
             header?: never;
             path?: never;

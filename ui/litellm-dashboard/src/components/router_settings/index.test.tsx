@@ -170,6 +170,99 @@ describe("RouterSettings", () => {
     );
   });
 
+  it("should send no_retry_on_errors as the edited JSON list, not as a string", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getCallbacksCall).mockResolvedValue({
+      router_settings: {
+        routing_strategy: "simple-shuffle",
+        no_retry_on_errors: [429, "RateLimitError"],
+      },
+    });
+    renderWithProviders(<RouterSettings {...defaultProps} />);
+
+    await findStrategySelect();
+
+    const field = (await screen.findByRole("textbox", { name: /no_retry_on_errors/i })) as HTMLInputElement;
+    expect(JSON.parse(field.value)).toEqual([429, "RateLimitError"]);
+    fireEvent.change(field, { target: { value: '["Timeout", 503]' } });
+
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() =>
+      expect(setCallbacksCall).toHaveBeenCalledWith("test-token", {
+        router_settings: expect.objectContaining({ no_retry_on_errors: ["Timeout", 503] }),
+      }),
+    );
+  });
+
+  it("should send an empty list when the no_retry_on_errors field is cleared", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getCallbacksCall).mockResolvedValue({
+      router_settings: {
+        routing_strategy: "simple-shuffle",
+        no_retry_on_errors: [429, "RateLimitError"],
+      },
+    });
+    renderWithProviders(<RouterSettings {...defaultProps} />);
+
+    await findStrategySelect();
+
+    const field = (await screen.findByRole("textbox", { name: /no_retry_on_errors/i })) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: "  " } });
+
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() =>
+      expect(setCallbacksCall).toHaveBeenCalledWith("test-token", {
+        router_settings: expect.objectContaining({ no_retry_on_errors: [] }),
+      }),
+    );
+  });
+
+  it("should refuse to save a no_retry_on_errors value that is valid JSON but not a list", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getCallbacksCall).mockResolvedValue({
+      router_settings: {
+        routing_strategy: "simple-shuffle",
+        no_retry_on_errors: ["RateLimitError"],
+      },
+    });
+    renderWithProviders(<RouterSettings {...defaultProps} />);
+
+    await findStrategySelect();
+
+    const field = (await screen.findByRole("textbox", { name: /no_retry_on_errors/i })) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: "429" } });
+
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(toast.fromError).toHaveBeenCalled());
+    expect(setCallbacksCall).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("should refuse to save an invalid no_retry_on_errors list instead of keeping the old one", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getCallbacksCall).mockResolvedValue({
+      router_settings: {
+        routing_strategy: "simple-shuffle",
+        no_retry_on_errors: ["RateLimitError"],
+      },
+    });
+    renderWithProviders(<RouterSettings {...defaultProps} />);
+
+    await findStrategySelect();
+
+    const field = (await screen.findByRole("textbox", { name: /no_retry_on_errors/i })) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: "RateLimitError" } });
+
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(toast.fromError).toHaveBeenCalled());
+    expect(setCallbacksCall).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
   it("should surface an error and not claim success when saving fails", async () => {
     const user = userEvent.setup();
     vi.mocked(setCallbacksCall).mockRejectedValue(new Error("422 Unprocessable Entity"));

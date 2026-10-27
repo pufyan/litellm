@@ -944,3 +944,131 @@ async def test_failover_falls_through_to_external_fallback_when_remaining_in_coo
         )
 
     assert response._hidden_params["model_id"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_skips_same_group_failover():
+    """`no_retry_on_errors` means no further attempt against the model group,
+    weighted failover included; the listed error reaches the caller."""
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "bad",
+                    "mock_response": "litellm.RateLimitError",
+                    "weight": 1,
+                },
+                "model_info": {"id": "A"},
+            },
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "good",
+                    "mock_response": "ok from B",
+                    "weight": 0,
+                },
+                "model_info": {"id": "B"},
+            },
+        ],
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        enable_weighted_failover=True,
+        no_retry_on_errors=["RateLimitError"],
+    )
+
+    with pytest.raises(litellm.RateLimitError):
+        await router.acompletion(
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_unlisted_error_still_fails_over_within_the_group():
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "bad",
+                    "mock_response": Exception("A down"),
+                    "weight": 1,
+                },
+                "model_info": {"id": "A"},
+            },
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "good",
+                    "mock_response": "ok from B",
+                    "weight": 0,
+                },
+                "model_info": {"id": "B"},
+            },
+        ],
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        enable_weighted_failover=True,
+        no_retry_on_errors=["Timeout"],
+    )
+
+    response = await router.acompletion(
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response._hidden_params["model_id"] == "B"
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_still_falls_through_to_external_fallback():
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "bad",
+                    "mock_response": "litellm.RateLimitError",
+                    "weight": 1,
+                },
+                "model_info": {"id": "A"},
+            },
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "good",
+                    "mock_response": "ok from B",
+                    "weight": 0,
+                },
+                "model_info": {"id": "B"},
+            },
+            {
+                "model_name": "fallback-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "good",
+                    "mock_response": "ok from fallback",
+                },
+                "model_info": {"id": "fallback"},
+            },
+        ],
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        enable_weighted_failover=True,
+        no_retry_on_errors=["RateLimitError"],
+        fallbacks=[{"test-model": ["fallback-model"]}],
+    )
+
+    response = await router.acompletion(
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response._hidden_params["model_id"] == "fallback"

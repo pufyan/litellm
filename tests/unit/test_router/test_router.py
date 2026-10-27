@@ -15683,6 +15683,8 @@ def _anthropic_messages_retry_router(
     fallbacks: list[dict[str, list[str]]] | None = None,
     context_window_fallbacks: list[dict[str, list[str]]] | None = None,
     retry_policy: RetryPolicy | None = None,
+    no_retry_on_errors: list[str | int] | None = None,
+    enable_weighted_failover: bool = False,
 ) -> Router:
     """Two deployments in the group, so a same-group retry waits for no backoff; no fallbacks unless asked."""
     group_deployments = [
@@ -15699,6 +15701,8 @@ def _anthropic_messages_retry_router(
         fallbacks=fallbacks or [],
         context_window_fallbacks=context_window_fallbacks or [],
         retry_policy=retry_policy,
+        no_retry_on_errors=no_retry_on_errors,
+        enable_weighted_failover=enable_weighted_failover,
     )
 
 
@@ -15833,6 +15837,69 @@ async def test_anthropic_messages_retries_stop_at_num_retries_and_raise_the_last
         [chunk async for chunk in stream]
 
     assert [(attempted, budget) for _, attempted, budget in provider.calls] == [(0, 2), (1, 2), (2, 2)]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_terminal_error_is_not_retried_within_the_group():
+    """A listed error is terminal for the request: a stream dropped before content
+    with a terminal cause gets no same-group retry, even with num_retries left."""
+    router = _anthropic_messages_retry_router(num_retries=2, no_retry_on_errors=["APIConnectionError"])
+    provider = _AnthropicMessagesScriptedProvider(_anthropic_messages_dropped_before_content)
+
+    stream = await _anthropic_messages_stream_through_router(router, provider)
+    with pytest.raises(litellm.APIConnectionError):
+        [chunk async for chunk in stream]
+
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_terminal_error_frame_skips_group_retries_but_still_falls_back():
+    """The same rule applied to a native `event: error` frame: a terminal class
+    costs no same-group attempt, while the configured fallback still runs."""
+    router = _anthropic_messages_retry_router(
+        num_retries=2,
+        fallbacks=[{"glm": ["fb"]}],
+        no_retry_on_errors=["RateLimitError"],
+    )
+    provider = _AnthropicMessagesScriptedProvider(
+        lambda: _AnthropicMessagesFakeByteStream(
+            [_anthropic_messages_message_start_chunk(), _anthropic_messages_rate_limit_error_chunk()]
+        ),
+        lambda: _AnthropicMessagesFakeByteStream(
+            [_anthropic_messages_message_start_chunk(), _anthropic_messages_content_chunk("from fb")]
+        ),
+    )
+
+    stream = await _anthropic_messages_stream_through_router(router, provider)
+    body = [chunk async for chunk in stream]
+
+    assert body == [_anthropic_messages_message_start_chunk(), _anthropic_messages_content_chunk("from fb")]
+    assert [model in _ANTHROPIC_MESSAGES_RETRY_GROUP for model, _, _ in provider.calls] == [True, False]
+    assert provider.calls[-1][0] == "anthropic/fb-model"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_terminal_error_frame_reaches_the_client_with_only_same_group_failover():
+    """With weighted failover on and no external fallback, a terminal error frame has
+    nothing left that could take it over, so it must reach the client as the provider
+    sent it instead of being buffered into a raised error."""
+    router = _anthropic_messages_retry_router(
+        num_retries=2,
+        no_retry_on_errors=["RateLimitError"],
+        enable_weighted_failover=True,
+    )
+    provider = _AnthropicMessagesScriptedProvider(
+        lambda: _AnthropicMessagesFakeByteStream(
+            [_anthropic_messages_message_start_chunk(), _anthropic_messages_rate_limit_error_chunk()]
+        )
+    )
+
+    stream = await _anthropic_messages_stream_through_router(router, provider)
+    body = [chunk async for chunk in stream]
+
+    assert body == [_anthropic_messages_message_start_chunk(), _anthropic_messages_rate_limit_error_chunk()]
+    assert len(provider.calls) == 1
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Final
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import openai
@@ -933,3 +933,330 @@ timeout_error = litellm.Timeout(
     model="gpt-12",
     llm_provider="azure",
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "configured",
+    [["RateLimitError"], ["litellm.RateLimitError"], [429], ["429"]],
+    ids=["class-name", "dotted-class-name", "status-code", "quoted-status-code"],
+)
+async def test_no_retry_on_errors_skips_retries_for_matching_error(
+    configured: list[str | int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_asyncio_sleep(monkeypatch)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "retry-test-model",
+                "litellm_params": {"model": "openai/retry-test-model", "api_key": "test-key"},
+            }
+        ],
+        num_retries=2,
+        no_retry_on_errors=configured,
+    )
+    call_count: Final = {"calls": 0}
+
+    async def failing_call(*args, **kwargs):
+        call_count["calls"] += 1
+        raise rate_limit_error
+
+    with patch.object(router, "make_call", side_effect=failing_call):
+        with pytest.raises(litellm.RateLimitError) as excinfo:
+            await router.async_function_with_retries(
+                original_function=AsyncMock(),
+                model="retry-test-model",
+                messages=[{"role": "user", "content": "test"}],
+                metadata={},
+            )
+
+    assert call_count["calls"] == 1
+    assert excinfo.value is rate_limit_error
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_errors_leaves_unlisted_errors_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_asyncio_sleep(monkeypatch)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "retry-test-model",
+                "litellm_params": {"model": "openai/retry-test-model", "api_key": "test-key"},
+            }
+        ],
+        num_retries=2,
+        no_retry_on_errors=["RateLimitError"],
+    )
+    call_count: Final = {"calls": 0}
+
+    async def failing_call(*args, **kwargs):
+        call_count["calls"] += 1
+        raise internal_server_error
+
+    with patch.object(router, "make_call", side_effect=failing_call):
+        with pytest.raises(litellm.InternalServerError):
+            await router.async_function_with_retries(
+                original_function=AsyncMock(),
+                model="retry-test-model",
+                messages=[{"role": "user", "content": "test"}],
+                metadata={},
+            )
+
+    assert call_count["calls"] == 3
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_errors_still_runs_fallbacks() -> None:
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "tts",
+                "litellm_params": {"model": "gemini/gemini-3.8-flash-lite-tts", "api_key": "test-key"},
+            },
+            {
+                "model_name": "tts-fallback",
+                "litellm_params": {"model": "gemini/gemini-3.8-flash-lite-tts", "api_key": "test-key"},
+            },
+        ],
+        num_retries=2,
+        no_retry_on_errors=["RateLimitError"],
+        fallbacks=[{"tts": ["tts-fallback"]}],
+    )
+    attempts: Final[list[str]] = []
+    fallback_response: Final = object()
+
+    async def fake_aspeech(model, input, voice=None, **kwargs):
+        attempts.append(model)
+        if model == "tts":
+            raise rate_limit_error
+        return fallback_response
+
+    with patch.object(router, "_aspeech", new=fake_aspeech):
+        response = await router.aspeech(model="tts", input="hello", voice="Kore")
+
+    assert attempts == ["tts", "tts-fallback"]
+    assert response is fallback_response
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [[""], [True], [700], [None], "RateLimitError"],
+    ids=["empty-name", "boolean", "status-out-of-range", "none-entry", "bare-string"],
+)
+def test_no_retry_on_errors_rejects_invalid_entries(configured: object) -> None:
+    with pytest.raises(ValueError, match="no_retry_on_errors"):
+        Router(model_list=[], no_retry_on_errors=configured)
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_errors_stops_the_retry_loop_when_a_later_attempt_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the terminal check used to run only on the first failure, so a
+    listed error on attempt 2 (or later) was retried again. A 500 first answered
+    with a 429 must stop right there."""
+    _patch_asyncio_sleep(monkeypatch)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "retry-test-model",
+                "litellm_params": {"model": "openai/retry-test-model", "api_key": "test-key"},
+            }
+        ],
+        num_retries=2,
+        no_retry_on_errors=["RateLimitError"],
+    )
+    call_count: Final = {"calls": 0}
+
+    async def failing_call(*args, **kwargs):
+        call_count["calls"] += 1
+        if call_count["calls"] == 1:
+            raise litellm.InternalServerError(message="boom", model="gpt-4o", llm_provider="openai")
+        raise litellm.RateLimitError(message="slow down", model="gpt-4o", llm_provider="openai")
+
+    with patch.object(router, "make_call", side_effect=failing_call):
+        with pytest.raises(litellm.RateLimitError):
+            await router.async_function_with_retries(
+                original_function=AsyncMock(),
+                model="retry-test-model",
+                messages=[{"role": "user", "content": "test"}],
+                metadata={},
+            )
+
+    assert call_count["calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_errors_matches_a_configured_superclass(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_asyncio_sleep(monkeypatch)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "retry-test-model",
+                "litellm_params": {"model": "openai/retry-test-model", "api_key": "test-key"},
+            }
+        ],
+        num_retries=2,
+        no_retry_on_errors=["openai.APIError"],
+    )
+    call_count: Final = {"calls": 0}
+
+    async def failing_call(*args, **kwargs):
+        call_count["calls"] += 1
+        raise litellm.RateLimitError(message="slow down", model="gpt-4o", llm_provider="openai")
+
+    with patch.object(router, "make_call", side_effect=failing_call):
+        with pytest.raises(litellm.RateLimitError):
+            await router.async_function_with_retries(
+                original_function=AsyncMock(),
+                model="retry-test-model",
+                messages=[{"role": "user", "content": "test"}],
+                metadata={},
+            )
+
+    assert call_count["calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_errors_wins_over_retry_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A retry policy grants retries per class; a class the operator marked as
+    never-retried must not be re-enabled by one."""
+    _patch_asyncio_sleep(monkeypatch)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "retry-test-model",
+                "litellm_params": {"model": "openai/retry-test-model", "api_key": "test-key"},
+            }
+        ],
+        num_retries=2,
+        retry_policy=RetryPolicy(RateLimitErrorRetries=2),
+        no_retry_on_errors=["RateLimitError"],
+    )
+    call_count: Final = {"calls": 0}
+
+    async def failing_call(*args, **kwargs):
+        call_count["calls"] += 1
+        raise litellm.RateLimitError(message="slow down", model="gpt-4o", llm_provider="openai")
+
+    with patch.object(router, "make_call", side_effect=failing_call):
+        with pytest.raises(litellm.RateLimitError):
+            await router.async_function_with_retries(
+                original_function=AsyncMock(),
+                model="retry-test-model",
+                messages=[{"role": "user", "content": "test"}],
+                metadata={},
+            )
+
+    assert call_count["calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_errors_wins_over_model_group_retry_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-model-group policy is resolved from the same table as retry_policy,
+    so it must not re-enable retries for a class the operator marked terminal."""
+    _patch_asyncio_sleep(monkeypatch)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "retry-test-model",
+                "litellm_params": {"model": "openai/retry-test-model", "api_key": "test-key"},
+            }
+        ],
+        num_retries=2,
+        model_group_retry_policy={"retry-test-model": RetryPolicy(RateLimitErrorRetries=2)},
+        no_retry_on_errors=["RateLimitError"],
+    )
+    call_count: Final = {"calls": 0}
+
+    async def failing_call(*args, **kwargs):
+        call_count["calls"] += 1
+        raise litellm.RateLimitError(message="slow down", model="gpt-4o", llm_provider="openai")
+
+    with patch.object(router, "make_call", side_effect=failing_call):
+        with pytest.raises(litellm.RateLimitError):
+            await router.async_function_with_retries(
+                original_function=AsyncMock(),
+                model="retry-test-model",
+                messages=[{"role": "user", "content": "test"}],
+                metadata={},
+            )
+
+    assert call_count["calls"] == 1
+
+
+def test_should_skip_retries_for_error_walks_nested_stream_wrappers() -> None:
+    """The matcher must not stop at the outermost envelope. Today the stream handlers
+    put the provider error straight into `original_exception` and flatten a wrapper they
+    receive, so one envelope is the common case; this synthetic two-level chain pins the
+    bounded walk so a future re-wrap cannot silently hide the terminal class."""
+    from litellm.exceptions import MidStreamFallbackError
+
+    router: Final = Router(model_list=[], no_retry_on_errors=["RateLimitError"])
+    terminal: Final = litellm.RateLimitError(message="slow down", model="gpt-4o", llm_provider="openai")
+    inner: Final = MidStreamFallbackError(
+        message="glm-a dropped", model="glm-a", llm_provider="anthropic", original_exception=terminal
+    )
+    outer: Final = MidStreamFallbackError(
+        message="fb dropped", model="fb", llm_provider="anthropic", original_exception=inner
+    )
+
+    assert router._should_skip_retries_for_error(outer) is True
+
+    unlisted: Final = MidStreamFallbackError(
+        message="fb dropped",
+        model="fb",
+        llm_provider="anthropic",
+        original_exception=litellm.InternalServerError(message="boom", model="gpt-4o", llm_provider="openai"),
+    )
+    assert router._should_skip_retries_for_error(unlisted) is False
+
+
+def test_no_retry_on_errors_warns_about_a_plain_name_no_litellm_class_matches(caplog) -> None:
+    """A typo cannot be rejected (custom exception classes are legal), so it is warned
+    about at load time instead of silently never matching."""
+    with caplog.at_level("WARNING"):
+        Router(model_list=[], no_retry_on_errors=["RateLimitErr", "my_module.CustomError"])
+
+    assert "RateLimitErr" in caplog.text
+    assert "CustomError" not in caplog.text
+
+
+def test_no_retry_on_errors_does_not_warn_about_known_classes_and_status_codes(caplog) -> None:
+    with caplog.at_level("WARNING"):
+        Router(model_list=[], no_retry_on_errors=["RateLimitError", 429])
+
+    assert "no_retry_on_errors names no known" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_no_retry_on_errors_wins_over_a_per_request_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller-supplied `num_retries` is read before the policy tables, so the
+    terminal decision has to be taken ahead of it as well."""
+    _patch_asyncio_sleep(monkeypatch)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "retry-test-model",
+                "litellm_params": {"model": "openai/retry-test-model", "api_key": "test-key"},
+            }
+        ],
+        no_retry_on_errors=["RateLimitError"],
+    )
+    call_count: Final = {"calls": 0}
+
+    async def failing_call(*args, **kwargs):
+        call_count["calls"] += 1
+        raise litellm.RateLimitError(message="slow down", model="gpt-4o", llm_provider="openai")
+
+    with patch.object(router, "make_call", side_effect=failing_call):
+        with pytest.raises(litellm.RateLimitError):
+            await router.async_function_with_retries(
+                original_function=AsyncMock(),
+                model="retry-test-model",
+                messages=[{"role": "user", "content": "test"}],
+                metadata={},
+                num_retries=3,
+            )
+
+    assert call_count["calls"] == 1

@@ -161,6 +161,45 @@ class TestRouterSettingsEndpoints:
         assert rg_field.field_value == groups
 
     @pytest.mark.asyncio
+    async def test_get_router_settings_serializes_no_retry_on_errors_as_a_sorted_json_array(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The router stores a frozenset, which FastAPI cannot serialize; the
+        settings response must expose the same sorted list the router snapshot does."""
+        llm_router = Router(
+            model_list=[
+                {
+                    "model_name": "test-model",
+                    "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-x"},
+                }
+            ],
+            no_retry_on_errors=["RateLimitError", 429],
+        )
+        monkeypatch.setattr(proxy_server, "llm_router", llm_router)
+        monkeypatch.setattr(
+            proxy_server,
+            "proxy_config",
+            _StubProxyConfig(SettingsStore("router_settings"), {}),
+        )
+        admin_user: Final = UserAPIKeyAuth(
+            user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-x"
+        )
+
+        response: Final[RouterSettingsResponse] = await get_router_settings(
+            user_api_key_dict=admin_user
+        )
+
+        assert response.current_values["no_retry_on_errors"] == [429, "RateLimitError"]
+        assert response.model_dump(mode="json")["current_values"]["no_retry_on_errors"] == [
+            429,
+            "RateLimitError",
+        ]
+        field: Final = next(
+            f for f in response.fields if f.field_name == "no_retry_on_errors"
+        )
+        assert field.field_value == [429, "RateLimitError"]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("metadata_only", (True, False))
     async def test_priority_is_advertised_for_groups_only(
         self, monkeypatch: pytest.MonkeyPatch, metadata_only: bool
@@ -247,3 +286,68 @@ class TestRouterSettingsEndpoints:
             field for field in response.fields if field.field_name == "routing_groups"
         )
         assert groups_field.field_value == expected
+
+    @pytest.mark.asyncio
+    async def test_get_router_settings_normalizes_a_raw_config_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Config replaces the live router's value in the response, so the raw
+        YAML list must be normalized the same way the router would hold it."""
+        llm_router = Router(
+            model_list=[
+                {
+                    "model_name": "test-model",
+                    "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-x"},
+                }
+            ]
+        )
+        config: Final = {"no_retry_on_errors": [" 429 ", "RateLimitError"]}
+        store: Final = SettingsStore("router_settings")
+        store.load_yaml(config)
+        monkeypatch.setattr(proxy_server, "llm_router", llm_router)
+        monkeypatch.setattr(
+            proxy_server, "proxy_config", _StubProxyConfig(store, config)
+        )
+        admin_user: Final = UserAPIKeyAuth(
+            user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-test"
+        )
+
+        response: Final[RouterSettingsResponse] = await get_router_settings(
+            user_api_key_dict=admin_user
+        )
+
+        assert response.current_values["no_retry_on_errors"] == [429, "RateLimitError"]
+        assert response.model_dump(mode="json")["current_values"][
+            "no_retry_on_errors"
+        ] == [429, "RateLimitError"]
+
+    @pytest.mark.asyncio
+    async def test_get_router_settings_shows_a_malformed_config_value_as_written(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stored value that fails validation is surfaced unchanged instead of
+        turning the settings page into a 500."""
+        llm_router = Router(
+            model_list=[
+                {
+                    "model_name": "test-model",
+                    "litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-x"},
+                }
+            ]
+        )
+        config: Final = {"no_retry_on_errors": ["Not A Class"]}
+        store: Final = SettingsStore("router_settings")
+        store.load_yaml(config)
+        monkeypatch.setattr(proxy_server, "llm_router", llm_router)
+        monkeypatch.setattr(
+            proxy_server, "proxy_config", _StubProxyConfig(store, config)
+        )
+        admin_user: Final = UserAPIKeyAuth(
+            user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-test"
+        )
+
+        response: Final[RouterSettingsResponse] = await get_router_settings(
+            user_api_key_dict=admin_user
+        )
+
+        assert response.current_values["no_retry_on_errors"] == ["Not A Class"]

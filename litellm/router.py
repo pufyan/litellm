@@ -100,6 +100,11 @@ from litellm.litellm_core_utils.hidden_params import (
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.llm_cost_calc.utils import SERVICE_TIER_COST_KEY_SUFFIXES
+from litellm.litellm_core_utils.no_retry_on_errors import (
+    error_matches_no_retry_entry,
+    normalize_no_retry_on_errors,
+    sorted_no_retry_entries,
+)
 from litellm.litellm_core_utils.ptu_pricing import (
     PTU_COST_ATTRIBUTION_ENV_VAR,
     declares_ptu,
@@ -713,6 +718,26 @@ def _retry_policy_ceiling(policy: RetryPolicy) -> int:
     return max((retries for retries in policy.model_dump().values() if isinstance(retries, int)), default=0)
 
 
+def _warn_unknown_no_retry_entries(entries: frozenset[str | int]) -> None:
+    """A plain name that matches no litellm exception class is legal (custom classes exist) but usually a typo.
+
+    Dotted names may legitimately point at provider or user modules, so they are not guessed at.
+    """
+    from litellm import exceptions as litellm_exceptions
+
+    unknown: Final = sorted(
+        entry
+        for entry in entries
+        if isinstance(entry, str) and "." not in entry and not hasattr(litellm_exceptions, entry)
+    )
+    if unknown:
+        verbose_router_logger.warning(
+            "no_retry_on_errors names no known litellm exception class: %s. "
+            "Custom exception classes are still matched at request time.",
+            unknown,
+        )
+
+
 def _responses_stream_holds_event(item: object, held_event_count: int) -> bool:
     from litellm.responses.streaming_iterator import PRE_OUTPUT_LIFECYCLE_EVENT_TYPES
 
@@ -939,6 +964,7 @@ class Router:
         retry_after: int = 0,  # min time to wait before retrying a failed request
         retry_policy: RetryPolicy | dict | None = None,  # set custom retries for different exceptions
         model_group_retry_policy: dict[str, RetryPolicy] = {},  # set custom retry policies based on model group
+        no_retry_on_errors: list[str | int] | None = None,  # error class names / status codes that are never retried
         allowed_fails: int | None = None,  # Number of times a deployment can failbefore being added to cooldown
         allowed_fails_policy: AllowedFailsPolicy | None = None,  # set custom allowed fails policy
         cooldown_time: float | None = None,  # (seconds) time to cooldown a deployment after failure
@@ -978,6 +1004,7 @@ class Router:
             polling_interval: (Optional[float]): frequency of polling queue. Only for '.scheduler_acompletion()'. Default is 3ms.
             default_priority: (Optional[int]): the default priority for a request. Only for '.scheduler_acompletion()'. Default is None.
             num_retries (Optional[int]): Number of retries for failed requests. Defaults to 2.
+            no_retry_on_errors (Optional[List[str | int]]): Error class names (e.g. "RateLimitError") or HTTP status codes (e.g. 429) that must never be retried. Fallbacks still run. Defaults to None.
             timeout (Optional[float]): Timeout for requests. Defaults to None.
             default_litellm_params (dict): Default parameters for Router.chat.completion.create. Defaults to {}.
             set_verbose (bool): Flag to set verbose mode. Defaults to False.
@@ -1330,6 +1357,8 @@ class Router:
                 )
 
         self.model_group_retry_policy: dict[str, RetryPolicy] | None = model_group_retry_policy
+        self.no_retry_on_errors: frozenset[str | int] = normalize_no_retry_on_errors(no_retry_on_errors)
+        _warn_unknown_no_retry_entries(self.no_retry_on_errors)
 
         self.allowed_fails_policy: AllowedFailsPolicy | None = None
         if allowed_fails_policy is not None:
@@ -5835,10 +5864,14 @@ class Router:
         if not _is_retriable_anthropic_status(status_code) or _anthropic_stream_error_is_gateway_verdict(chunk):
             return None
         frame_error: Final = anthropic_error_frame_exception(error_type, message, status_code, model_group)
+        if self._should_skip_retries_for_error(frame_error):
+            return (
+                frame_error if self._anthropic_messages_stream_can_fall_back(model_group, kwargs, frame_error) else None
+            )
         budget, _ = self._anthropic_messages_retry_budget(frame_error, kwargs)
         if budget > attempted_retries_for_request(kwargs):
             return frame_error
-        if self._anthropic_messages_stream_can_fall_back(model_group, kwargs):
+        if self._anthropic_messages_stream_can_fall_back(model_group, kwargs, frame_error):
             return frame_error
         return None
 
@@ -5892,6 +5925,8 @@ class Router:
         last_error = e  # rebind-ok: the newest failure is what the fallback chain and the caller see
         for attempt in range(attempted_retries_for_request(initial_kwargs), budget):
             trigger = _mid_stream_retry_trigger(last_error)
+            if self._should_skip_retries_for_error(trigger):
+                return _AnthropicStreamRetriesExhausted(last_error)
             if not policy_applies and not self._anthropic_messages_should_retry(
                 trigger, healthy_deployments, all_deployments, initial_kwargs
             ):
@@ -7634,7 +7669,7 @@ class Router:
             if litellm.utils.get_deployment_order(d) is not None
         }
         order_values: Final[list] = sorted(_order_set)
-        if len(order_values) > 1 and not _skip_order_fallback:
+        if len(order_values) > 1 and not _skip_order_fallback and not self._should_skip_retries_for_error(e):
             # Determine which order levels have already been tried
             current_target: Final = kwargs.get("_target_order")
             skip_up_to: Final = current_target if current_target is not None else order_values[0]
@@ -7674,7 +7709,12 @@ class Router:
                 return response
 
         # Weighted intra-group failover (simple-shuffle only); see _maybe_run_weighted_failover.
-        if self.enable_weighted_failover and not _skip_order_fallback and original_model_group is not None:
+        if (
+            self.enable_weighted_failover
+            and not _skip_order_fallback
+            and original_model_group is not None
+            and not self._should_skip_retries_for_error(e)
+        ):
             response = await self._maybe_run_weighted_failover(
                 exception=e,
                 original_model_group=original_model_group,
@@ -8019,6 +8059,8 @@ class Router:
                 raise
             current_attempt = None
             original_exception = e
+            if self._should_skip_retries_for_error(e):
+                raise
             deployment_num_retries: Final = getattr(e, "num_retries", None)
 
             if (
@@ -8116,6 +8158,9 @@ class Router:
                     # Always track the latest error so we raise the most
                     # recent exception instead of the first one.
                     original_exception = e
+
+                    if self._should_skip_retries_for_error(e):
+                        raise
 
                     ## LOGGING
                     kwargs = self.log_retry(kwargs=kwargs, e=e)
@@ -8215,6 +8260,23 @@ class Router:
                 message=f"This is a mock exception for model={model_group}, to trigger a rate limit error.",
                 num_retries=num_retries,
             )
+
+    def _should_skip_retries_for_error(self, error: Exception) -> bool:
+        """True when `no_retry_on_errors` names this error's class or status code.
+
+        A mid-stream fallback wrapper carries the provider error that actually
+        failed, and the wrappers can nest (a fallback's error wrapped again by
+        the retry path), so the whole chain is checked.
+        """
+        candidate: Exception = error
+        for _ in range(4):
+            if error_matches_no_retry_entry(candidate, self.no_retry_on_errors):
+                return True
+            wrapped: Final = getattr(candidate, "original_exception", None)
+            if not isinstance(wrapped, Exception):
+                return False
+            candidate = wrapped  # rebind-ok: walking the wrapper chain
+        return False
 
     def should_retry_this_error(
         self,
@@ -8831,24 +8893,35 @@ class Router:
             )
         )
 
-    def _anthropic_messages_stream_can_fall_back(self, model_group: str, kwargs: Mapping[str, Any]) -> bool:
+    def _anthropic_messages_stream_can_fall_back(
+        self,
+        model_group: str,
+        kwargs: Mapping[str, Any],
+        trigger: Exception | None = None,
+    ) -> bool:
         """
         Whether async_function_with_fallbacks_common_utils could still route a
         MidStreamFallbackError somewhere for this request (order levels, weighted
         failover, content-policy or generic fallbacks), which is the only case where
         holding lifecycle frames back from the client buys a clean retry. Errs toward
         True whenever a dispatcher path might reach a fallback.
+
+        `trigger` is the failure asking the question: a class `no_retry_on_errors`
+        marks terminal rules out the same-group paths (order levels, weighted
+        failover), so only an external fallback can still take over.
         """
         if fallbacks_disabled_for_request(kwargs):
             return False
-        if self.enable_weighted_failover:
-            return True
-        order_levels: Final = self._anthropic_messages_order_levels(model_group, kwargs)
-        if len(order_levels) > 1:
-            current_target: Final = kwargs.get("_target_order")
-            skip_up_to: Final = current_target if current_target is not None else order_levels[0]
-            if any(o > skip_up_to for o in order_levels):
+        same_group_available: Final = trigger is None or not self._should_skip_retries_for_error(trigger)
+        if same_group_available:
+            if self.enable_weighted_failover:
                 return True
+            order_levels: Final = self._anthropic_messages_order_levels(model_group, kwargs)
+            if len(order_levels) > 1:
+                current_target: Final = kwargs.get("_target_order")
+                skip_up_to: Final = current_target if current_target is not None else order_levels[0]
+                if any(o > skip_up_to for o in order_levels):
+                    return True
         content_policy_fallbacks: Final = kwargs.get("content_policy_fallbacks", self.content_policy_fallbacks)
         if content_policy_fallbacks is not None and self._has_content_policy_fallback(model_group, kwargs):
             return True
@@ -12609,6 +12682,7 @@ class Router:
             "context_window_fallbacks",
             "model_group_retry_policy",
             "retry_policy",
+            "no_retry_on_errors",
             "model_group_alias",
             "enable_weighted_failover",
             "enable_tag_filtering",
@@ -12616,7 +12690,9 @@ class Router:
         ]
 
         for var in vars_to_include:
-            if var in _all_vars:
+            if var == "no_retry_on_errors":
+                _settings_to_return[var] = sorted_no_retry_entries(self.no_retry_on_errors)
+            elif var in _all_vars:
                 _settings_to_return[var] = _all_vars[var]
             if (
                 var == "routing_strategy_args"
@@ -12672,6 +12748,10 @@ class Router:
                         value = RetryPolicy(**value)
                     if value is None or isinstance(value, RetryPolicy):
                         setattr(self, var, value)
+                elif var == "no_retry_on_errors":
+                    entries: Final = normalize_no_retry_on_errors(kwargs[var])
+                    setattr(self, var, entries)
+                    _warn_unknown_no_retry_entries(entries)
                 else:
                     value = kwargs[var]
                     # only run routing strategy init if it has changed

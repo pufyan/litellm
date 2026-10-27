@@ -662,3 +662,88 @@ def test_check_non_standard_fallback_format():
         == True
     )
     assert check_non_standard_fallback_format([{"model": ["qwen-backup"], "api_key": "some-key"}]) == True
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_skips_order_fallback():
+    """`no_retry_on_errors` covers every same-group attempt, the order-based
+    fallback included: the order=2 deployment is never called for a listed error."""
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "bad",
+                    "mock_response": "litellm.RateLimitError",
+                    "order": 1,
+                },
+                "model_info": {"id": "1"},
+            },
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "good",
+                    "mock_response": "success from order 2",
+                    "order": 2,
+                },
+                "model_info": {"id": "2"},
+            },
+        ],
+        num_retries=0,
+        no_retry_on_errors=["RateLimitError"],
+    )
+
+    with pytest.raises(litellm.RateLimitError):
+        await router.acompletion(
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_error_still_reaches_external_fallback():
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "bad",
+                    "mock_response": "litellm.RateLimitError",
+                    "order": 1,
+                },
+                "model_info": {"id": "1"},
+            },
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "good",
+                    "mock_response": "success from order 2",
+                    "order": 2,
+                },
+                "model_info": {"id": "2"},
+            },
+            {
+                "model_name": "fallback-model",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "good",
+                    "mock_response": "success from external fallback",
+                },
+                "model_info": {"id": "fallback"},
+            },
+        ],
+        fallbacks=[{"test-model": ["fallback-model"]}],
+        num_retries=0,
+        no_retry_on_errors=["RateLimitError"],
+    )
+
+    response = await router.acompletion(
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert response._hidden_params["model_id"] == "fallback"

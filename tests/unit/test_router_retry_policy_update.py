@@ -76,6 +76,64 @@ def test_update_router_config_accepts_retry_policy_payload():
     assert dumped["retry_policy"]["TimeoutErrorRetries"] == 3
 
 
+def test_update_router_config_exposes_no_retry_on_errors_field():
+    """no_retry_on_errors must survive /config/update instead of being stripped as an unknown key."""
+    cfg = UpdateRouterConfig(no_retry_on_errors=["RateLimitError", 429])
+    assert cfg.model_dump(exclude_none=True)["no_retry_on_errors"] == [429, "RateLimitError"]
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        ["700"],
+        [429.5],
+        [True],
+        [{"RateLimitError": True}],
+        "RateLimitError",
+        ["Not A Class"],
+    ],
+)
+def test_update_router_config_rejects_malformed_no_retry_on_errors(bad_value):
+    """A typo must fail at the schema boundary: /config/update persists the row
+    before applying it, and apply errors are swallowed, so an unvalidated entry
+    would be stored as accepted while having no effect."""
+    with pytest.raises(ValidationError):
+        UpdateRouterConfig(no_retry_on_errors=bad_value)
+
+
+def test_get_settings_returns_a_json_serializable_sorted_no_retry_on_errors():
+    """The router stores a frozenset, which /router/settings cannot serialize
+    deterministically; the snapshot must expose the sorted list instead."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {
+                    "model": "openai/gpt-4",
+                    "api_key": "sk-fake",
+                    "api_base": "http://localhost:9999",
+                },
+            }
+        ],
+        no_retry_on_errors=["RateLimitError", 429],
+    )
+
+    assert router.get_settings()["no_retry_on_errors"] == [429, "RateLimitError"]
+    assert json.loads(json.dumps(router.get_settings()["no_retry_on_errors"])) == [429, "RateLimitError"]
+
+
+def test_update_settings_normalizes_and_warns_about_an_unknown_name(caplog):
+    """The runtime update path has its own normalization branch, so a typo must
+    surface there too instead of waiting for the next restart."""
+    router = _build_router()
+
+    with caplog.at_level("WARNING"):
+        router.update_settings(no_retry_on_errors=[" 429 ", "RateLimitErr"])
+
+    assert router.no_retry_on_errors == frozenset({429, "RateLimitErr"})
+    assert "RateLimitErr" in caplog.text
+
+
 def test_update_router_config_rejects_malformed_retry_policy():
     """The field is typed as RetryPolicy, so /config/update validates the
     payload at the boundary and rejects non-numeric counts with a 422 instead
@@ -300,6 +358,15 @@ def test_update_settings_persists_retry_policy_dict():
     assert router.retry_policy.TimeoutErrorRetries == 3
 
 
+def test_update_settings_persists_no_retry_on_errors():
+    router = _build_router()
+    assert router.no_retry_on_errors == frozenset()
+
+    router.update_settings(no_retry_on_errors=["RateLimitError", 429])
+
+    assert router.no_retry_on_errors == frozenset({"RateLimitError", 429})
+
+
 def test_update_settings_accepts_retry_policy_object_unchanged():
     """A pre-built ``RetryPolicy`` instance must pass through verbatim so
     callers that already constructed one (e.g. tests or programmatic
@@ -462,3 +529,56 @@ async def test_config_update_persists_and_reads_back_retry_policy(monkeypatch):
     assert read_back.BadRequestErrorRetries == 5
     assert read_back.TimeoutErrorRetries == 3
     assert read_back.RateLimitErrorRetries == 7
+
+
+@pytest.mark.asyncio
+async def test_config_update_persists_and_reads_back_no_retry_on_errors(monkeypatch):
+    """The Admin UI save must survive ``/config/update`` -> DB -> apply ->
+    ``/get/config/callbacks``, and the live router must actually match the
+    persisted entries afterwards."""
+    import litellm.proxy.proxy_server as proxy_server
+    from litellm.proxy._types import ConfigYAML, LitellmUserRoles, UserAPIKeyAuth
+
+    router = _build_router()
+    assert router.no_retry_on_errors == frozenset()
+
+    fake_table = _FakeConfigTable()
+    prisma_client = MagicMock()
+    prisma_client.db.litellm_config = fake_table
+
+    async def _apply_router_settings(*args, **kwargs):
+        await proxy_server.proxy_config._add_router_settings_from_db_config(
+            llm_router=router, prisma_client=prisma_client
+        )
+
+    monkeypatch.setattr(proxy_server, "prisma_client", prisma_client)
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    monkeypatch.setattr(proxy_server.proxy_config, "add_deployment", _apply_router_settings)
+    monkeypatch.setattr(proxy_server.proxy_config, "get_config", AsyncMock(return_value={}))
+
+    posted = UpdateRouterConfig(no_retry_on_errors=["RateLimitError", 429])
+    request = MagicMock()
+    request.json = AsyncMock(
+        return_value={"router_settings": {"no_retry_on_errors": posted.model_dump()["no_retry_on_errors"]}}
+    )
+
+    await proxy_server.update_config(
+        config_info=ConfigYAML(router_settings=posted),
+        request=request,
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-9876"),
+    )
+
+    assert fake_table.rows["router_settings"].param_value["no_retry_on_errors"] == [429, "RateLimitError"]
+    assert router.no_retry_on_errors == frozenset({"RateLimitError", 429})
+    assert router._should_skip_retries_for_error(
+        litellm.RateLimitError(message="slow down", model="gpt-4o", llm_provider="openai")
+    )
+
+    read_back = (
+        await proxy_server.get_config(
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-9876"
+            )
+        )
+    )["router_settings"]["no_retry_on_errors"]
+    assert read_back == [429, "RateLimitError"]
