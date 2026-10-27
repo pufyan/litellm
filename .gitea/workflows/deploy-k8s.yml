@@ -1,0 +1,114 @@
+name: Deploy LiteLLM (cluster01)
+
+# Выкладка в новый кластер (deploy/k8s, kustomize). Старый прод (namespace production) -- deploy.yml.
+#   push в master        -> stage автоматически (и старый прод -- deploy.yml, переходный период);
+#   ручной запуск        -> выбор ветки (в форме запуска) и окружения;
+#   prod                 -> только из master: с другой ветки запуск падает первым шагом.
+# Тег образа -- полный хеш коммита, как у deploy.yml: образ, уже собранный им (или прошлым прогоном), не
+# пересобирается. Job миграции нет: схему ставит сам шлюз при старте.
+#
+# Секреты репозитория: KUBECONFIG_STAGE, KUBECONFIG_PROD (учётка ci-deployer своего namespace),
+# DOCKER_USERNAME, REGISTRY_TOKEN (push в реестр), REPO_TOKEN (зеркало actions/checkout).
+on:
+  push:
+    branches: [ master ]
+    paths-ignore:
+    - '**.md'
+    - 'docs/**'
+    - 'tests/**'
+    - 'cookbook/**'
+    - '.github/**'
+    - 'ui/litellm-dashboard/**.test.*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Окружение'
+        required: true
+        type: choice
+        options:
+          - stage
+          - prod
+
+concurrency:
+  group: deploy-litellm-${{ github.event.inputs.environment || 'stage' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment || 'stage' }}
+      IMAGE: git.aitomaton.online/aitomaton/litellm
+      TAG: ${{ github.sha }}
+      KUBECTL_VERSION: v1.36.5
+      KUSTOMIZE_VERSION: v5.7.1
+    steps:
+    - name: Prod only from master
+      if: env.ENVIRONMENT == 'prod' && github.ref != 'refs/heads/master'
+      run: |
+        echo "prod выкатывается только из master, а запущено из ${{ github.ref }}"
+        exit 1
+
+    - name: Checkout code
+      uses: https://${{ secrets.DOCKER_USERNAME }}:${{ secrets.REPO_TOKEN }}@git.aitomaton.online/aitomaton/checkout@v4
+      with:
+        # Репозиторий ~1 ГБ; полная история для сборки не нужна.
+        fetch-depth: 1
+
+    - name: Registry login
+      env:
+        REGISTRY_USER: ${{ secrets.DOCKER_USERNAME }}
+        REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      run: printf '%s' "$REGISTRY_TOKEN" | docker login git.aitomaton.online -u "$REGISTRY_USER" --password-stdin
+
+    - name: Build and push
+      env:
+        # Корневой Dockerfile -- syntax=docker/dockerfile:1.7 и --mount=type=cache: нужен BuildKit.
+        DOCKER_BUILDKIT: "1"
+      run: |
+        if docker manifest inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+          echo "$IMAGE:$TAG уже в реестре -- без сборки"
+          exit 0
+        fi
+        docker build -t "$IMAGE:$TAG" .
+        docker push "$IMAGE:$TAG"
+
+    - name: Setup kubectl and kustomize
+      run: |
+        curl -sSLo kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+        curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz kustomize
+        chmod +x kubectl kustomize
+        sudo mv kubectl kustomize /usr/local/bin/
+        kubectl version --client
+        kustomize version
+
+    - name: Configure kubectl
+      env:
+        KUBECONFIG_STAGE: ${{ secrets.KUBECONFIG_STAGE }}
+        KUBECONFIG_PROD: ${{ secrets.KUBECONFIG_PROD }}
+      run: |
+        mkdir -p ~/.kube
+        if [ "$ENVIRONMENT" = prod ]; then CFG="$KUBECONFIG_PROD"; else CFG="$KUBECONFIG_STAGE"; fi
+        if [ -z "$CFG" ]; then echo "KUBECONFIG_${ENVIRONMENT^^} не задан"; exit 1; fi
+        printf '%s\n' "$CFG" > ~/.kube/config
+        chmod 600 ~/.kube/config
+        echo "NAMESPACE=$(kubectl config view --minify -o jsonpath='{..namespace}')" >> "$GITHUB_ENV"
+
+    - name: Set image
+      working-directory: deploy/k8s/overlays/${{ env.ENVIRONMENT }}
+      run: |
+        kustomize edit set image "litellm=$IMAGE:$TAG"
+        kubectl diff -k . || true
+
+    - name: Deploy
+      working-directory: deploy/k8s/overlays/${{ env.ENVIRONMENT }}
+      run: |
+        kubectl apply -k .
+        # Старт с Prisma migrate -- до минуты и дольше; старая копия уходит за terminationGracePeriodSeconds.
+        if ! kubectl -n "$NAMESPACE" rollout status deployment/litellm --timeout=15m; then
+          kubectl -n "$NAMESPACE" describe deployment litellm | tail -30
+          kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -20
+          kubectl -n "$NAMESPACE" logs -l app=litellm --tail=100 || true
+          exit 1
+        fi
+        kubectl -n "$NAMESPACE" get pods -l app=litellm -o wide

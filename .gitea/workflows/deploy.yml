@@ -10,6 +10,9 @@ on:
     - 'cookbook/**'
     - '.github/**'
     - 'ui/litellm-dashboard/**.test.*'
+    # Новый кластер (cluster01) -- свой workflow deploy-k8s.yml; старый прод его правки не касаются.
+    - 'deploy/k8s/**'
+    - '.gitea/workflows/deploy-k8s.yml'
   workflow_dispatch:
 
 jobs:

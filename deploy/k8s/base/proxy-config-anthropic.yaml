@@ -1,0 +1,155 @@
+# ПОВЕДЕНИЕ ШЛЮЗА МОДЕЛЕЙ, КОГДА ЗАДАН КЛЮЧ ANTHROPIC (`ANTHROPIC_API_KEY` в `.env`).
+# Compose монтирует этот файл вместо `config.yaml` сам: `config${ANTHROPIC_API_KEY:+-anthropic}.yaml`. Нет ключа —
+# работает `config.yaml`, и шлюз ведёт себя ровно как раньше (всё через OpenRouter).
+#
+# ДВА КЛЮЧА (решение владельца 2026-10-09). Модели Anthropic идут НАПРЯМУЮ в Anthropic по `ANTHROPIC_API_KEY`;
+# отказал Anthropic (ключ, деньги, лимит, сбой) или не ответил за 2 мин — ТОТ ЖЕ запрос сразу уходит той же моделью
+# через OpenRouter (`OPENROUTER_API_KEY`). Это две реализации одной группы с приоритетом `order`: 1 — Anthropic,
+# 2 — OpenRouter; LiteLLM переходит ко второй внутри запроса. Повторов к Anthropic нет (`model_group_retry_policy`
+# ниже): при отказе запасной путь быстрее повтора. Остальные модели — подстановочный маршрут, как в `config.yaml`.
+#
+# Имя группы — то, что шлёт продукт (слаг OpenRouter, через точку); у Anthropic идентификатор через дефис.
+# Цены — для журнала трат (у LiteLLM этих моделей может не быть в каталоге цен).
+#
+# ВСЁ НИЖЕ СПИСКА МОДЕЛЕЙ ANTHROPIC — ДОСЛОВНАЯ КОПИЯ `config.yaml` (за ней только `model_group_retry_policy`):
+# тест `LiteLlmConfigTests` сверяет. Правите `config.yaml` — правьте и здесь.
+
+model_list:
+  - model_name: anthropic/claude-haiku-5.5
+    litellm_params:
+      model: anthropic/claude-haiku-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      order: 1
+      timeout: 120
+    model_info:
+      input_cost_per_token: 1.0e-07
+      output_cost_per_token: 5.0e-07
+  - model_name: anthropic/claude-haiku-5.5
+    litellm_params:
+      model: openrouter/anthropic/claude-haiku-5.5
+      api_key: os.environ/OPENROUTER_API_KEY
+      order: 2
+  - model_name: anthropic/claude-sonnet-5.5
+    litellm_params:
+      model: anthropic/claude-sonnet-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      order: 1
+      timeout: 120
+    model_info:
+      input_cost_per_token: 2.0e-06
+      output_cost_per_token: 1.0e-05
+  - model_name: anthropic/claude-sonnet-5.5
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-5.5
+      api_key: os.environ/OPENROUTER_API_KEY
+      order: 2
+  - model_name: anthropic/claude-opus-5.5
+    litellm_params:
+      model: anthropic/claude-opus-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      order: 1
+      timeout: 120
+    model_info:
+      input_cost_per_token: 4.0e-06
+      output_cost_per_token: 2.0e-05
+  - model_name: anthropic/claude-opus-5.5
+    litellm_params:
+      model: openrouter/anthropic/claude-opus-5.5
+      api_key: os.environ/OPENROUTER_API_KEY
+      order: 2
+  - model_name: anthropic/claude-fable-5.1
+    litellm_params:
+      model: anthropic/claude-fable-5-1
+      api_key: os.environ/ANTHROPIC_API_KEY
+      order: 1
+      timeout: 120
+    model_info:
+      input_cost_per_token: 1.0e-05
+      output_cost_per_token: 5.0e-05
+  - model_name: anthropic/claude-fable-5.1
+    litellm_params:
+      model: openrouter/anthropic/claude-fable-5.1
+      api_key: os.environ/OPENROUTER_API_KEY
+      order: 2
+
+  # ПОДСТАНОВОЧНЫЙ МАРШРУТ, А НЕ СПИСОК МОДЕЛЕЙ, и это осознанно. Имя модели — настройка КОМПАНИИ
+  # (`Настройки → Помощник`), то есть множество имён открыто по построению; перечисленный каталог
+  # означал бы, что арендатор, назвавший модель, получает «No deployments available» вместо ответа,
+  # и чинилось бы это правкой файла на сервере.
+  #
+  # Именованные записи добавляются СВЕРХ этого — псевдонимом, бюджетом, запасной цепочкой — через
+  # Admin UI, и живут в базе (`store_model_in_db`). Файл при этом остаётся полом, а не потолком.
+  - model_name: "*"
+    litellm_params:
+      model: openrouter/*
+      api_key: os.environ/OPENROUTER_API_KEY
+
+general_settings:
+  store_model_in_db: true
+
+  # ТЕЛА ЗАПРОСОВ В ЖУРНАЛ ТРАТ НЕ ПИШУТСЯ. Через шлюз идут строки арендатора — клиенты, сделки,
+  # переписка; журнал трат нужен ради стоимости, а не ради содержимого.
+  store_prompts_in_spend_logs: false
+
+  maximum_spend_logs_retention_period: "30d"
+  maximum_spend_logs_retention_interval: "1d"
+
+  # База ОБЩАЯ с CRM (сервер один, база своя), поэтому пул держим скромным: пиковую нагрузку здесь
+  # даёт не шлюз, а сам продукт.
+  database_connection_pool_limit: 10
+  proxy_batch_write_at: 60
+
+  # При недоступности базы запросы отклоняются — иначе виртуальные ключи перестают проверяться, и
+  # шлюз на время аварии становится открытым.
+  allow_requests_on_db_unavailable: false
+
+litellm_settings:
+  # Провайдеры отличаются набором поддерживаемых параметров. Мешок параметров у нас открыт по
+  # значениям (`Crm:Ai:Params` и настройки компании), поэтому неподдерживаемый член отбрасывается,
+  # а не роняет запрос.
+  drop_params: true
+
+  num_retries: 2
+  request_timeout: 600
+  json_logs: true
+
+  # ТЕЛА В ЛОГИ — ТОЖЕ НЕТ, по той же причине, что и в журнал трат.
+  turn_off_message_logging: true
+
+router_settings:
+  routing_strategy: simple-shuffle
+
+  # На одном деплойменте модели кулдаун означает полный отказ: протухший ключ провайдера превратился
+  # бы из внятного 401 в «No deployments available» на всё это время.
+  cooldown_time: 10
+
+  # К Anthropic без повторов: отказ или молчание — сразу та же модель через OpenRouter (order 2).
+  model_group_retry_policy:
+    anthropic/claude-haiku-5.5:
+      AuthenticationErrorRetries: 0
+      BadRequestErrorRetries: 0
+      TimeoutErrorRetries: 0
+      RateLimitErrorRetries: 0
+      InternalServerErrorRetries: 0
+      ContentPolicyViolationErrorRetries: 0
+    anthropic/claude-sonnet-5.5:
+      AuthenticationErrorRetries: 0
+      BadRequestErrorRetries: 0
+      TimeoutErrorRetries: 0
+      RateLimitErrorRetries: 0
+      InternalServerErrorRetries: 0
+      ContentPolicyViolationErrorRetries: 0
+    anthropic/claude-opus-5.5:
+      AuthenticationErrorRetries: 0
+      BadRequestErrorRetries: 0
+      TimeoutErrorRetries: 0
+      RateLimitErrorRetries: 0
+      InternalServerErrorRetries: 0
+      ContentPolicyViolationErrorRetries: 0
+    anthropic/claude-fable-5.1:
+      AuthenticationErrorRetries: 0
+      BadRequestErrorRetries: 0
+      TimeoutErrorRetries: 0
+      RateLimitErrorRetries: 0
+      InternalServerErrorRetries: 0
+      ContentPolicyViolationErrorRetries: 0
